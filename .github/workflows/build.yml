@@ -27,7 +27,7 @@ jobs:
       sdks: ${{ steps.matrix.outputs.sdks }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Generate version metadata
         id: meta
@@ -99,7 +99,7 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Remove vmlinux-btf dependency for CI
         shell: bash
