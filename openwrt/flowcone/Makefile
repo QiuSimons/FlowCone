@@ -11,7 +11,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/QiuSimons/FlowCone.git
 PKG_SOURCE_VERSION:=master
-PKG_MIRROR_HASH:=skip
+PKG_MIRROR_HASH = $(if $(wildcard $(DL_DIR)/$(PKG_SOURCE)),$(shell $(MKHASH) sha256 $(DL_DIR)/$(PKG_SOURCE) 2>/dev/null || sha256sum $(DL_DIR)/$(PKG_SOURCE) 2>/dev/null | cut -d" " -f1),skip)
 
 PKG_LICENSE:=GPL-3.0-or-later
 PKG_LICENSE_FILES:=LICENSE
