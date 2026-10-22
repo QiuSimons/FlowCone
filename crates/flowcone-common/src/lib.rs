@@ -52,7 +52,7 @@ pub struct GlobalConfig {
     pub wan_ip4: u32,
     pub bypass_mark_mask: u32,
     pub bypass_mark_val: u32,
-    pub _pad: u32,
+    pub l2_len: u32, // 14 for Ethernet, 0 for PPP/NONE/TUN/RAWIP
     pub wan_ip6: [u8; 16],
     pub min_port4: u16,
     pub max_port4: u16,
@@ -110,7 +110,7 @@ pub fn is_routable_internal_ipv6(addr: &[u8; 16], allow_all_internal: bool) -> b
     if addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80 {
         return false;
     }
-    // Loopback / Unspecified: ::1 or :: (Zero-state ALU check, avoids BPF verifier complexity)
+    // Loopback / Unspecified: ::1 or ::
     let hi = u64::from_ne_bytes([
         addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
     ]);
@@ -130,14 +130,13 @@ pub fn is_routable_internal_ipv6(addr: &[u8; 16], allow_all_internal: bool) -> b
 pub const PORT_MAP_ENTRIES: u32 = 65536;
 pub const MAX_BINDINGS: u32 = 65536;
 
-/// Packet mark set by FlowCone TC Ingress on DNAT-translated inbound packets.
-pub const FLOWCONE_MARK: u32 = 0x4643;
+/// Packet mark set on DNAT-translated inbound packets (bit 30).
+pub const FLOWCONE_MARK: u32 = 0x40000000;
 
-/// RFC 4787 port allocation rules:
-/// - REQ-1: Endpoint-Independent Mapping
-/// - REQ-3: Port Preservation (attempts to reuse original source port)
-/// - REQ-4: Parity Preservation (bidirectional radiating search with 16 probes)
-/// - Parity Relaxation: Fallback to opposite parity when same-parity pool is exhausted (8 probes)
+/// RFC 4787 port allocation:
+/// - Port preservation (REQ-3)
+/// - Parity preservation (REQ-4)
+/// - Parity relaxation fallback
 #[inline(always)]
 pub fn select_rfc4787_port<F: FnMut(u16) -> bool>(
     preferred: u16,
@@ -150,12 +149,12 @@ pub fn select_rfc4787_port<F: FnMut(u16) -> bool>(
         return None;
     }
 
-    // Step 1: Port preservation (RFC 4787 REQ-3)
+    // 1. Port preservation
     if preferred >= min_port && preferred <= max_port && is_free(preferred) {
         return Some(preferred);
     }
 
-    // Step 2: Parity preservation (RFC 4787 REQ-4)
+    // 2. Parity preservation
     let parity = (preferred & 1) as u32;
     let minp = min_port as u32;
     let maxp = max_port as u32;
@@ -164,36 +163,33 @@ pub fn select_rfc4787_port<F: FnMut(u16) -> bool>(
     if first <= maxp {
         let cnt = (maxp - first) / 2 + 1;
         if cnt > 0 {
-            let idx = (seed as usize) % (cnt as usize);
+            let mut port = first + 2 * ((seed as u32) % cnt);
             let mut i: usize = 0;
-            // Up to 16 bidirectional probes with same parity
-            while i < 16 && (i as u32) < cnt {
-                let d = (i + 1) >> 1;
-                let j = if (i & 1) != 0 {
-                    (idx + (cnt as usize) - (d % (cnt as usize))) % (cnt as usize)
-                } else {
-                    (idx + (d % (cnt as usize))) % (cnt as usize)
-                };
-                let port = first + 2 * (j as u32);
-                if port != preferred as u32 && port >= minp && port <= maxp && is_free(port as u16)
-                {
+            while i < 8 && (i as u32) < cnt {
+                if port != preferred as u32 && is_free(port as u16) {
                     return Some(port as u16);
+                }
+                port += 2;
+                if port > maxp {
+                    port = first;
                 }
                 i += 1;
             }
         }
     }
 
-    // Step 3: Parity relaxation fallback when same-parity pool is exhausted
+    // 3. Parity relaxation fallback
     let total_ports = maxp - minp + 1;
     if total_ports > 0 {
-        let alt_idx = (seed.wrapping_add(1) as usize) % (total_ports as usize);
+        let mut port = minp + (seed.wrapping_add(1) % total_ports);
         let mut k: usize = 0;
-        // Bounded fallback probes (8 steps)
-        while k < 8 && (k as u32) < total_ports {
-            let port = minp + (((alt_idx + k) as u32) % total_ports);
+        while k < 4 && (k as u32) < total_ports {
             if port != preferred as u32 && is_free(port as u16) {
                 return Some(port as u16);
+            }
+            port += 1;
+            if port > maxp {
+                port = minp;
             }
             k += 1;
         }

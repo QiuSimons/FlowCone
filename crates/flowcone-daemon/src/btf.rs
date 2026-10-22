@@ -9,13 +9,11 @@ pub fn find_btf(custom_path: Option<&str>) -> Option<Btf> {
         return Some(b);
     }
 
-    // 1. Kernel built-in BTF
     if let Ok(b) = Btf::from_sys_fs() {
         println!("flowcone: loaded kernel sysfs BTF");
         return Some(b);
     }
 
-    // 2. Standard detached BTF locations
     let candidates = [
         "/usr/lib/debug/boot/vmlinux",
         "/boot/vmlinux",

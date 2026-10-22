@@ -7,7 +7,6 @@ fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let dest_path = Path::new(&out_dir).join("flowcone-ebpf.bin");
 
-    // 1. Check explicit environment override
     if let Ok(custom_path) = env::var("FLOWCONE_EBPF_PATH") {
         let p = PathBuf::from(custom_path);
         if p.exists() {
@@ -17,11 +16,11 @@ fn main() {
         }
     }
 
-    // 2. Search common pre-compiled locations
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
 
     let candidates = [
+        manifest_path.join("ebpf/flowcone-ebpf.bin"),
         manifest_path.join("../../target-build/bpfel-unknown-none/release/flowcone-ebpf"),
         manifest_path.join("../../target/bpfel-unknown-none/release/flowcone-ebpf"),
         manifest_path
@@ -37,7 +36,6 @@ fn main() {
         }
     }
 
-    // 3. Attempt automatic build if eBPF source is present
     let ebpf_dir = manifest_path.join("../flowcone-ebpf");
     if ebpf_dir.join("Cargo.toml").exists() {
         println!("cargo:warning=flowcone-ebpf binary not found, attempting automatic compilation...");

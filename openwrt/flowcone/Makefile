@@ -24,7 +24,7 @@ PKG_BUILD_FLAGS:=no-mips16
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
 
-FLOWCONE_RUST_ARCH_DEPENDS:=@(aarch64||arm||i386||i686||powerpc64||riscv64||x86_64)
+FLOWCONE_RUST_ARCH_DEPENDS:=@(aarch64||arm||i386||i686||riscv64||x86_64)
 
 define Package/flowcone
   SECTION:=net

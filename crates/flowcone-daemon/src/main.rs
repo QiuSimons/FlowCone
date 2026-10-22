@@ -138,7 +138,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_signals();
     let notifier = Arc::new(ShutdownNotifier::new());
 
-    // 1. Wait for WAN interface to be ready (e.g. PPPoE dialup or USB modem)
     let iface_path = format!("/sys/class/net/{}", config.iface);
     if !Path::new(&iface_path).exists() {
         println!(
@@ -159,7 +158,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 2. Load eBPF bytecode with BTF
     let btf = btf::find_btf(config.btf_path.as_deref());
     let mut loader = EbpfLoader::new();
     if let Some(ref b) = btf {
@@ -167,7 +165,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut bpf = loader.load(EBPF_BYTES)?;
 
-    // 3. Assemble SessionManager
     let session_mgr = Arc::new(Mutex::new(SessionManager::new(
         Array::try_from(bpf.take_map("CONFIG").ok_or("map CONFIG not found")?)?,
         HashMap::try_from(
@@ -196,12 +193,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?,
     )));
 
-    // 4. Apply self-contained nftables rules
-    if config.manage_nft {
-        firewall::apply_rules(config.min_port, config.max_port, config.verbose);
+    let l2_len = netlink::get_iface_l2_len(&config.iface);
+    if config.verbose {
+        println!(
+            "flowcone: detected L2 header length: {} bytes for interface {}",
+            l2_len, config.iface
+        );
     }
 
-    // 5. Attach TC Ingress and Egress
     let _ = qdisc_add_clsact(&config.iface);
     attach_tc_classifier(
         &mut bpf,
@@ -216,7 +215,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         TcAttachType::Egress,
     )?;
 
-    // 6. Spawn WAN IP watcher thread
     let ip_session = Arc::clone(&session_mgr);
     let ip_cfg = config.clone();
     let ip_notifier = Arc::clone(&notifier);
@@ -224,68 +222,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_ip4: u32 = 0;
         let mut last_ip6 = [0u8; 16];
         let mut last_effective_v6: u32 = 0;
+        let mut applied_v4 = false;
+        let mut applied_v6 = false;
 
         loop {
-            let cur_ip4 = if ip_cfg.enable_v4 {
-                netlink::get_iface_ipv4(&ip_cfg.iface)
-            } else {
-                None
-            };
-            let cur_ip6 = if ip_cfg.enable_v6 {
-                netlink::get_iface_ipv6(&ip_cfg.iface)
-            } else {
-                None
-            };
-
             let mut config_dirty = false;
             let mut resolved_ip4 = last_ip4;
             let mut resolved_ip6 = last_ip6;
 
             if ip_cfg.enable_v4 {
-                if let Some(ip4_bytes) = cur_ip4 {
-                    let ip4 = u32::from_ne_bytes(ip4_bytes);
-                    if ip4 != last_ip4 {
-                        println!(
-                            "flowcone: WAN IPv4 updated to {}",
-                            Ipv4Addr::from(ip4_bytes)
-                        );
-                        if last_ip4 != 0 {
-                            println!("flowcone: flushing stale v4 mappings");
-                            if let Ok(mut mgr) = ip_session.lock() {
-                                mgr.clear_v4_mappings();
+                match netlink::get_iface_ipv4(&ip_cfg.iface) {
+                    Ok(Some(ip4_bytes)) => {
+                        let ip4 = u32::from_ne_bytes(ip4_bytes);
+                        if ip4 != last_ip4 {
+                            println!(
+                                "flowcone: WAN IPv4 updated to {}",
+                                Ipv4Addr::from(ip4_bytes)
+                            );
+                            if last_ip4 != 0 {
+                                println!("flowcone: flushing stale v4 mappings");
+                                if let Ok(mut mgr) = ip_session.lock() {
+                                    mgr.clear_v4_mappings();
+                                }
                             }
+                            last_ip4 = ip4;
+                            resolved_ip4 = ip4;
+                            config_dirty = true;
                         }
-                        last_ip4 = ip4;
-                        resolved_ip4 = ip4;
-                        config_dirty = true;
                     }
-                } else if last_ip4 != 0 {
-                    println!("flowcone: WAN interface lost IPv4");
-                    last_ip4 = 0;
-                    resolved_ip4 = 0;
-                    config_dirty = true;
+                    Ok(None) => {
+                        if last_ip4 != 0 {
+                            println!("flowcone: WAN interface lost IPv4");
+                            last_ip4 = 0;
+                            resolved_ip4 = 0;
+                            config_dirty = true;
+                        }
+                    }
+                    Err(e) => {
+                        if ip_cfg.verbose {
+                            eprintln!("flowcone: warning: transient netlink IPv4 query error: {:?}", e);
+                        }
+                    }
                 }
             }
 
             if ip_cfg.enable_v6 {
-                if let Some(ip6) = cur_ip6 {
-                    if ip6 != last_ip6 {
-                        println!("flowcone: WAN IPv6 updated to {}", Ipv6Addr::from(ip6));
-                        if last_ip6 != [0u8; 16] {
-                            println!("flowcone: flushing stale v6 mappings");
-                            if let Ok(mut mgr) = ip_session.lock() {
-                                mgr.clear_v6_mappings();
+                match netlink::get_iface_ipv6(&ip_cfg.iface) {
+                    Ok(Some(ip6)) => {
+                        if ip6 != last_ip6 {
+                            println!("flowcone: WAN IPv6 updated to {}", Ipv6Addr::from(ip6));
+                            if last_ip6 != [0u8; 16] {
+                                println!("flowcone: flushing stale v6 mappings");
+                                if let Ok(mut mgr) = ip_session.lock() {
+                                    mgr.clear_v6_mappings();
+                                }
                             }
+                            last_ip6 = ip6;
+                            resolved_ip6 = ip6;
+                            config_dirty = true;
                         }
-                        last_ip6 = ip6;
-                        resolved_ip6 = ip6;
-                        config_dirty = true;
                     }
-                } else if last_ip6 != [0u8; 16] {
-                    println!("flowcone: WAN interface lost IPv6");
-                    last_ip6 = [0u8; 16];
-                    resolved_ip6 = [0u8; 16];
-                    config_dirty = true;
+                    Ok(None) => {
+                        if last_ip6 != [0u8; 16] {
+                            println!("flowcone: WAN interface lost IPv6");
+                            last_ip6 = [0u8; 16];
+                            resolved_ip6 = [0u8; 16];
+                            config_dirty = true;
+                        }
+                    }
+                    Err(e) => {
+                        if ip_cfg.verbose {
+                            eprintln!("flowcone: warning: transient IPv6 query error: {:?}", e);
+                        }
+                    }
                 }
             }
 
@@ -312,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         wan_ip4: resolved_ip4,
                         bypass_mark_mask: ip_cfg.bypass_mark_mask,
                         bypass_mark_val: ip_cfg.bypass_mark_val,
-                        _pad: 0,
+                        l2_len,
                         wan_ip6: resolved_ip6,
                         min_port4: ip_cfg.min_port,
                         max_port4: ip_cfg.max_port,
@@ -327,6 +336,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     mgr.set_config(g_cfg);
                 }
+
+                if ip_cfg.manage_nft {
+                    let active_v4 = ip_cfg.enable_v4 && resolved_ip4 != 0;
+                    let active_v6 = effective_v6 != 0;
+                    if active_v4 != applied_v4 || active_v6 != applied_v6 {
+                        firewall::sync_fw4_rules(
+                            &ip_cfg.iface,
+                            ip_cfg.min_port,
+                            ip_cfg.max_port,
+                            active_v4,
+                            active_v6,
+                            ip_cfg.verbose,
+                        );
+                        applied_v4 = active_v4;
+                        applied_v6 = active_v6;
+                    }
+                }
             }
 
             let sleep_dur = Duration::from_secs(if resolved_ip4 != 0 { 5 } else { 1 });
@@ -336,7 +362,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 7. Spawn janitor GC thread
     let gc_session = Arc::clone(&session_mgr);
     let timeout_ns = config.timeout_sec * 1_000_000_000;
     let verbose = config.verbose;
@@ -358,7 +383,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 8. Wait for shutdown signal (blocking read on self-pipe)
     let mut sig_buf = [0u8; 1];
     while RUNNING.load(Ordering::SeqCst) {
         match rustix::io::read(&sig_read_end, &mut sig_buf) {
@@ -376,17 +400,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
     notifier.notify_shutdown();
 
-    // Fail-open: disable translation before detaching
+    if config.manage_nft {
+        firewall::remove_rules(config.verbose);
+    }
+
     if let Ok(mut mgr) = session_mgr.lock() {
         mgr.disable_fail_open();
     }
 
     let _ = ip_thread.join();
     let _ = gc_thread.join();
-
-    if config.manage_nft {
-        firewall::remove_rules(config.verbose);
-    }
 
     println!("flowcone: stopped");
     Ok(())

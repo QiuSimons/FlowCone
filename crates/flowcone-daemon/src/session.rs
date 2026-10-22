@@ -88,7 +88,7 @@ fn sweep_family<V: ConeBinding>(
     now_ns: u64,
     timeout_ns: u64,
 ) -> usize {
-    // 1. Collect candidates exceeding timeout
+    // Find expired outbound bindings
     expired_buf.clear();
     for (key, val) in ob_map.iter().flatten() {
         let port_be = val.port_be();
@@ -103,7 +103,6 @@ fn sweep_family<V: ConeBinding>(
         }
     }
 
-    // 2. Double-check and atomic slot purge
     let mut swept = 0;
     for &(key, port_be) in expired_buf.iter() {
         let port_host = u16::from_be(port_be);
@@ -124,7 +123,7 @@ fn sweep_family<V: ConeBinding>(
         swept += 1;
     }
 
-    // 3. Self-healing reconciliation: sweep orphaned inbound bindings
+    // Sweep orphaned inbound bindings (with 2s grace period)
     orphan_buf.clear();
     for (port_host, in_val) in ib_map.iter().flatten() {
         let ep_key = in_val.make_key();
@@ -132,7 +131,7 @@ fn sweep_family<V: ConeBinding>(
             Ok(ob) => u16::from_be(ob.port_be()) != port_host,
             Err(_) => true,
         };
-        if is_orphan || now_ns.saturating_sub(in_val.last_seen()) > timeout_ns {
+        if is_orphan && now_ns.saturating_sub(in_val.last_seen()) > 2_000_000_000 {
             orphan_buf.push(port_host);
         }
     }
@@ -210,7 +209,7 @@ impl SessionManager {
             wan_ip4: 0,
             bypass_mark_mask: 0,
             bypass_mark_val: 0,
-            _pad: 0,
+            l2_len: 0,
             wan_ip6: [0u8; 16],
             min_port4: 0,
             max_port4: 0,
