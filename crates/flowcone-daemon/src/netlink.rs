@@ -1,4 +1,8 @@
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, recv, send, socket_with};
+use rustix::time::Timespec;
+use std::time::Duration;
 
 
 #[inline(always)]
@@ -144,6 +148,86 @@ pub fn get_iface_l2_len(ifname: &str) -> u32 {
     14
 }
 
+/// rtnetlink multicast groups: link state and IPv4/IPv6 address changes.
+const RTNLGRP_LINK: u32 = 1;
+const RTNLGRP_IPV4_IFADDR: u32 = 5;
+const RTNLGRP_IPV6_IFADDR: u32 = 9;
+
+/// Subscription to rtnetlink link/address notifications.
+pub struct EventMonitor {
+    sock: OwnedFd,
+}
+
+impl EventMonitor {
+    pub fn new() -> Result<Self, NetlinkError> {
+        let sock = socket_with(
+            AddressFamily::NETLINK,
+            SocketType::RAW,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(|_| NetlinkError::SocketError)?;
+
+        let groups = (1u32 << (RTNLGRP_LINK - 1))
+            | (1u32 << (RTNLGRP_IPV4_IFADDR - 1))
+            | (1u32 << (RTNLGRP_IPV6_IFADDR - 1));
+        // rustix does not expose sockaddr_nl, so bind(2) is called directly.
+        unsafe {
+            let mut addr: libc::sockaddr_nl = core::mem::zeroed();
+            addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            addr.nl_groups = groups;
+            let ret = libc::bind(
+                sock.as_raw_fd(),
+                &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
+                core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                return Err(NetlinkError::SocketError);
+            }
+        }
+
+        Ok(Self { sock })
+    }
+
+    /// Wait for a notification, a wake pipe byte or the timeout.
+    pub fn wait(&self, wake: BorrowedFd<'_>, timeout: Duration) -> bool {
+        let ts = Timespec {
+            tv_sec: timeout.as_secs() as i64,
+            tv_nsec: timeout.subsec_nanos() as i64,
+        };
+        let mut fds = [
+            PollFd::new(&self.sock, PollFlags::IN),
+            PollFd::new(&wake, PollFlags::IN),
+        ];
+
+        match poll(&mut fds, Some(&ts)) {
+            Ok(n) if n > 0 => {
+                if fds[0].revents().contains(PollFlags::IN) {
+                    // Drain the socket, otherwise the next poll returns at once.
+                    let mut buf = [0u8; 4096];
+                    while let Ok((n, _)) = recv(&self.sock, &mut buf, rustix::net::RecvFlags::DONTWAIT)
+                    {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Read the kernel ifindex of an interface (`None` if it does not exist).
+pub fn get_ifindex(ifname: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", ifname))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Retrieve global IPv6 address from standard Linux /proc/net/if_inet6.
 /// Returns `Ok(Some(ip))` if found, `Ok(None)` if file read succeeded but interface has no global IPv6,
 /// or `Err(e)` on filesystem I/O error.
@@ -152,48 +236,60 @@ pub fn get_iface_ipv6(ifname: &str) -> Result<Option<[u8; 16]>, std::io::Error> 
     Ok(parse_proc_inet6(&content, ifname))
 }
 
-/// Pure parser function for /proc/net/if_inet6 lines (enables unit testing).
-/// Filters out temporary (0x01, RFC 4941 privacy), tentative (0x40), failed (0x08), and deprecated (0x20).
-/// Prefers permanent (0x80) global addresses.
+/// Pure parser for /proc/net/if_inet6 lines.
+///
+/// Skips temporary, tentative, failed and deprecated addresses and prefers
+/// permanent ones. Only 2000::/3 is accepted: ULA also has scope 00 but is
+/// not a valid WAN address. The kernel prints the flags as a u8.
 pub fn parse_proc_inet6(content: &str, target_ifname: &str) -> Option<[u8; 16]> {
     let mut fallback = None;
     for line in content.lines() {
         let mut parts = line.split_whitespace();
-        let hex_addr = parts.next()?;
-        let _ifindex = parts.next()?;
-        let _plen = parts.next()?;
-        let scope = parts.next()?;
-        let flags_str = parts.next()?;
-        let dev = parts.next()?;
+        let (Some(hex_addr), Some(_ifindex), Some(_plen), Some(scope), Some(flags_str), Some(dev)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            // A short line must not abort the whole scan.
+            continue;
+        };
 
         // scope 00 = global scope
-        if dev == target_ifname && scope == "00" && hex_addr.len() == 32 {
-            let flags = u8::from_str_radix(flags_str, 16).unwrap_or(0);
-            // Skip IFA_F_TEMPORARY (0x01), IFA_F_DADFAILED (0x08), IFA_F_DEPRECATED (0x20), IFA_F_TENTATIVE (0x40)
-            if (flags & 0x69) != 0 {
-                continue;
-            }
+        if dev != target_ifname || scope != "00" || hex_addr.len() != 32 {
+            continue;
+        }
 
-            let mut bytes = [0u8; 16];
-            let mut valid = true;
-            for i in 0..16 {
-                if let Ok(b) = u8::from_str_radix(&hex_addr[i * 2..i * 2 + 2], 16) {
-                    bytes[i] = b;
-                } else {
-                    valid = false;
-                    break;
-                }
-            }
-            if !valid {
-                continue;
-            }
+        let Ok(flags) = u8::from_str_radix(flags_str, 16) else {
+            continue;
+        };
+        // Skip IFA_F_TEMPORARY (0x01), IFA_F_DADFAILED (0x08), IFA_F_DEPRECATED (0x20), IFA_F_TENTATIVE (0x40)
+        if (flags & 0x69) != 0 {
+            continue;
+        }
 
-            // Prefer permanent address (IFA_F_PERMANENT = 0x80)
-            if (flags & 0x80) != 0 {
-                return Some(bytes);
-            } else if fallback.is_none() {
-                fallback = Some(bytes);
+        let mut bytes = [0u8; 16];
+        let mut valid = true;
+        for i in 0..16 {
+            if let Ok(b) = u8::from_str_radix(&hex_addr[i * 2..i * 2 + 2], 16) {
+                bytes[i] = b;
+            } else {
+                valid = false;
+                break;
             }
+        }
+        // RFC 4291 global unicast 2000::/3; excludes ULA fc00::/7.
+        if !valid || (bytes[0] & 0xe0) != 0x20 {
+            continue;
+        }
+
+        // Prefer permanent address (IFA_F_PERMANENT = 0x80)
+        if (flags & 0x80) != 0 {
+            return Some(bytes);
+        } else if fallback.is_none() {
+            fallback = Some(bytes);
         }
     }
     fallback
@@ -226,5 +322,53 @@ fe8000000000000002155dfffe123456 02 40 20 80     eth0
 
         assert_eq!(parse_proc_inet6(sample, "lo"), None); // scope 10 != 00
         assert_eq!(parse_proc_inet6(sample, "eth0"), None); // scope 20 != 00
+    }
+
+    #[test]
+    fn test_parse_proc_inet6_rejects_ula() {
+        // ULA has scope 00 as well; it must never become the WAN NAT66 source.
+        let sample = "\
+fd60202600000000001132fffe2c2777 03 40 00 80     eth1
+";
+        assert_eq!(parse_proc_inet6(sample, "eth1"), None);
+
+        // A permanent ULA must not shadow a (non permanent) GUA.
+        let sample2 = "\
+fd60202600000000001132fffe2c2777 03 40 00 80     eth1
+240e039010879391001132fffe243f6f 03 40 00 00     eth1
+";
+        assert_eq!(
+            parse_proc_inet6(sample2, "eth1"),
+            Some([
+                0x24, 0x0e, 0x03, 0x90, 0x10, 0x87, 0x93, 0x91, 0x00, 0x11, 0x32, 0xff, 0xfe, 0x24,
+                0x3f, 0x6f
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_proc_inet6_skips_short_lines() {
+        // A truncated line must not abort the scan (no `?` early return).
+        let sample = "\
+this line is broken
+240e039010879391001132fffe243f6f 03 40 00 80     eth1
+";
+        assert!(parse_proc_inet6(sample, "eth1").is_some());
+    }
+
+    #[test]
+    fn test_parse_proc_inet6_bad_flags() {
+        // Unparsable flags (defensive; the kernel always prints a u8) skip the line.
+        let sample = "\
+240e039010879391001132fffe243f6f 03 40 00 zz     eth1
+";
+        assert_eq!(parse_proc_inet6(sample, "eth1"), None);
+    }
+
+    #[test]
+    fn test_get_ifindex_loopback() {
+        // lo always exists and has ifindex 1.
+        assert_eq!(get_ifindex("lo"), Some(1));
+        assert_eq!(get_ifindex("does-not-exist-xyz"), None);
     }
 }

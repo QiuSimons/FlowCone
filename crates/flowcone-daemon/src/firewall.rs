@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const FW4_USER_PATH: &str = "/etc/firewall4.user";
+const FW4_NFTABLES_D_DIR: &str = "/usr/share/nftables.d";
 const FW4_CHAIN_PRE_SRCNAT_DIR: &str = "/usr/share/nftables.d/chain-pre/srcnat";
 const FW4_CHAIN_PRE_SRCNAT_FILE: &str = "/usr/share/nftables.d/chain-pre/srcnat/10-flowcone.nft";
 const FW4_CHAIN_PRE_FORWARD_DIR: &str = "/usr/share/nftables.d/chain-pre/forward";
@@ -34,11 +35,17 @@ pub fn check_hardware_offload_warning() {
     }
 }
 
+/// IPv4 source set of the srcnat exemption, matching is_private_ipv4().
+fn v4_src_set() -> String {
+    flowcone_common::INTERNAL_V4_PREFIXES.join(", ")
+}
+
 /// Generate IPv4 srcnat exemption rule.
 /// Skips masquerade for private IPv4 source traffic on WAN interface.
 pub fn generate_fw4_srcnat_rule_v4(iface: &str) -> String {
     format!(
-        "oifname \"{iface}\" meta nfproto ipv4 meta l4proto udp ip saddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }} counter return comment \"flowcone\""
+        "oifname \"{iface}\" meta nfproto ipv4 meta l4proto udp ip saddr {{ {} }} counter return comment \"flowcone\"",
+        v4_src_set()
     )
 }
 
@@ -59,7 +66,8 @@ pub fn generate_fw4_srcnat_rule_v6(iface: &str, is_masq: bool) -> String {
 /// Generate IPv4 srcnat exemption rule for 'ip' family table (e.g. iptables-nft 'table ip nat').
 pub fn generate_srcnat_rule_ip(iface: &str) -> String {
     format!(
-        "oifname \"{iface}\" meta l4proto udp ip saddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }} counter return comment \"flowcone\""
+        "oifname \"{iface}\" meta l4proto udp ip saddr {{ {} }} counter return comment \"flowcone\"",
+        v4_src_set()
     )
 }
 
@@ -115,9 +123,10 @@ pub fn generate_standalone_script(iface: &str) -> String {
          \x20   }}\n\
          \x20   chain srcnat {{\n\
          \x20       type nat hook postrouting priority srcnat - 1; policy accept;\n\
-         \x20       oifname \"{iface}\" meta l4proto udp ip saddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }} counter return comment \"flowcone\"\n\
+         \x20       oifname \"{iface}\" meta l4proto udp ip saddr {{ {} }} counter return comment \"flowcone\"\n\
          \x20   }}\n\
-         }}\n"
+         }}\n",
+        v4_src_set()
     )
 }
 
@@ -328,50 +337,104 @@ pub fn find_all_flowcone_rules(ruleset_output: &str) -> Vec<RuleToDelete> {
     rules
 }
 
-/// Delete all injected flowcone rules from any table/chain across the entire nftables ruleset
-pub fn delete_all_injected_rules(verbose: bool) {
-    if let Ok(out) = Command::new("nft").args(["-a", "list", "ruleset"]).output() {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let rules = find_all_flowcone_rules(&text);
-            for r in rules {
-                let res = Command::new("nft")
-                    .args([
-                        "delete",
-                        "rule",
-                        &r.family,
-                        &r.table,
-                        &r.chain,
-                        "handle",
-                        &r.handle.to_string(),
-                    ])
-                    .output();
-                if let Ok(out) = res {
-                    if !out.status.success() && verbose {
-                        eprintln!(
-                            "flowcone: warning: failed to delete handle {} in {} {} {}: {}",
-                            r.handle,
-                            r.family,
-                            r.table,
-                            r.chain,
-                            String::from_utf8_lossy(&out.stderr)
-                        );
-                    }
-                }
-                if verbose {
-                    println!(
-                        "flowcone: removed rule from {} {} {} (handle {})",
-                        r.family, r.table, r.chain, r.handle
-                    );
+/// Run one nft transaction (`nft -f -` applies the file as one batch).
+fn nft_apply(script: &str) -> Result<(), String> {
+    if script.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn nft: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(script.as_bytes());
+    }
+
+    match child.wait_with_output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(e) => Err(format!("failed to wait for nft: {e}")),
+    }
+}
+
+fn nft_output(args: &[&str]) -> Option<String> {
+    let out = Command::new("nft").args(args).output().ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// `nft -a list ruleset` is the only way to enumerate rule handles.
+fn nft_ruleset_text() -> Option<String> {
+    nft_output(&["-a", "list", "ruleset"])
+}
+
+fn nft_table_exists(family: &str, table: &str) -> bool {
+    Command::new("nft")
+        .args(["list", "table", family, table])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Delete statements for already injected rules.
+fn build_delete_script(rules: &[RuleToDelete]) -> String {
+    let mut script = String::new();
+    for r in rules {
+        script.push_str(&format!(
+            "delete rule {} {} {} handle {}\n",
+            r.family, r.table, r.chain, r.handle
+        ));
+    }
+    script
+}
+
+/// Apply `deletes + body`; retry without the deletes if a handle is gone.
+fn nft_apply_with_fallback(deletes: &str, body: &str, what: &str) -> bool {
+    match nft_apply(&format!("{deletes}{body}")) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "flowcone: warning: {} transaction failed ({}), retrying without stale rule deletes",
+                what, e
+            );
+            match nft_apply(body) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("flowcone: error: {} failed: {}", what, e);
+                    false
                 }
             }
         }
     }
 }
 
-/// Delete injected flowcone rules from inet fw4 chains (srcnat & forward)
-pub fn delete_injected_fw4_rules(verbose: bool) {
-    delete_all_injected_rules(verbose);
+/// Delete all injected flowcone rules from any table/chain in one transaction.
+pub fn delete_all_injected_rules(verbose: bool) {
+    let Some(text) = nft_ruleset_text() else {
+        return;
+    };
+    let rules = find_all_flowcone_rules(&text);
+    if verbose {
+        for r in &rules {
+            println!(
+                "flowcone: removing rule from {} {} {} (handle {})",
+                r.family, r.table, r.chain, r.handle
+            );
+        }
+    }
+    if let Err(e) = nft_apply(&build_delete_script(&rules)) {
+        eprintln!("flowcone: warning: failed to delete injected rules: {}", e);
+    }
 }
 
 pub fn strip_fw4_user_block(content: &str) -> String {
@@ -441,9 +504,12 @@ pub fn update_chain_pre_files(
         let _ = fs::remove_file(FW4_CHAIN_PRE_SRCNAT_FILE);
     }
 
-    let fwd_rules = generate_fw4_forward_rules();
-    let fwd_content = fwd_rules.join("\n") + "\n";
-    let _ = fs::write(FW4_CHAIN_PRE_FORWARD_FILE, fwd_content);
+    if enable_v4 || enable_v6 {
+        let fwd_content = generate_fw4_forward_rules().join("\n") + "\n";
+        let _ = fs::write(FW4_CHAIN_PRE_FORWARD_FILE, fwd_content);
+    } else {
+        let _ = fs::remove_file(FW4_CHAIN_PRE_FORWARD_FILE);
+    }
 }
 
 pub fn clean_chain_pre_files() {
@@ -451,8 +517,114 @@ pub fn clean_chain_pre_files() {
     let _ = fs::remove_file(FW4_CHAIN_PRE_FORWARD_FILE);
 }
 
-/// Synchronize firewall rules with current protocol and address state.
-/// Called dynamically when WAN IPv4 or IPv6 state changes.
+/// Insert statements for `table inet fw4`.
+fn build_fw4_insert_script(
+    iface: &str,
+    enable_v4: bool,
+    enable_v6: bool,
+    is_v6_masq: bool,
+) -> String {
+    let mut script = String::new();
+    if enable_v4 {
+        script.push_str(&format!(
+            "insert rule inet fw4 srcnat {}\n",
+            generate_fw4_srcnat_rule_v4(iface)
+        ));
+    }
+    if enable_v6 {
+        script.push_str(&format!(
+            "insert rule inet fw4 srcnat {}\n",
+            generate_fw4_srcnat_rule_v6(iface, is_v6_masq)
+        ));
+    }
+    if enable_v4 || enable_v6 {
+        for fwd in generate_fw4_forward_rules() {
+            script.push_str(&format!("insert rule inet fw4 forward {}\n", fwd));
+        }
+    }
+    script
+}
+
+/// Insert statements for the srcnat chains of a generic Linux firewall.
+fn build_primary_insert_script(
+    iface: &str,
+    chains: &[&NftBaseChain],
+    enable_v4: bool,
+    enable_v6: bool,
+    is_v6_masq: bool,
+) -> String {
+    let mut script = String::new();
+    for c in chains {
+        match c.family.as_str() {
+            "inet" => {
+                if enable_v4 {
+                    script.push_str(&format!(
+                        "insert rule inet {} {} {}\n",
+                        c.table,
+                        c.name,
+                        generate_fw4_srcnat_rule_v4(iface)
+                    ));
+                }
+                if enable_v6 {
+                    script.push_str(&format!(
+                        "insert rule inet {} {} {}\n",
+                        c.table,
+                        c.name,
+                        generate_fw4_srcnat_rule_v6(iface, is_v6_masq)
+                    ));
+                }
+            }
+            "ip" => {
+                if enable_v4 {
+                    script.push_str(&format!(
+                        "insert rule ip {} {} {}\n",
+                        c.table,
+                        c.name,
+                        generate_srcnat_rule_ip(iface)
+                    ));
+                }
+            }
+            "ip6" => {
+                if enable_v6 {
+                    script.push_str(&format!(
+                        "insert rule ip6 {} {} {}\n",
+                        c.table,
+                        c.name,
+                        generate_srcnat_rule_ip6(iface, is_v6_masq)
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    script
+}
+
+/// Prefer /usr/share/nftables.d/chain-pre (loaded natively by fw4); the
+/// /etc/firewall4.user fallback would inject the same rules twice.
+fn use_chain_pre() -> bool {
+    // Probe the directory fw4 scans: on a fresh install the chain-pre/<chain>
+    // subdirectories do not exist yet (update_chain_pre_files creates them).
+    Path::new(FW4_NFTABLES_D_DIR).is_dir() && auto_includes_enabled()
+}
+
+fn auto_includes_enabled() -> bool {
+    match Command::new("uci")
+        .args(["get", "firewall.@defaults[0].auto_includes"])
+        .output()
+    {
+        Ok(out) if out.status.success() => !matches!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "0" | "no" | "false" | "off" | "disabled"
+        ),
+        // no uci, or the option is unset: fw4 defaults to enabled
+        _ => true,
+    }
+}
+
+/// Sync the firewall rules with the current address/protocol state.
+///
+/// Applied as one transaction, so the rules are never missing in between.
 pub fn sync_fw4_rules(
     iface: &str,
     min_port: u16,
@@ -461,176 +633,86 @@ pub fn sync_fw4_rules(
     enable_v6: bool,
     verbose: bool,
 ) {
-    let is_fw4 = has_table_inet_fw4();
+    check_hardware_offload_warning();
+    let is_v6_masq = is_ipv6_masq_enabled();
 
-    if is_fw4 {
-        check_hardware_offload_warning();
-        delete_injected_fw4_rules(verbose);
+    // Rules injected by an earlier run, from any table/chain.
+    let deletes = nft_ruleset_text()
+        .map(|text| build_delete_script(&find_all_flowcone_rules(&text)))
+        .unwrap_or_default();
 
-        let is_v6_masq = is_ipv6_masq_enabled();
+    if has_table_inet_fw4() {
+        let native_includes = use_chain_pre();
+        let body = build_fw4_insert_script(iface, enable_v4, enable_v6, is_v6_masq);
+        nft_apply_with_fallback(&deletes, &body, "inet fw4 rule sync");
 
-        if enable_v4 {
-            let r4 = generate_fw4_srcnat_rule_v4(iface);
-            let res = Command::new("nft")
-                .args(["insert", "rule", "inet", "fw4", "srcnat"])
-                .args(r4.split_whitespace())
-                .output();
-            if let Ok(out) = res {
-                if !out.status.success() {
-                    eprintln!(
-                        "flowcone: error: failed to insert v4 srcnat rule: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                }
-            }
-        }
-
-        if enable_v6 {
-            let r6 = generate_fw4_srcnat_rule_v6(iface, is_v6_masq);
-            let res = Command::new("nft")
-                .args(["insert", "rule", "inet", "fw4", "srcnat"])
-                .args(r6.split_whitespace())
-                .output();
-            if let Ok(out) = res {
-                if !out.status.success() {
-                    eprintln!(
-                        "flowcone: error: failed to insert v6 srcnat rule: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                }
-            }
-        }
-
-        if enable_v4 || enable_v6 {
-            for fwd in generate_fw4_forward_rules() {
-                let res = Command::new("nft")
-                    .args(["insert", "rule", "inet", "fw4", "forward"])
-                    .args(fwd.split_whitespace())
-                    .output();
-                if let Ok(out) = res {
-                    if !out.status.success() {
-                        eprintln!(
-                            "flowcone: error: failed to insert forward rule: {}",
-                            String::from_utf8_lossy(&out.stderr)
-                        );
-                    }
-                }
-            }
-        }
-
-        update_chain_pre_files(iface, enable_v4, enable_v6, is_v6_masq);
-
-        if Path::new("/etc").exists() {
+        if native_includes {
+            update_chain_pre_files(iface, enable_v4, enable_v6, is_v6_masq);
+            clean_firewall4_user_file();
+        } else {
+            clean_chain_pre_files();
             update_firewall4_user_file(iface, enable_v4, enable_v6, is_v6_masq);
         }
 
         if verbose {
             println!(
-                "flowcone: synced inet fw4 rules (iface {}, v4={}, v6={}, ports {}-{})",
-                iface, enable_v4, enable_v6, min_port, max_port
+                "flowcone: synced inet fw4 rules (iface {}, v4={}, v6={}, masq6={}, ports {}-{}, native includes={})",
+                iface, enable_v4, enable_v6, is_v6_masq, min_port, max_port, native_includes
             );
         }
+        return;
+    }
+
+    let base_chains = get_existing_base_chains();
+    let postrouting_nat_chains: Vec<&NftBaseChain> = base_chains
+        .iter()
+        .filter(|c| c.hook == "postrouting" && c.chain_type == "nat")
+        .collect();
+    let forward_filter_chains: Vec<&NftBaseChain> = base_chains
+        .iter()
+        .filter(|c| c.hook == "forward" && c.chain_type == "filter")
+        .collect();
+
+    let mut body = String::new();
+    if nft_table_exists("inet", "flowcone") {
+        // nft does not flush a re-defined table, so delete it first.
+        body.push_str("delete table inet flowcone\n");
+    }
+
+    if postrouting_nat_chains.is_empty() && forward_filter_chains.is_empty() {
+        // No firewall: only the standalone table (forward accept) is needed.
+        body.push_str(&generate_standalone_script(iface));
     } else {
-        check_hardware_offload_warning();
-        delete_all_injected_rules(verbose);
-
-        let is_v6_masq = is_ipv6_masq_enabled();
-        let base_chains = get_existing_base_chains();
-
-        let postrouting_nat_chains: Vec<&NftBaseChain> = base_chains
-            .iter()
-            .filter(|c| c.hook == "postrouting" && c.chain_type == "nat")
-            .collect();
-        let forward_filter_chains: Vec<&NftBaseChain> = base_chains
-            .iter()
-            .filter(|c| c.hook == "forward" && c.chain_type == "filter")
-            .collect();
-
-        if !postrouting_nat_chains.is_empty() || !forward_filter_chains.is_empty() {
-            let _ = Command::new("nft")
-                .args(["delete", "table", "inet", "flowcone"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output();
-
-            for chain in postrouting_nat_chains {
-                match chain.family.as_str() {
-                    "inet" => {
-                        if enable_v4 {
-                            let r4 = generate_fw4_srcnat_rule_v4(iface);
-                            let _ = Command::new("nft")
-                                .args(["insert", "rule", &chain.family, &chain.table, &chain.name])
-                                .args(r4.split_whitespace())
-                                .output();
-                        }
-                        if enable_v6 {
-                            let r6 = generate_fw4_srcnat_rule_v6(iface, is_v6_masq);
-                            let _ = Command::new("nft")
-                                .args(["insert", "rule", &chain.family, &chain.table, &chain.name])
-                                .args(r6.split_whitespace())
-                                .output();
-                        }
-                    }
-                    "ip" => {
-                        if enable_v4 {
-                            let r4 = generate_srcnat_rule_ip(iface);
-                            let _ = Command::new("nft")
-                                .args(["insert", "rule", &chain.family, &chain.table, &chain.name])
-                                .args(r4.split_whitespace())
-                                .output();
-                        }
-                    }
-                    "ip6" => {
-                        if enable_v6 {
-                            let r6 = generate_srcnat_rule_ip6(iface, is_v6_masq);
-                            let _ = Command::new("nft")
-                                .args(["insert", "rule", &chain.family, &chain.table, &chain.name])
-                                .args(r6.split_whitespace())
-                                .output();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if enable_v4 || enable_v6 {
-                let fwd_rules = generate_fw4_forward_rules();
-                for chain in forward_filter_chains {
-                    for fwd in &fwd_rules {
-                        let _ = Command::new("nft")
-                            .args(["insert", "rule", &chain.family, &chain.table, &chain.name])
-                            .args(fwd.split_whitespace())
-                            .output();
-                    }
-                }
-            }
-
-            if verbose {
-                println!(
-                    "flowcone: injected rules into existing Linux firewall chains (iface {}, v4={}, v6={})",
-                    iface, enable_v4, enable_v6
-                );
-            }
-        } else {
-            let script = generate_standalone_script(iface);
-            let child = Command::new("nft")
-                .args(["-f", "-"])
-                .stdin(Stdio::piped())
-                .spawn();
-
-            if let Ok(mut c) = child {
-                if let Some(mut stdin) = c.stdin.take() {
-                    let _ = stdin.write_all(script.as_bytes());
-                }
-                let _ = c.wait();
-                if verbose {
-                    println!(
-                        "flowcone: applied standalone nftables rules (table inet flowcone on {})",
-                        iface
-                    );
+        body.push_str(&build_primary_insert_script(
+            iface,
+            &postrouting_nat_chains,
+            enable_v4,
+            enable_v6,
+            is_v6_masq,
+        ));
+        if enable_v4 || enable_v6 {
+            for c in &forward_filter_chains {
+                for fwd in generate_fw4_forward_rules() {
+                    body.push_str(&format!(
+                        "insert rule {} {} {} {}\n",
+                        c.family, c.table, c.name, fwd
+                    ));
                 }
             }
         }
+    }
+
+    nft_apply_with_fallback(&deletes, &body, "Linux firewall rule sync");
+
+    if verbose {
+        println!(
+            "flowcone: synced Linux firewall rules (iface {}, v4={}, v6={}, srcnat chains={}, forward chains={})",
+            iface,
+            enable_v4,
+            enable_v6,
+            postrouting_nat_chains.len(),
+            forward_filter_chains.len()
+        );
     }
 }
 
@@ -661,16 +743,20 @@ mod tests {
         assert!(script.contains("priority filter - 1"));
         assert!(script.contains("priority srcnat - 1"));
         assert!(script.contains("meta mark & 0x40000000 == 0x40000000 counter accept comment \"flowcone\""));
-        assert!(script.contains("oifname \"eth1\" meta l4proto udp ip saddr { 10.0.0.0/8"));
+        assert!(script.contains(&format!(
+            "oifname \"eth1\" meta l4proto udp ip saddr {{ {} }}",
+            flowcone_common::INTERNAL_V4_PREFIXES.join(", ")
+        )));
         assert!(script.contains("comment \"flowcone\""));
     }
 
     #[test]
     fn test_generate_srcnat_rule_ip_and_ip6() {
+        let set = flowcone_common::INTERNAL_V4_PREFIXES.join(", ");
         let r_ip = generate_srcnat_rule_ip("eth0");
         assert_eq!(
             r_ip,
-            "oifname \"eth0\" meta l4proto udp ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } counter return comment \"flowcone\""
+            format!("oifname \"eth0\" meta l4proto udp ip saddr {{ {set} }} counter return comment \"flowcone\"")
         );
         let r_ip6_ula = generate_srcnat_rule_ip6("eth0", false);
         assert_eq!(
@@ -688,7 +774,10 @@ mod tests {
     fn test_generate_fw4_user_block() {
         let inc = generate_fw4_user_block("eth1", true, true, false);
         assert!(inc.contains(FLOWCONE_TAG_START));
-        assert!(inc.contains("oifname \"eth1\" meta nfproto ipv4 meta l4proto udp ip saddr { 10.0.0.0/8"));
+        assert!(inc.contains(&format!(
+            "oifname \"eth1\" meta nfproto ipv4 meta l4proto udp ip saddr {{ {} }}",
+            flowcone_common::INTERNAL_V4_PREFIXES.join(", ")
+        )));
         assert!(inc.contains("meta mark & 0x40000000 == 0x40000000"));
         assert!(inc.contains("ip6 saddr fc00::/7"));
         assert!(inc.contains(FLOWCONE_TAG_END));
@@ -696,10 +785,11 @@ mod tests {
 
     #[test]
     fn test_generate_fw4_chain_pre_rules() {
+        let set = flowcone_common::INTERNAL_V4_PREFIXES.join(", ");
         let srcnat_v4 = generate_fw4_srcnat_rule_v4("eth1");
         assert_eq!(
             srcnat_v4,
-            "oifname \"eth1\" meta nfproto ipv4 meta l4proto udp ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } counter return comment \"flowcone\""
+            format!("oifname \"eth1\" meta nfproto ipv4 meta l4proto udp ip saddr {{ {set} }} counter return comment \"flowcone\"")
         );
         let srcnat_v6_ula = generate_fw4_srcnat_rule_v6("eth1", false);
         assert_eq!(
@@ -940,5 +1030,76 @@ table inet fw4 {
 
         let no_block = "#!/bin/sh\necho hi\n";
         assert_eq!(strip_fw4_user_block(no_block), no_block);
+    }
+
+    #[test]
+    fn test_build_delete_script() {
+        let rules = vec![
+            RuleToDelete {
+                family: "inet".to_string(),
+                table: "fw4".to_string(),
+                chain: "srcnat".to_string(),
+                handle: 42,
+            },
+            RuleToDelete {
+                family: "ip".to_string(),
+                table: "nat".to_string(),
+                chain: "POSTROUTING".to_string(),
+                handle: 7,
+            },
+        ];
+        assert_eq!(
+            build_delete_script(&rules),
+            "delete rule inet fw4 srcnat handle 42\ndelete rule ip nat POSTROUTING handle 7\n"
+        );
+        assert!(build_delete_script(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_build_fw4_insert_script() {
+        let both = build_fw4_insert_script("eth1", true, true, false);
+        assert!(both.contains("insert rule inet fw4 srcnat oifname \"eth1\" meta nfproto ipv4"));
+        assert!(both.contains("ip6 saddr fc00::/7"));
+        assert!(both.contains("insert rule inet fw4 forward meta mark & 0x40000000"));
+        assert_eq!(both.lines().count(), 3);
+
+        let v4_only = build_fw4_insert_script("eth1", true, false, false);
+        assert_eq!(v4_only.lines().count(), 2);
+        assert!(!v4_only.contains("nfproto ipv6"));
+
+        // masq6 detected: the v6 exemption must match all IPv6, not ULA only
+        let v6_masq = build_fw4_insert_script("eth1", false, true, true);
+        assert_eq!(v6_masq.lines().count(), 2);
+        assert!(v6_masq.contains("meta nfproto ipv6 meta l4proto udp counter return"));
+        assert!(!v6_masq.contains("fc00::/7"));
+
+        assert!(build_fw4_insert_script("eth1", false, false, false).is_empty());
+    }
+
+    #[test]
+    fn test_build_primary_insert_script() {
+        let inet = NftBaseChain {
+            family: "inet".to_string(),
+            table: "fw4".to_string(),
+            name: "srcnat".to_string(),
+            hook: "postrouting".to_string(),
+            chain_type: "nat".to_string(),
+            prio: "srcnat".to_string(),
+        };
+        let ip6 = NftBaseChain {
+            family: "ip6".to_string(),
+            table: "nat".to_string(),
+            name: "POSTROUTING".to_string(),
+            hook: "postrouting".to_string(),
+            chain_type: "nat".to_string(),
+            prio: "srcnat".to_string(),
+        };
+        let chains = vec![&inet, &ip6];
+        let script = build_primary_insert_script("eth0", &chains, true, true, true);
+        assert!(script.contains("insert rule inet fw4 srcnat oifname \"eth0\" meta nfproto ipv4"));
+        assert!(script.contains(
+            "insert rule ip6 nat POSTROUTING oifname \"eth0\" meta l4proto udp counter return"
+        ));
+        assert_eq!(script.lines().count(), 3);
     }
 }
