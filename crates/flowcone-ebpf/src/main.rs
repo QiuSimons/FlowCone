@@ -555,7 +555,16 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
                     (*val).last_seen = now;
                     mapped_port = Some((*val).port);
                 } else {
+                    // The inbound slot belongs to the same endpoint; free it so
+                    // the client keeps its port after the WAN address changed.
+                    let old_port = u16::from_be((*val).port);
                     let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
+                    if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&old_port) {
+                        if (*in_val).ip == src_ip && (*in_val).port == src_port {
+                            let _ = INBOUND_BINDINGS_V4.remove(&old_port);
+                            bitmap::free_port_v4(old_port);
+                        }
+                    }
                 }
             }
         }
@@ -600,8 +609,10 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
                                 break;
                             }
                         }
-                    } else {
-                        bitmap::mark_port_v4(alloc);
+                    } else if INBOUND_BINDINGS_V4.get_ptr_mut(&alloc).is_none() {
+                        // The slot was reserved by alloc_port_v4 but never
+                        // inserted; keep the bit only if another CPU owns it.
+                        bitmap::free_port_v4(alloc);
                     }
                 }
                 attempt += 1;
@@ -689,7 +700,14 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
                     (*val).last_seen = now;
                     mapped_port = Some((*val).port);
                 } else {
+                    let old_port = u16::from_be((*val).port);
                     let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
+                    if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&old_port) {
+                        if (*in_val).ip == src_addr && (*in_val).port == src_port {
+                            let _ = INBOUND_BINDINGS_V6.remove(&old_port);
+                            bitmap::free_port_v6(old_port);
+                        }
+                    }
                 }
             }
         }
@@ -737,8 +755,8 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
                                 break;
                             }
                         }
-                    } else {
-                        bitmap::mark_port_v6(alloc);
+                    } else if INBOUND_BINDINGS_V6.get_ptr_mut(&alloc).is_none() {
+                        bitmap::free_port_v6(alloc);
                     }
                 }
                 attempt += 1;

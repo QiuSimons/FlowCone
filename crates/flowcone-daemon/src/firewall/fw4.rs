@@ -80,16 +80,29 @@ pub(crate) fn generate_fw4_user_block(
 ) -> String {
     let mut lines = Vec::new();
     lines.push(FLOWCONE_TAG_START.to_string());
+    // fw4 runs this file with /bin/sh, so the rule has to be one quoted word:
+    // an unquoted `&` (meta mark & 0x40000000) would start a background job.
     if enable_v4 {
         let r4 = generate_fw4_srcnat_rule_v4(iface);
-        lines.push(format!("nft insert rule inet fw4 srcnat {} 2>/dev/null || true", r4));
+        lines.push(format!(
+            "nft 'insert rule inet fw4 srcnat {}' 2>/dev/null || true",
+            r4
+        ));
     }
     if enable_v6 {
         let r6 = generate_fw4_srcnat_rule_v6(iface, is_v6_masq);
-        lines.push(format!("nft insert rule inet fw4 srcnat {} 2>/dev/null || true", r6));
+        lines.push(format!(
+            "nft 'insert rule inet fw4 srcnat {}' 2>/dev/null || true",
+            r6
+        ));
     }
-    for fwd in generate_fw4_forward_rules() {
-        lines.push(format!("nft insert rule inet fw4 forward {} 2>/dev/null || true", fwd));
+    if enable_v4 || enable_v6 {
+        for fwd in generate_fw4_forward_rules() {
+            lines.push(format!(
+                "nft 'insert rule inet fw4 forward {}' 2>/dev/null || true",
+                fwd
+            ));
+        }
     }
     lines.push(FLOWCONE_TAG_END.to_string());
     lines.join("\n") + "\n"
@@ -282,6 +295,14 @@ mod tests {
             flowcone_common::INTERNAL_V4_PREFIXES.join(", ")
         )));
         assert!(inc.contains("meta mark & 0x40000000 == 0x40000000"));
+        // Every nft invocation must be one single-quoted word, otherwise
+        // /bin/sh splits the rule at `&` and the insert never happens.
+        for line in inc.lines().filter(|l| l.starts_with("nft ")) {
+            assert!(
+                line.starts_with("nft '") && line.contains("' 2>/dev/null || true"),
+                "unquoted nft invocation: {line}"
+            );
+        }
         assert!(inc.contains("ip6 saddr fc00::/7"));
         assert!(inc.contains(FLOWCONE_TAG_END));
     }
