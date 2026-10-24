@@ -367,14 +367,6 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             let now = unsafe { bpf_ktime_get_coarse_ns() };
             unsafe {
                 (*target).last_seen = now;
-                let ep = EndpointKey4 {
-                    ip: new_dst_ip,
-                    port: new_dst_port,
-                    _pad: 0,
-                };
-                if let Some(ob) = OUTBOUND_BINDINGS_V4.get_ptr_mut(&ep) {
-                    (*ob).last_seen = now;
-                }
             }
 
             let old_dst_ip = iph.dst_addr;
@@ -439,14 +431,6 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             let now = unsafe { bpf_ktime_get_coarse_ns() };
             unsafe {
                 (*target).last_seen = now;
-                let ep = EndpointKey6 {
-                    ip: new_dst_ip,
-                    port: new_dst_port,
-                    _pad: [0; 3],
-                };
-                if let Some(ob) = OUTBOUND_BINDINGS_V6.get_ptr_mut(&ep) {
-                    (*ob).last_seen = now;
-                }
             }
 
             let old_dst_ip = iph.dst_addr;
@@ -569,12 +553,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
             unsafe {
                 if (*val).ip == cfg.wan_ip4 {
                     (*val).last_seen = now;
-                    let p = (*val).port;
-                    let p_host = u16::from_be(p);
-                    if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&p_host) {
-                        (*in_val).last_seen = now;
-                    }
-                    mapped_port = Some(p);
+                    mapped_port = Some((*val).port);
                 } else {
                     let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
                 }
@@ -708,12 +687,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
             unsafe {
                 if (*val).ip == cfg.wan_ip6 {
                     (*val).last_seen = now;
-                    let p = (*val).port;
-                    let p_host = u16::from_be(p);
-                    if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&p_host) {
-                        (*in_val).last_seen = now;
-                    }
-                    mapped_port = Some(p);
+                    mapped_port = Some((*val).port);
                 } else {
                     let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
                 }

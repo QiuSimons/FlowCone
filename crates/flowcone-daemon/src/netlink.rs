@@ -25,6 +25,7 @@ pub enum NetlinkError {
 
 /// One local address of an interface, as reported by RTM_GETADDR.
 pub(crate) struct IfaceAddr {
+    pub(crate) family: u8,
     pub(crate) flags: u32,
     pub(crate) scope: u8,
     pub(crate) addr: [u8; 16],
@@ -36,19 +37,14 @@ const IFA_F_DEPRECATED: u32 = 0x20;
 const IFA_F_TENTATIVE: u32 = 0x40;
 const IFA_F_PERMANENT: u32 = 0x80;
 
-/// Dump the local addresses of one address family (2 = AF_INET, 10 = AF_INET6).
+/// Dump the local addresses of `ifindex` (0 = both families in one request).
 ///
 /// IFA_LOCAL wins over IFA_ADDRESS, so a point-to-point WAN reports the local
 /// end rather than the peer; IFA_FLAGS supersedes the u8 header field.
-fn dump_iface_addrs(ifname: &str, family: u8) -> Result<Vec<IfaceAddr>, NetlinkError> {
-    let ifindex_str = match std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", ifname)) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let target_ifindex: u32 = match ifindex_str.trim().parse() {
-        Ok(idx) => idx,
-        Err(_) => return Ok(Vec::new()),
-    };
+fn dump_iface_addrs(ifindex: u32, family: u8) -> Result<Vec<IfaceAddr>, NetlinkError> {
+    if ifindex == 0 {
+        return Ok(Vec::new());
+    }
 
     let sock = socket_with(
         AddressFamily::NETLINK,
@@ -71,7 +67,7 @@ fn dump_iface_addrs(ifname: &str, family: u8) -> Result<Vec<IfaceAddr>, NetlinkE
     req_bytes[8..12].copy_from_slice(&(1u32).to_ne_bytes());
     req_bytes[12..16].copy_from_slice(&(0u32).to_ne_bytes());
     req_bytes[16] = family;
-    req_bytes[20..24].copy_from_slice(&target_ifindex.to_ne_bytes());
+    req_bytes[20..24].copy_from_slice(&ifindex.to_ne_bytes());
 
     if send(&sock, &req_bytes, rustix::net::SendFlags::empty()).is_err() {
         return Err(NetlinkError::SendError);
@@ -102,7 +98,7 @@ fn dump_iface_addrs(ifname: &str, family: u8) -> Result<Vec<IfaceAddr>, NetlinkE
                 let mut flags = buf[offset + 18] as u32;
                 let ifa_scope = buf[offset + 19];
                 let ifa_index = read_u32_ne(&buf, offset + 20);
-                if ifa_family == family && ifa_index == target_ifindex {
+                if (family == 0 || ifa_family == family) && ifa_index == ifindex {
                     let mut rta_offset = offset + 24;
                     let end = (offset + nlmsg_len).min(n);
                     let mut local = None;
@@ -131,6 +127,7 @@ fn dump_iface_addrs(ifname: &str, family: u8) -> Result<Vec<IfaceAddr>, NetlinkE
                     }
                     if let Some(addr) = local.or(address) {
                         addrs.push(IfaceAddr {
+                            family: ifa_family,
                             flags,
                             scope: ifa_scope,
                             addr,
@@ -154,7 +151,7 @@ fn dump_iface_addrs(ifname: &str, family: u8) -> Result<Vec<IfaceAddr>, NetlinkE
 fn pick_global_v4(addrs: &[IfaceAddr]) -> Option<[u8; 4]> {
     addrs
         .iter()
-        .find(|a| a.scope == 0 && a.flags & IFA_F_SECONDARY == 0)
+        .find(|a| a.family == 2 && a.scope == 0 && a.flags & IFA_F_SECONDARY == 0)
         .map(|a| [a.addr[0], a.addr[1], a.addr[2], a.addr[3]])
 }
 
@@ -164,7 +161,7 @@ fn pick_gua_v6(addrs: &[IfaceAddr]) -> Option<[u8; 16]> {
     for a in addrs {
         // 2000::/3 only: ULA (fc00::/7) is not a WAN address even though it
         // is global scope.
-        if a.scope != 0 || (a.addr[0] & 0xe0) != 0x20 {
+        if a.family != 10 || a.scope != 0 || (a.addr[0] & 0xe0) != 0x20 {
             continue;
         }
         if a.flags & (IFA_F_SECONDARY | IFA_F_DADFAILED | IFA_F_DEPRECATED | IFA_F_TENTATIVE) != 0 {
@@ -178,14 +175,19 @@ fn pick_gua_v6(addrs: &[IfaceAddr]) -> Option<[u8; 16]> {
     fallback
 }
 
-/// Retrieve the global IPv4 address of an interface via rtnetlink.
-pub fn get_iface_ipv4(ifname: &str) -> Result<Option<[u8; 4]>, NetlinkError> {
-    Ok(pick_global_v4(&dump_iface_addrs(ifname, 2)?))
+/// Global addresses of one interface.
+pub(crate) struct IfaceAddrs {
+    pub(crate) v4: Option<[u8; 4]>,
+    pub(crate) v6: Option<[u8; 16]>,
 }
 
-/// Retrieve the global IPv6 address of an interface via rtnetlink.
-pub fn get_iface_ipv6(ifname: &str) -> Result<Option<[u8; 16]>, NetlinkError> {
-    Ok(pick_gua_v6(&dump_iface_addrs(ifname, 10)?))
+/// Global addresses of an interface, from one rtnetlink dump.
+pub fn get_iface_addrs(ifindex: u32) -> Result<IfaceAddrs, NetlinkError> {
+    let addrs = dump_iface_addrs(ifindex, 0)?;
+    Ok(IfaceAddrs {
+        v4: pick_global_v4(&addrs),
+        v6: pick_gua_v6(&addrs),
+    })
 }
 
 /// Detect L2 header length for interface.
@@ -288,16 +290,22 @@ pub fn get_ifindex(ifname: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn addr(v: u8, flags: u32, scope: u8) -> IfaceAddr {
+    fn addr(family: u8, v: u8, flags: u32, scope: u8) -> IfaceAddr {
         let mut addr = [0u8; 16];
         addr[0] = v;
-        IfaceAddr { flags, scope, addr }
+        IfaceAddr {
+            family,
+            flags,
+            scope,
+            addr,
+        }
     }
 
     #[test]
     fn test_pick_gua_v6_skips_non_global() {
         // ULA is outside 2000::/3 and link-local is link scope.
-        let addrs = [addr(0xfd, IFA_F_PERMANENT, 0), addr(0xfe, IFA_F_PERMANENT, 0x20)];
+        assert_eq!(pick_gua_v6(&[addr(2, 10, 0, 0)]), None);
+        let addrs = [addr(10, 0xfd, IFA_F_PERMANENT, 0), addr(10, 0xfe, IFA_F_PERMANENT, 0x20)];
         assert_eq!(pick_gua_v6(&addrs), None);
     }
 
@@ -305,26 +313,26 @@ mod tests {
     fn test_pick_gua_v6_prefers_permanent() {
         // Secondary, tentative and deprecated are skipped; permanent wins.
         let addrs = [
-            addr(0x24, 0x00, 0),
-            addr(0x25, IFA_F_SECONDARY, 0),
-            addr(0x26, IFA_F_TENTATIVE, 0),
-            addr(0x27, IFA_F_DEPRECATED, 0),
-            addr(0x28, IFA_F_PERMANENT, 0),
+            addr(10, 0x24, 0x00, 0),
+            addr(10, 0x25, IFA_F_SECONDARY, 0),
+            addr(10, 0x26, IFA_F_TENTATIVE, 0),
+            addr(10, 0x27, IFA_F_DEPRECATED, 0),
+            addr(10, 0x28, IFA_F_PERMANENT, 0),
         ];
         let picked = pick_gua_v6(&addrs).expect("a GUA");
         assert_eq!(picked[0], 0x28);
 
-        let only_permanent = [addr(0x24, 0x00, 0), addr(0x28, IFA_F_PERMANENT, 0)];
+        let only_permanent = [addr(10, 0x24, 0x00, 0), addr(10, 0x28, IFA_F_PERMANENT, 0)];
         assert_eq!(pick_gua_v6(&only_permanent).unwrap()[0], 0x28);
     }
 
     #[test]
     fn test_pick_global_v4() {
         // The first non-secondary global address wins.
-        let addrs = [addr(10, IFA_F_SECONDARY, 0), addr(10, 0, 0), addr(100, 0, 0)];
+        let addrs = [addr(2, 10, IFA_F_SECONDARY, 0), addr(2, 10, 0, 0), addr(2, 100, 0, 0)];
         let picked = pick_global_v4(&addrs).expect("an IPv4 address");
         assert_eq!(picked, [10, 0, 0, 0]);
-        assert_eq!(pick_global_v4(&[addr(10, 0, 0x20)]), None);
+        assert_eq!(pick_global_v4(&[addr(2, 10, 0, 0x20)]), None);
     }
 
     #[test]

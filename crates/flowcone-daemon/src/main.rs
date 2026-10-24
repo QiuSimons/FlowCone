@@ -409,8 +409,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config_dirty = true;
             }
 
+            // A failed query is transient, not "the interface lost its address".
+            let iface_addrs = netlink::get_iface_addrs(cur_ifindex);
+
             if ip_cfg.enable_v4 {
-                match netlink::get_iface_ipv4(&ip_cfg.iface) {
+                match iface_addrs.as_ref().map(|a| a.v4) {
                     Ok(Some(ip4_bytes)) => {
                         let ip4 = u32::from_ne_bytes(ip4_bytes);
                         if ip4 != applied.ip4 {
@@ -439,14 +442,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         if ip_cfg.verbose {
-                            eprintln!("flowcone: warning: transient netlink IPv4 query error: {:?}", e);
+                            eprintln!(
+                                "flowcone: warning: transient netlink address query error: {:?}",
+                                e
+                            );
                         }
                     }
                 }
             }
 
             if ip_cfg.enable_v6 {
-                match netlink::get_iface_ipv6(&ip_cfg.iface) {
+                match iface_addrs.as_ref().map(|a| a.v6) {
                     Ok(Some(ip6)) => {
                         if ip6 != applied.ip6 {
                             println!("flowcone: WAN IPv6 updated to {}", Ipv6Addr::from(ip6));
@@ -471,7 +477,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         if ip_cfg.verbose {
-                            eprintln!("flowcone: warning: transient IPv6 query error: {:?}", e);
+                            eprintln!(
+                                "flowcone: warning: transient netlink address query error: {:?}",
+                                e
+                            );
                         }
                     }
                 }
