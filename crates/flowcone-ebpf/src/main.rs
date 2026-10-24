@@ -562,24 +562,27 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
 
         let now = unsafe { bpf_ktime_get_coarse_ns() };
 
-        // Drop a mapping created for a previous WAN address so the allocation
-        // path below re-creates it with the current one.
+        // An entry that belongs to a previous WAN address is dropped, so the
+        // allocation path below re-creates it with the current one.
+        let mut mapped_port = None;
         if let Some(val) = OUTBOUND_BINDINGS_V4.get_ptr_mut(&ep_key) {
-            if unsafe { (*val).ip } != cfg.wan_ip4 {
-                let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
+            unsafe {
+                if (*val).ip == cfg.wan_ip4 {
+                    (*val).last_seen = now;
+                    let p = (*val).port;
+                    let p_host = u16::from_be(p);
+                    if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&p_host) {
+                        (*in_val).last_seen = now;
+                    }
+                    mapped_port = Some(p);
+                } else {
+                    let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
+                }
             }
         }
 
-        let mapped_port = if let Some(val) = OUTBOUND_BINDINGS_V4.get_ptr_mut(&ep_key) {
-            unsafe {
-                (*val).last_seen = now;
-                let p = (*val).port;
-                let p_host = u16::from_be(p);
-                if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&p_host) {
-                    (*in_val).last_seen = now;
-                }
-                p
-            }
+        let mapped_port = if let Some(mapped_port) = mapped_port {
+            mapped_port
         } else {
             let pref = u16::from_be(src_port);
             let mut allocated_port = None;
@@ -700,22 +703,25 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         let now = unsafe { bpf_ktime_get_coarse_ns() };
 
         // Same handling as the IPv4 path.
+        let mut mapped_port = None;
         if let Some(val) = OUTBOUND_BINDINGS_V6.get_ptr_mut(&ep_key) {
-            if unsafe { (*val).ip } != cfg.wan_ip6 {
-                let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
+            unsafe {
+                if (*val).ip == cfg.wan_ip6 {
+                    (*val).last_seen = now;
+                    let p = (*val).port;
+                    let p_host = u16::from_be(p);
+                    if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&p_host) {
+                        (*in_val).last_seen = now;
+                    }
+                    mapped_port = Some(p);
+                } else {
+                    let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
+                }
             }
         }
 
-        let mapped_port = if let Some(val) = OUTBOUND_BINDINGS_V6.get_ptr_mut(&ep_key) {
-            unsafe {
-                (*val).last_seen = now;
-                let p = (*val).port;
-                let p_host = u16::from_be(p);
-                if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&p_host) {
-                    (*in_val).last_seen = now;
-                }
-                p
-            }
+        let mapped_port = if let Some(mapped_port) = mapped_port {
+            mapped_port
         } else {
             let pref = u16::from_be(src_port);
             let mut allocated_port = None;

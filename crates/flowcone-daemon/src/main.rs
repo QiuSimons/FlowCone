@@ -219,6 +219,19 @@ pub fn resolve_effective_v6(enable_v6: bool, wan_ip6: [u8; 16], has_masq: bool) 
     }
 }
 
+/// What the data plane and the firewall were last configured with.
+struct AppliedState {
+    l2_len: u32,
+    ip4: u32,
+    ip6: [u8; 16],
+    effective_v6: u32,
+    v4_enabled: bool,
+    /// u32::MAX forces the first rule sync; then holds the IPv6 mode (0/1/2).
+    v6_mode: u32,
+    ifindex: u32,
+    present: bool,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = match config::parse_args() {
         Ok(c) => c,
@@ -349,15 +362,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ip_cfg = config.clone();
     let ip_notifier = Arc::clone(&notifier);
     let ip_thread = thread::spawn(move || {
-        let mut l2_len = l2_len;
-        let mut last_ip4: u32 = 0;
-        let mut last_ip6 = [0u8; 16];
-        let mut last_effective_v6: u32 = 0;
-        let mut applied_v4 = false;
-        // u32::MAX forces the first sync; then holds the IPv6 mode (0/1/2).
-        let mut applied_v6_mode = u32::MAX;
-        let mut last_ifindex = start_ifindex;
-        let mut was_present = start_ifindex != 0;
+        let mut applied = AppliedState {
+            l2_len,
+            ip4: 0,
+            ip6: [0u8; 16],
+            effective_v6: 0,
+            v4_enabled: false,
+            v6_mode: u32::MAX,
+            ifindex: start_ifindex,
+            present: start_ifindex != 0,
+        };
         let mut attach_timer = Instant::now();
 
         loop {
@@ -365,19 +379,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut reattach = false;
             let mut force_new_attach = false;
             let mut notable = false;
-            let mut resolved_ip4 = last_ip4;
-            let mut resolved_ip6 = last_ip6;
+            let mut resolved_ip4 = applied.ip4;
+            let mut resolved_ip6 = applied.ip6;
 
             // A re-created interface (PPPoE/WireGuard reconnect) lost its
             // links; the periodic check below covers what the ifindex cannot.
             let cur_ifindex = netlink::get_ifindex(&ip_cfg.iface).unwrap_or(0);
             let present = cur_ifindex != 0;
-            if present && (!was_present || cur_ifindex != last_ifindex) {
+            if present && (!applied.present || cur_ifindex != applied.ifindex) {
                 println!(
                     "flowcone: interface {} re-created (ifindex {} -> {}), re-attaching",
-                    ip_cfg.iface, last_ifindex, cur_ifindex
+                    ip_cfg.iface, applied.ifindex, cur_ifindex
                 );
-                l2_len = netlink::get_iface_l2_len(&ip_cfg.iface);
+                applied.l2_len = netlink::get_iface_l2_len(&ip_cfg.iface);
                 reattach = true;
                 force_new_attach = true;
                 notable = true;
@@ -387,7 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 attach_timer = Instant::now();
                 reattach = true;
             }
-            was_present = present;
+            applied.present = present;
 
             // Explicit resync request (SIGHUP from the init script).
             let resync = RESYNC_REQUESTED.swap(false, Ordering::Relaxed);
@@ -399,26 +413,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match netlink::get_iface_ipv4(&ip_cfg.iface) {
                     Ok(Some(ip4_bytes)) => {
                         let ip4 = u32::from_ne_bytes(ip4_bytes);
-                        if ip4 != last_ip4 {
+                        if ip4 != applied.ip4 {
                             println!(
                                 "flowcone: WAN IPv4 updated to {}",
                                 Ipv4Addr::from(ip4_bytes)
                             );
-                            if last_ip4 != 0 {
+                            if applied.ip4 != 0 {
                                 println!("flowcone: flushing stale v4 mappings");
                                 if let Ok(mut mgr) = ip_session.lock() {
                                     mgr.clear_v4_mappings();
                                 }
                             }
-                            last_ip4 = ip4;
+                            applied.ip4 = ip4;
                             resolved_ip4 = ip4;
                             config_dirty = true;
                         }
                     }
                     Ok(None) => {
-                        if last_ip4 != 0 {
+                        if applied.ip4 != 0 {
                             println!("flowcone: WAN interface lost IPv4");
-                            last_ip4 = 0;
+                            applied.ip4 = 0;
                             resolved_ip4 = 0;
                             config_dirty = true;
                         }
@@ -434,23 +448,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ip_cfg.enable_v6 {
                 match netlink::get_iface_ipv6(&ip_cfg.iface) {
                     Ok(Some(ip6)) => {
-                        if ip6 != last_ip6 {
+                        if ip6 != applied.ip6 {
                             println!("flowcone: WAN IPv6 updated to {}", Ipv6Addr::from(ip6));
-                            if last_ip6 != [0u8; 16] {
+                            if applied.ip6 != [0u8; 16] {
                                 println!("flowcone: flushing stale v6 mappings");
                                 if let Ok(mut mgr) = ip_session.lock() {
                                     mgr.clear_v6_mappings();
                                 }
                             }
-                            last_ip6 = ip6;
+                            applied.ip6 = ip6;
                             resolved_ip6 = ip6;
                             config_dirty = true;
                         }
                     }
                     Ok(None) => {
-                        if last_ip6 != [0u8; 16] {
+                        if applied.ip6 != [0u8; 16] {
                             println!("flowcone: WAN interface lost IPv6");
-                            last_ip6 = [0u8; 16];
+                            applied.ip6 = [0u8; 16];
                             resolved_ip6 = [0u8; 16];
                             config_dirty = true;
                         }
@@ -470,7 +484,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     firewall::is_ipv6_masq_enabled(),
                 );
 
-                if effective_v6 != last_effective_v6 {
+                if effective_v6 != applied.effective_v6 {
                     let desc = match effective_v6 {
                         0 => "disabled (no WAN IPv6 address)",
                         1 => "auto-adaptive (ULA NAT66 + Native GUA wire-speed routing)",
@@ -478,7 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => "custom",
                     };
                     println!("flowcone: IPv6 operational mode: {}", desc);
-                    last_effective_v6 = effective_v6;
+                    applied.effective_v6 = effective_v6;
                 }
 
                 if let Ok(mut mgr) = ip_session.lock() {
@@ -486,7 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         wan_ip4: resolved_ip4,
                         bypass_mark_mask: ip_cfg.bypass_mark_mask,
                         bypass_mark_val: ip_cfg.bypass_mark_val,
-                        l2_len,
+                        l2_len: applied.l2_len,
                         wan_ip6: resolved_ip6,
                         min_port4: ip_cfg.min_port,
                         max_port4: ip_cfg.max_port,
@@ -508,8 +522,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // a resync or a re-created interface forces a rewrite.
                     if resync
                         || notable
-                        || active_v4 != applied_v4
-                        || effective_v6 != applied_v6_mode
+                        || active_v4 != applied.v4_enabled
+                        || effective_v6 != applied.v6_mode
                     {
                         firewall::sync_fw4_rules(
                             &ip_cfg.iface,
@@ -519,8 +533,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             effective_v6 != 0,
                             ip_cfg.verbose,
                         );
-                        applied_v4 = active_v4;
-                        applied_v6_mode = effective_v6;
+                        applied.v4_enabled = active_v4;
+                        applied.v6_mode = effective_v6;
                     }
                 }
             }
@@ -537,7 +551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 if attached {
-                    last_ifindex = cur_ifindex;
+                    applied.ifindex = cur_ifindex;
                     if notable || ip_cfg.verbose {
                         println!(
                             "flowcone: TCX programs re-attached to {} (ifindex {})",
