@@ -236,7 +236,7 @@ pub const MAX_BINDINGS: u32 = 65536;
 pub const FRAG_MAP_ENTRIES: u32 = 8192;
 pub const SESSION_EVENT_ENTRIES: u32 = 16384;
 /// One u64 word covers 64 ports; 1024 words cover the full u16 port space.
-pub const PORT_BITS_ENTRIES: u32 = 1024;
+pub const PORT_BITS_ENTRIES: u32 = 65536;
 /// Each parity queue can hold the whole pool; duplicates are skipped via the
 /// free bitmap, and a full queue sets a user-space rebuild flag.
 pub const PORT_QUEUE_ENTRIES: u32 = 65536;

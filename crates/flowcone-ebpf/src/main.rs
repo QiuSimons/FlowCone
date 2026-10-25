@@ -104,23 +104,22 @@ static SESSION_EVENTS_V6: Queue<SessionEvent6> =
 #[map]
 static GC_FLAGS: Array<u32> = Array::with_max_entries(1, 0);
 
-/// Port pool: a free bitmap plus two parity queues. The bitmap is only a hint;
-/// the atomic BPF_NOEXIST insert into INBOUND_BINDINGS is the port claim. This
-/// gives O(1) allocation without a 64K scan and without an atomic RMW.
+/// Port pool: one state byte per port plus two parity queues. The byte marks
+/// whether the port is still queued; BPF_NOEXIST is the authoritative claim.
 #[map]
-static PORT_FREE_V4: Array<u64> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
+static PORT_FREE_V4: Array<u8> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
 
 #[map]
-static PORT_FREE_V6: Array<u64> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
+static PORT_FREE_V6: Array<u8> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
 
 /// Ports bound by local UDP services (DNS, WireGuard, IPsec, proxy, ...).
 /// Reserve both families conservatively so FlowCone never steals a WAN
 /// service port via port preservation.
 #[map]
-static RESERVED_V4: Array<u64> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
+static RESERVED_V4: Array<u8> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
 
 #[map]
-static RESERVED_V6: Array<u64> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
+static RESERVED_V6: Array<u8> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
 
 #[map]
 static FREE_EVEN_V4: Queue<u16> = Queue::with_max_entries(PORT_QUEUE_ENTRIES, 0);
@@ -446,40 +445,18 @@ fn push_event_v6(key: &EndpointKey6, port: u16) {
 }
 
 #[inline(always)]
-fn port_bit_is_free(map: &Array<u64>, reserved: &Array<u64>, port: u16) -> bool {
-    let word = (port as u32) >> 6;
-    let mask = 1u64 << ((port as u32) & 63);
-    let free = match map.get_ptr_mut(word) {
-        Some(p) => unsafe { (*p & mask) != 0 },
-        None => false,
-    };
-    if !free {
-        return false;
-    }
-    match reserved.get_ptr_mut(word) {
-        Some(p) => unsafe { (*p & mask) == 0 },
+fn port_is_reserved(reserved: &Array<u8>, port: u16) -> bool {
+    match reserved.get_ptr_mut(port as u32) {
+        Some(p) => unsafe { *p != 0 },
         None => false,
     }
 }
 
 #[inline(always)]
-fn port_bit_clear(map: &Array<u64>, port: u16) {
-    let word = (port as u32) >> 6;
-    let mask = 1u64 << ((port as u32) & 63);
-    if let Some(p) = map.get_ptr_mut(word) {
+fn port_bit_clear(map: &Array<u8>, port: u16) {
+    if let Some(p) = map.get_ptr_mut(port as u32) {
         unsafe {
-            *p &= !mask;
-        }
-    }
-}
-
-#[inline(always)]
-fn port_bit_set(map: &Array<u64>, port: u16) {
-    let word = (port as u32) >> 6;
-    let mask = 1u64 << ((port as u32) & 63);
-    if let Some(p) = map.get_ptr_mut(word) {
-        unsafe {
-            *p |= mask;
+            *p = 0;
         }
     }
 }
@@ -493,7 +470,16 @@ fn queue_push(q: &Queue<u16>, port: u16) {
 
 #[inline(always)]
 fn release_port_v4(port: u16) {
-    port_bit_set(&PORT_FREE_V4, port);
+    if let Some(p) = PORT_FREE_V4.get_ptr_mut(port as u32) {
+        unsafe {
+            if *p != 0 {
+                return;
+            }
+            *p = 1;
+        }
+    } else {
+        return;
+    }
     if (port & 1) == 0 {
         queue_push(&FREE_EVEN_V4, port);
     } else {
@@ -503,7 +489,16 @@ fn release_port_v4(port: u16) {
 
 #[inline(always)]
 fn release_port_v6(port: u16) {
-    port_bit_set(&PORT_FREE_V6, port);
+    if let Some(p) = PORT_FREE_V6.get_ptr_mut(port as u32) {
+        unsafe {
+            if *p != 0 {
+                return;
+            }
+            *p = 1;
+        }
+    } else {
+        return;
+    }
     if (port & 1) == 0 {
         queue_push(&FREE_EVEN_V6, port);
     } else {
@@ -513,34 +508,58 @@ fn release_port_v6(port: u16) {
 
 #[inline(always)]
 fn claim_port_v4(port: u16, in_val: &BindingValue4) -> bool {
-    if !port_bit_is_free(&PORT_FREE_V4, &RESERVED_V4, port) {
+    if port_is_reserved(&RESERVED_V4, port) {
         return false;
     }
-    port_bit_clear(&PORT_FREE_V4, port);
-    if INBOUND_BINDINGS_V4.insert(&port, in_val, BPF_NOEXIST).is_ok() {
-        return true;
-    }
-    // If the key now exists, another CPU owns this port. Otherwise this port
-    // was merely stale; put it back so it is not lost.
-    if unsafe { INBOUND_BINDINGS_V4.get(&port) }.is_none() {
-        release_port_v4(port);
-    }
-    false
+    INBOUND_BINDINGS_V4.insert(&port, in_val, BPF_NOEXIST).is_ok()
 }
 
 #[inline(always)]
 fn claim_port_v6(port: u16, in_val: &BindingValue6) -> bool {
-    if !port_bit_is_free(&PORT_FREE_V6, &RESERVED_V6, port) {
+    if port_is_reserved(&RESERVED_V6, port) {
         return false;
     }
-    port_bit_clear(&PORT_FREE_V6, port);
-    if INBOUND_BINDINGS_V6.insert(&port, in_val, BPF_NOEXIST).is_ok() {
-        return true;
+    INBOUND_BINDINGS_V6.insert(&port, in_val, BPF_NOEXIST).is_ok()
+}
+
+#[inline(always)]
+fn pop_and_claim_v4(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue4) -> Option<u16> {
+    let port = match q.pop() {
+        Ok(Some(port)) => port,
+        _ => return None,
+    };
+    port_bit_clear(&PORT_FREE_V4, port);
+    if port >= min && port <= max && claim_port_v4(port, in_val) {
+        return Some(port);
     }
-    if unsafe { INBOUND_BINDINGS_V6.get(&port) }.is_none() {
+    if port >= min
+        && port <= max
+        && !port_is_reserved(&RESERVED_V4, port)
+        && unsafe { INBOUND_BINDINGS_V4.get(&port) }.is_none()
+    {
+        release_port_v4(port);
+    }
+    None
+}
+
+#[inline(always)]
+fn pop_and_claim_v6(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue6) -> Option<u16> {
+    let port = match q.pop() {
+        Ok(Some(port)) => port,
+        _ => return None,
+    };
+    port_bit_clear(&PORT_FREE_V6, port);
+    if port >= min && port <= max && claim_port_v6(port, in_val) {
+        return Some(port);
+    }
+    if port >= min
+        && port <= max
+        && !port_is_reserved(&RESERVED_V6, port)
+        && unsafe { INBOUND_BINDINGS_V6.get(&port) }.is_none()
+    {
         release_port_v6(port);
     }
-    false
+    None
 }
 
 #[inline(always)]
@@ -556,25 +575,15 @@ fn alloc_port_v4(pref: u16, min: u16, max: u16, in_val: &BindingValue4) -> Optio
     };
     let mut i = 0;
     while i < 8 {
-        match q1.pop() {
-            Ok(Some(port)) => {
-                if port >= min && port <= max && claim_port_v4(port, in_val) {
-                    return Some(port);
-                }
-            }
-            _ => break,
+        if let Some(port) = pop_and_claim_v4(q1, min, max, in_val) {
+            return Some(port);
         }
         i += 1;
     }
     i = 0;
     while i < 4 {
-        match q2.pop() {
-            Ok(Some(port)) => {
-                if port >= min && port <= max && claim_port_v4(port, in_val) {
-                    return Some(port);
-                }
-            }
-            _ => break,
+        if let Some(port) = pop_and_claim_v4(q2, min, max, in_val) {
+            return Some(port);
         }
         i += 1;
     }
@@ -595,25 +604,15 @@ fn alloc_port_v6(pref: u16, min: u16, max: u16, in_val: &BindingValue6) -> Optio
     };
     let mut i = 0;
     while i < 8 {
-        match q1.pop() {
-            Ok(Some(port)) => {
-                if port >= min && port <= max && claim_port_v6(port, in_val) {
-                    return Some(port);
-                }
-            }
-            _ => break,
+        if let Some(port) = pop_and_claim_v6(q1, min, max, in_val) {
+            return Some(port);
         }
         i += 1;
     }
     i = 0;
     while i < 4 {
-        match q2.pop() {
-            Ok(Some(port)) => {
-                if port >= min && port <= max && claim_port_v6(port, in_val) {
-                    return Some(port);
-                }
-            }
-            _ => break,
+        if let Some(port) = pop_and_claim_v6(q2, min, max, in_val) {
+            return Some(port);
         }
         i += 1;
     }
@@ -629,10 +628,7 @@ enum Ipv6L4 {
     Unsupported,
 }
 
-/// Walk the IPv6 extension headers and classify the upper layer protocol.
-/// Fragmented packets are deliberately not translated: the fragment cache
-/// version was too large for the verifier and is handled as a documented
-/// limitation instead of an unverifiable data plane.
+/// Walk IPv6 extension headers and locate the upper-layer header.
 #[inline(always)]
 fn locate_ipv6_l4(data_end: usize, ip_off: usize, mut nh: u8) -> Ipv6L4 {
     let mut cur_off = ip_off + 40;
@@ -734,6 +730,9 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         }
 
         let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+        if udph.check == 0 {
+            return TC_ACT_UNSPEC;
+        }
         let ext_port = u16::from_be(udph.dst_port);
 
         if let Some(target) = INBOUND_BINDINGS_V4.get_ptr_mut(&ext_port) {
@@ -995,17 +994,16 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
                 return TC_ACT_UNSPEC;
         }
+        if iph.src_addr == cfg.wan_ip6 {
+            return TC_ACT_UNSPEC;
+        }
+        let allow_all_internal = cfg.enabled_v6 > 1;
+        if !flowcone_common::is_routable_internal_ipv6(&iph.src_addr, allow_all_internal) {
+            return TC_ACT_UNSPEC;
+        }
         if iph.next_hdr == 44 {
             unsafe { FRAG_TARGET.tail_call(&ctx, 0); }
             return TC_ACT_UNSPEC;
-        }
-        if iph.src_addr == cfg.wan_ip6 {
-                return TC_ACT_UNSPEC;
-        }
-
-        let allow_all_internal = cfg.enabled_v6 > 1;
-        if !flowcone_common::is_routable_internal_ipv6(&iph.src_addr, allow_all_internal) {
-                return TC_ACT_UNSPEC;
         }
 
         let udp_off = match locate_ipv6_l4(data_end, ip_off, iph.next_hdr) {
@@ -1140,6 +1138,9 @@ fn frag_v6_target(
         return TC_ACT_UNSPEC;
     }
     let next_hdr = unsafe { *((ip_off + 40) as *const u8) };
+    if next_hdr != IPPROTO_UDP {
+        return TC_ACT_UNSPEC;
+    }
     let frag_field = u16::from_be_bytes([
         unsafe { *((ip_off + 42) as *const u8) },
         unsafe { *((ip_off + 43) as *const u8) },
@@ -1168,9 +1169,6 @@ fn frag_v6_target(
             }
             return TC_ACT_UNSPEC;
         }
-        if next_hdr != IPPROTO_UDP || !more {
-            return TC_ACT_UNSPEC;
-        }
         let udp_off = ip_off + 48;
         if udp_off + mem::size_of::<UdpHdr>() > data_end {
             return TC_ACT_UNSPEC;
@@ -1196,8 +1194,8 @@ fn frag_v6_target(
             ip: new_ip,
             last_seen: now,
         };
-        if FRAG_IN_V6.insert(&key, &value, BPF_ANY).is_err() {
-            return TC_ACT_UNSPEC;
+        if more {
+            let _ = FRAG_IN_V6.insert(&key, &value, BPF_ANY);
         }
         let mark = unsafe { (*ctx.skb.skb).mark };
         ctx.skb.set_mark(mark | cfg.flowcone_mark);
@@ -1224,14 +1222,14 @@ fn frag_v6_target(
         ctx.skb.set_mark(mark | cfg.flowcone_mark);
         return TC_ACT_UNSPEC;
     }
-    if next_hdr != IPPROTO_UDP || !more {
-        return TC_ACT_UNSPEC;
-    }
     let udp_off = ip_off + 48;
     if udp_off + mem::size_of::<UdpHdr>() > data_end {
         return TC_ACT_SHOT;
     }
     let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+    if udph.check == 0 {
+        return TC_ACT_SHOT;
+    }
     let src_port = udph.src_port;
     let ep_key = EndpointKey6 {
         ip: src_ip,
@@ -1302,7 +1300,9 @@ fn frag_v6_target(
         ip: cfg.wan_ip6,
         last_seen: now,
     };
-    let _ = FRAG_OUT_V6.insert(&key, &value, BPF_ANY);
+    if more {
+        let _ = FRAG_OUT_V6.insert(&key, &value, BPF_ANY);
+    }
     let mark = unsafe { (*ctx.skb.skb).mark };
     ctx.skb.set_mark(mark | cfg.flowcone_mark);
     TC_ACT_UNSPEC
@@ -1368,10 +1368,11 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
                 if now.saturating_sub(v.last_seen) <= FRAG_TIMEOUT_NS {
                     let old = iph.dst_addr;
                     iph.dst_addr = v.ip;
-                    if fixup_l3_v4(&ctx, data, ip_off, old, v.ip) {
-                        let mark = unsafe { (*ctx.skb.skb).mark };
-                        ctx.skb.set_mark(mark | cfg.flowcone_mark);
+                    if !fixup_l3_v4(&ctx, data, ip_off, old, v.ip) {
+                        return TC_ACT_SHOT;
                     }
+                    let mark = unsafe { (*ctx.skb.skb).mark };
+                    ctx.skb.set_mark(mark | cfg.flowcone_mark);
                 }
             }
             return TC_ACT_UNSPEC;
@@ -1426,8 +1427,8 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
             _pad: 0,
             last_seen: now,
         };
-        if FRAG_IN_V4.insert(&key, &value, BPF_ANY).is_err() {
-            return TC_ACT_UNSPEC;
+        if more {
+            let _ = FRAG_IN_V4.insert(&key, &value, BPF_ANY);
         }
         let mark = unsafe { (*ctx.skb.skb).mark };
         ctx.skb.set_mark(mark | cfg.flowcone_mark);
@@ -1456,10 +1457,11 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
         }
         let old = iph.src_addr;
         iph.src_addr = v.ip;
-        if fixup_l3_v4(&ctx, data, ip_off, old, v.ip) {
-            let mark = unsafe { (*ctx.skb.skb).mark };
-            ctx.skb.set_mark(mark | cfg.flowcone_mark);
+        if !fixup_l3_v4(&ctx, data, ip_off, old, v.ip) {
+            return TC_ACT_SHOT;
         }
+        let mark = unsafe { (*ctx.skb.skb).mark };
+        ctx.skb.set_mark(mark | cfg.flowcone_mark);
         return TC_ACT_UNSPEC;
     }
     if !more {
@@ -1475,6 +1477,9 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
     }
     let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
     let src_port = udph.src_port;
+    if bypass_special_udp4(src_ip, iph.dst_addr, src_port, udph.dst_port) {
+        return TC_ACT_UNSPEC;
+    }
     let now = now_ns();
     let ep_key = EndpointKey4 {
         ip: src_ip,
@@ -1590,9 +1595,8 @@ fn csum_replace(csum: u16, old: u16, new: u16) -> u16 {
 }
 
 /// IPv4 ICMP error translation target. Rewrites the outer destination and the
-/// embedded UDP source using the inbound mapping, then recomputes the embedded
-/// IPv4, embedded UDP and outer ICMP checksums. Only ICMP errors with a small
-/// embedded message (<=256 bytes) are translated.
+/// embedded UDP source using the inbound mapping, then updates the embedded
+/// IPv4/UDP and outer ICMP checksums.
 #[classifier]
 pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
     let data = ctx.data();
@@ -1632,7 +1636,7 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
     }
     let icmp_off = ip_off + 20;
     let tot_len = u16::from_be(iph.tot_len) as usize;
-    if tot_len < 56 || tot_len > 256 || ip_off + tot_len > data_end || icmp_off + 36 > data_end {
+    if tot_len < 56 || icmp_off + 36 > data_end {
         return TC_ACT_UNSPEC;
     }
     let icmp_len = tot_len - 20;
@@ -1816,7 +1820,7 @@ pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let payload_len = u16::from_be(iph.payload_len) as usize;
-    if payload_len < 56 || payload_len > 256 || ip_off + 40 + payload_len > data_end {
+    if payload_len < 56 {
         return TC_ACT_UNSPEC;
     }
     let icmp_off = ip_off + 40;

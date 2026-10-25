@@ -49,10 +49,10 @@ pub struct SessionManager {
     events4: Queue<MapData, SessionEvent4>,
     events6: Queue<MapData, SessionEvent6>,
     gc_flags: Array<MapData, u32>,
-    free_bits4: Array<MapData, u64>,
-    free_bits6: Array<MapData, u64>,
-    reserved4: Array<MapData, u64>,
-    reserved6: Array<MapData, u64>,
+    free_bits4: Array<MapData, u8>,
+    free_bits6: Array<MapData, u8>,
+    reserved4: Array<MapData, u8>,
+    reserved6: Array<MapData, u8>,
     free_even4: Queue<MapData, u16>,
     free_odd4: Queue<MapData, u16>,
     free_even6: Queue<MapData, u16>,
@@ -94,6 +94,7 @@ trait ConeBinding: aya::Pod + Copy {
     fn port_be(&self) -> u16;
     fn last_seen(&self) -> u64;
     fn make_key(&self) -> Self::Key;
+    fn matches_key(&self, key: &Self::Key) -> bool;
 }
 
 impl ConeBinding for BindingValue4 {
@@ -113,6 +114,10 @@ impl ConeBinding for BindingValue4 {
             port: self.port,
             _pad: 0,
         }
+    }
+
+    fn matches_key(&self, key: &EndpointKey4) -> bool {
+        self.ip == key.ip && self.port == key.port
     }
 }
 
@@ -134,6 +139,10 @@ impl ConeBinding for BindingValue6 {
             _pad: [0; 3],
         }
     }
+
+    fn matches_key(&self, key: &EndpointKey6) -> bool {
+        self.ip == key.ip && self.port == key.port
+    }
 }
 
 /// Full-table reconciliation after a lost queue notification.
@@ -152,10 +161,10 @@ fn sweep_family<V: ConeBinding>(
             continue;
         }
         let port_host = u16::from_be(val.port_be());
-        let ib_last = ib_map
-            .get(&port_host, 0)
-            .map(|iv| iv.last_seen())
-            .unwrap_or(0);
+        let ib_last = match ib_map.get(&port_host, 0) {
+            Ok(iv) if iv.matches_key(&key) => iv.last_seen(),
+            _ => 0,
+        };
         if now_ns.saturating_sub(ib_last) > timeout_ns {
             expired_buf.push((key, port_host));
         }
@@ -166,18 +175,24 @@ fn sweep_family<V: ConeBinding>(
         // Revalidate after collecting. A datapath refresh between the first
         // scan and this point wins; the entry is kept.
         if let Ok(cur_val) = ob_map.get(&key, 0) {
-            let cur_ib_last = ib_map
-                .get(&port_host, 0)
-                .map(|iv| iv.last_seen())
-                .unwrap_or(0);
+            let cur_ib_last = match ib_map.get(&port_host, 0) {
+                Ok(iv) if iv.matches_key(&key) => iv.last_seen(),
+                _ => 0,
+            };
             if now_ns.saturating_sub(cur_val.last_seen().max(cur_ib_last)) <= timeout_ns {
                 continue;
             }
         }
         let _ = ob_map.remove(&key);
-        let _ = ib_map.remove(&port_host);
-        freed_ports.push(port_host);
-        swept += 1;
+        if ib_map
+            .get(&port_host, 0)
+            .map(|iv| iv.matches_key(&key))
+            .unwrap_or(false)
+            && ib_map.remove(&port_host).is_ok()
+        {
+            freed_ports.push(port_host);
+            swept += 1;
+        }
     }
 
     orphan_buf.clear();
@@ -216,10 +231,10 @@ impl SessionManager {
         events4: Queue<MapData, SessionEvent4>,
         events6: Queue<MapData, SessionEvent6>,
         gc_flags: Array<MapData, u32>,
-        free_bits4: Array<MapData, u64>,
-        free_bits6: Array<MapData, u64>,
-        reserved4: Array<MapData, u64>,
-        reserved6: Array<MapData, u64>,
+        free_bits4: Array<MapData, u8>,
+        free_bits6: Array<MapData, u8>,
+        reserved4: Array<MapData, u8>,
+        reserved6: Array<MapData, u8>,
         free_even4: Queue<MapData, u16>,
         free_odd4: Queue<MapData, u16>,
         free_even6: Queue<MapData, u16>,
@@ -266,32 +281,17 @@ impl SessionManager {
         while q.pop(0).is_ok() {}
     }
 
-    fn set_range_bits(bits: &mut Array<MapData, u64>, min: u16, max: u16) {
-        let mut words = [0u64; 1024];
+    fn set_range_bits(bits: &mut Array<MapData, u8>, min: u16, max: u16) {
         let mut p = min as u32;
         while p <= max as u32 {
-            words[(p >> 6) as usize] |= 1u64 << (p & 63);
+            let _ = bits.set(p, 1, 0);
             p += 1;
-        }
-        for (i, word) in words.iter().enumerate() {
-            let _ = bits.set(i as u32, *word, 0);
         }
     }
 
-    fn set_reserved_bits(bits: &mut Array<MapData, u64>, ports: &[u16]) {
-        if ports.is_empty() {
-            return;
-        }
-        let mut words = [0u64; 1024];
+    fn set_reserved_bits(bits: &mut Array<MapData, u8>, ports: &[u16]) {
         for &port in ports {
-            let p = port as u32;
-            words[(p >> 6) as usize] |= 1u64 << (p & 63);
-        }
-        for (i, word) in words.iter().enumerate() {
-            if *word != 0 {
-                let old = bits.get(&(i as u32), 0).unwrap_or(0);
-                let _ = bits.set(i as u32, old | *word, 0);
-            }
+            let _ = bits.set(port as u32, 1, 0);
         }
     }
 
@@ -369,10 +369,10 @@ impl SessionManager {
     }
 
     fn release_port4(&mut self, port: u16) {
-        let word = (port as u32) >> 6;
-        let mask = 1u64 << ((port as u32) & 63);
-        let bits = self.free_bits4.get(&word, 0).unwrap_or(0) | mask;
-        let _ = self.free_bits4.set(word, bits, 0);
+        if self.free_bits4.get(&(port as u32), 0).unwrap_or(0) != 0 {
+            return;
+        }
+        let _ = self.free_bits4.set(port as u32, 1, 0);
         let q = if (port & 1) == 0 {
             &mut self.free_even4
         } else {
@@ -384,10 +384,10 @@ impl SessionManager {
     }
 
     fn release_port6(&mut self, port: u16) {
-        let word = (port as u32) >> 6;
-        let mask = 1u64 << ((port as u32) & 63);
-        let bits = self.free_bits6.get(&word, 0).unwrap_or(0) | mask;
-        let _ = self.free_bits6.set(word, bits, 0);
+        if self.free_bits6.get(&(port as u32), 0).unwrap_or(0) != 0 {
+            return;
+        }
+        let _ = self.free_bits6.set(port as u32, 1, 0);
         let q = if (port & 1) == 0 {
             &mut self.free_even6
         } else {
@@ -401,48 +401,46 @@ impl SessionManager {
     fn rebuild_family4(&mut self) {
         Self::drain_queue(&mut self.free_even4);
         Self::drain_queue(&mut self.free_odd4);
-        for word in 0u32..1024 {
-            let bits = self.free_bits4.get(&word, 0).unwrap_or(0);
-            let mut b = 0u32;
-            while b < 64 {
-                if (bits & (1u64 << b)) != 0 {
-                    let port = ((word << 6) | b) as u16;
-                    let q = if (port & 1) == 0 {
-                        &mut self.free_even4
-                    } else {
-                        &mut self.free_odd4
-                    };
-                    if q.push(port, 0).is_err() {
-                        let _ = self.port_flags.set(0, 1, 0);
-                        return;
-                    }
+        let mut p = self.min_port;
+        loop {
+            if self.free_bits4.get(&(p as u32), 0).unwrap_or(0) != 0 {
+                let q = if (p & 1) == 0 {
+                    &mut self.free_even4
+                } else {
+                    &mut self.free_odd4
+                };
+                if q.push(p, 0).is_err() {
+                    let _ = self.port_flags.set(0, 1, 0);
+                    return;
                 }
-                b += 1;
             }
+            if p == self.max_port {
+                break;
+            }
+            p += 1;
         }
     }
 
     fn rebuild_family6(&mut self) {
         Self::drain_queue(&mut self.free_even6);
         Self::drain_queue(&mut self.free_odd6);
-        for word in 0u32..1024 {
-            let bits = self.free_bits6.get(&word, 0).unwrap_or(0);
-            let mut b = 0u32;
-            while b < 64 {
-                if (bits & (1u64 << b)) != 0 {
-                    let port = ((word << 6) | b) as u16;
-                    let q = if (port & 1) == 0 {
-                        &mut self.free_even6
-                    } else {
-                        &mut self.free_odd6
-                    };
-                    if q.push(port, 0).is_err() {
-                        let _ = self.port_flags.set(0, 1, 0);
-                        return;
-                    }
+        let mut p = self.min_port;
+        loop {
+            if self.free_bits6.get(&(p as u32), 0).unwrap_or(0) != 0 {
+                let q = if (p & 1) == 0 {
+                    &mut self.free_even6
+                } else {
+                    &mut self.free_odd6
+                };
+                if q.push(p, 0).is_err() {
+                    let _ = self.port_flags.set(0, 1, 0);
+                    return;
                 }
-                b += 1;
             }
+            if p == self.max_port {
+                break;
+            }
+            p += 1;
         }
     }
 
@@ -542,31 +540,36 @@ impl SessionManager {
             self.heap4.pop();
 
             let ob = self.ob_map4.get(&key, 0);
+            let ib = self.ib_map4.get(&port, 0);
             let ob_present = ob.is_ok();
+            let ib_matches = matches!(&ib, Ok(iv) if iv.matches_key(&key));
             let mut last = 0u64;
             if let Ok(val) = ob {
                 last = val.last_seen;
             }
-            if let Ok(iv) = self.ib_map4.get(&port, 0) {
+            if ib_matches && let Ok(iv) = ib {
                 last = last.max(iv.last_seen);
             }
             if !ob_present {
-                // An inbound entry without its outbound key is an orphan.
-                if self.ib_map4.remove(&port).is_ok() {
+                if ib_matches && self.ib_map4.remove(&port).is_ok() {
                     self.release_port4(port);
                     swept4 += 1;
                 }
             } else if last != 0 && now.saturating_sub(last) <= timeout_ns {
                 self.schedule4(last.saturating_add(timeout_ns), key, port, 0);
             } else if last != 0 && strike == 0 {
-                // Two-strike: a refresh racing with the expiry check gets a
-                // second look one second later before the mapping is removed.
                 self.schedule4(now.saturating_add(GC_EXPIRY_STRIKE_NS), key, port, 1);
             } else {
                 let ob_removed = self.ob_map4.remove(&key).is_ok();
-                let ib_removed = self.ib_map4.remove(&port).is_ok();
-                if ob_removed || ib_removed {
+                let ib_removed = if ib_matches {
+                    self.ib_map4.remove(&port).is_ok()
+                } else {
+                    false
+                };
+                if ib_removed {
                     self.release_port4(port);
+                }
+                if ob_removed || ib_removed {
                     swept4 += 1;
                 }
             }
@@ -584,16 +587,18 @@ impl SessionManager {
             self.heap6.pop();
 
             let ob = self.ob_map6.get(&key, 0);
+            let ib = self.ib_map6.get(&port, 0);
             let ob_present = ob.is_ok();
+            let ib_matches = matches!(&ib, Ok(iv) if iv.matches_key(&key));
             let mut last = 0u64;
             if let Ok(val) = ob {
                 last = val.last_seen;
             }
-            if let Ok(iv) = self.ib_map6.get(&port, 0) {
+            if ib_matches && let Ok(iv) = ib {
                 last = last.max(iv.last_seen);
             }
             if !ob_present {
-                if self.ib_map6.remove(&port).is_ok() {
+                if ib_matches && self.ib_map6.remove(&port).is_ok() {
                     self.release_port6(port);
                     swept6 += 1;
                 }
@@ -603,9 +608,15 @@ impl SessionManager {
                 self.schedule6(now.saturating_add(GC_EXPIRY_STRIKE_NS), key, port, 1);
             } else {
                 let ob_removed = self.ob_map6.remove(&key).is_ok();
-                let ib_removed = self.ib_map6.remove(&port).is_ok();
-                if ob_removed || ib_removed {
+                let ib_removed = if ib_matches {
+                    self.ib_map6.remove(&port).is_ok()
+                } else {
+                    false
+                };
+                if ib_removed {
                     self.release_port6(port);
+                }
+                if ob_removed || ib_removed {
                     swept6 += 1;
                 }
             }
