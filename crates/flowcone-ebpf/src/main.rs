@@ -523,14 +523,14 @@ fn claim_port_v6(port: u16, in_val: &BindingValue6) -> bool {
 }
 
 #[inline(always)]
-fn pop_and_claim_v4(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue4) -> Option<u16> {
+fn pop_and_claim_v4(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue4) -> Result<Option<u16>, ()> {
     let port = match q.pop() {
         Ok(Some(port)) => port,
-        _ => return None,
+        _ => return Err(()),
     };
     port_state_clear(&PORT_FREE_V4, port);
     if port >= min && port <= max && claim_port_v4(port, in_val) {
-        return Some(port);
+        return Ok(Some(port));
     }
     if port >= min
         && port <= max
@@ -539,18 +539,18 @@ fn pop_and_claim_v4(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue4) 
     {
         release_port_v4(port);
     }
-    None
+    Ok(None)
 }
 
 #[inline(always)]
-fn pop_and_claim_v6(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue6) -> Option<u16> {
+fn pop_and_claim_v6(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue6) -> Result<Option<u16>, ()> {
     let port = match q.pop() {
         Ok(Some(port)) => port,
-        _ => return None,
+        _ => return Err(()),
     };
     port_state_clear(&PORT_FREE_V6, port);
     if port >= min && port <= max && claim_port_v6(port, in_val) {
-        return Some(port);
+        return Ok(Some(port));
     }
     if port >= min
         && port <= max
@@ -559,7 +559,7 @@ fn pop_and_claim_v6(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue6) 
     {
         release_port_v6(port);
     }
-    None
+    Ok(None)
 }
 
 #[inline(always)]
@@ -575,19 +575,22 @@ fn alloc_port_v4(pref: u16, min: u16, max: u16, in_val: &BindingValue4) -> Optio
     };
     let mut i = 0;
     while i < 8 {
-        if let Some(port) = pop_and_claim_v4(q1, min, max, in_val) {
-            return Some(port);
+        match pop_and_claim_v4(q1, min, max, in_val) {
+            Ok(Some(port)) => return Some(port),
+            Ok(None) => {}
+            Err(()) => break,
         }
         i += 1;
     }
     i = 0;
     while i < 4 {
-        if let Some(port) = pop_and_claim_v4(q2, min, max, in_val) {
-            return Some(port);
+        match pop_and_claim_v4(q2, min, max, in_val) {
+            Ok(Some(port)) => return Some(port),
+            Ok(None) => {}
+            Err(()) => break,
         }
         i += 1;
     }
-    let _ = PORT_FLAGS.set(0, 1, 0);
     None
 }
 
@@ -604,19 +607,22 @@ fn alloc_port_v6(pref: u16, min: u16, max: u16, in_val: &BindingValue6) -> Optio
     };
     let mut i = 0;
     while i < 8 {
-        if let Some(port) = pop_and_claim_v6(q1, min, max, in_val) {
-            return Some(port);
+        match pop_and_claim_v6(q1, min, max, in_val) {
+            Ok(Some(port)) => return Some(port),
+            Ok(None) => {}
+            Err(()) => break,
         }
         i += 1;
     }
     i = 0;
     while i < 4 {
-        if let Some(port) = pop_and_claim_v6(q2, min, max, in_val) {
-            return Some(port);
+        match pop_and_claim_v6(q2, min, max, in_val) {
+            Ok(Some(port)) => return Some(port),
+            Ok(None) => {}
+            Err(()) => break,
         }
         i += 1;
     }
-    let _ = PORT_FLAGS.set(0, 1, 0);
     None
 }
 
@@ -730,9 +736,6 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         }
 
         let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
-        if udph.check == 0 {
-            return TC_ACT_UNSPEC;
-        }
         let ext_port = u16::from_be(udph.dst_port);
 
         if let Some(target) = INBOUND_BINDINGS_V4.get_ptr_mut(&ext_port) {
@@ -1003,7 +1006,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         }
         if iph.next_hdr == 44 {
             unsafe { FRAG_TARGET.tail_call(&ctx, 0); }
-            return TC_ACT_UNSPEC;
+            return TC_ACT_SHOT;
         }
 
         let udp_off = match locate_ipv6_l4(data_end, ip_off, iph.next_hdr) {
@@ -1174,6 +1177,9 @@ fn frag_v6_target(
             return TC_ACT_UNSPEC;
         }
         let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+        if udph.check == 0 {
+            return TC_ACT_UNSPEC;
+        }
         let ext_port = u16::from_be(udph.dst_port);
         let Some(target) = INBOUND_BINDINGS_V6.get_ptr_mut(&ext_port) else {
             return TC_ACT_UNSPEC;

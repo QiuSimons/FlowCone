@@ -541,16 +541,16 @@ impl SessionManager {
 
             let ob = self.ob_map4.get(&key, 0);
             let ib = self.ib_map4.get(&port, 0);
-            let ob_present = ob.is_ok();
+            let ob_matches = matches!(&ob, Ok(val) if u16::from_be(val.port) == port);
             let ib_matches = matches!(&ib, Ok(iv) if iv.matches_key(&key));
             let mut last = 0u64;
-            if let Ok(val) = ob {
+            if ob_matches && let Ok(val) = ob {
                 last = val.last_seen;
             }
             if ib_matches && let Ok(iv) = ib {
                 last = last.max(iv.last_seen);
             }
-            if !ob_present {
+            if !ob_matches {
                 if ib_matches && self.ib_map4.remove(&port).is_ok() {
                     self.release_port4(port);
                     swept4 += 1;
@@ -588,16 +588,16 @@ impl SessionManager {
 
             let ob = self.ob_map6.get(&key, 0);
             let ib = self.ib_map6.get(&port, 0);
-            let ob_present = ob.is_ok();
+            let ob_matches = matches!(&ob, Ok(val) if u16::from_be(val.port) == port);
             let ib_matches = matches!(&ib, Ok(iv) if iv.matches_key(&key));
             let mut last = 0u64;
-            if let Ok(val) = ob {
+            if ob_matches && let Ok(val) = ob {
                 last = val.last_seen;
             }
             if ib_matches && let Ok(iv) = ib {
                 last = last.max(iv.last_seen);
             }
-            if !ob_present {
+            if !ob_matches {
                 if ib_matches && self.ib_map6.remove(&port).is_ok() {
                     self.release_port6(port);
                     swept6 += 1;
