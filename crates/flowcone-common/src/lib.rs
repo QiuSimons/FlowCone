@@ -235,10 +235,10 @@ pub fn is_routable_internal_ipv6(addr: &[u8; 16], allow_all_internal: bool) -> b
 pub const MAX_BINDINGS: u32 = 65536;
 pub const FRAG_MAP_ENTRIES: u32 = 8192;
 pub const SESSION_EVENT_ENTRIES: u32 = 16384;
-/// One u64 word covers 64 ports; 1024 words cover the full u16 port space.
+/// One byte of state per port; 65536 entries cover the full u16 port space.
 pub const PORT_BITS_ENTRIES: u32 = 65536;
 /// Each parity queue can hold the whole pool; duplicates are skipped via the
-/// free bitmap, and a full queue sets a user-space rebuild flag.
+/// per-port state, and a full queue sets a user-space rebuild flag.
 pub const PORT_QUEUE_ENTRIES: u32 = 65536;
 
 /// Packet mark set on DNAT-translated inbound packets. The daemon can override
@@ -269,7 +269,7 @@ pub fn select_rfc4787_port<F: FnMut(u16) -> bool>(
     }
 
     // 2. Parity preservation. 64 probes keeps the false-exhaustion rate
-    // negligible even at high occupancy without a full bitmap scan.
+    // negligible even at high occupancy without a full port-state scan.
     let parity = (preferred & 1) as u32;
     let minp = min_port as u32;
     let maxp = max_port as u32;
