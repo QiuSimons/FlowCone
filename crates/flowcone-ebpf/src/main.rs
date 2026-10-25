@@ -11,7 +11,7 @@ use aya_ebpf::{
 use core::mem;
 use flowcone_common::{
     BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FragKey4, FragKey6, FragValue4, FragValue6,
-    GlobalConfig, SessionEvent4, SessionEvent6, MAX_BINDINGS, PORT_BITS_ENTRIES,
+    GlobalConfig, SessionEvent4, SessionEvent6, MAX_BINDINGS, PORT_STATE_ENTRIES,
     PORT_QUEUE_ENTRIES, SESSION_EVENT_ENTRIES,
 };
 
@@ -107,19 +107,19 @@ static GC_FLAGS: Array<u32> = Array::with_max_entries(1, 0);
 /// Port pool: one state byte per port plus two parity queues. The byte marks
 /// whether the port is still queued; BPF_NOEXIST is the authoritative claim.
 #[map]
-static PORT_FREE_V4: Array<u8> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
+static PORT_FREE_V4: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
 
 #[map]
-static PORT_FREE_V6: Array<u8> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
+static PORT_FREE_V6: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
 
 /// Ports bound by local UDP services (DNS, WireGuard, IPsec, proxy, ...).
 /// Reserve both families conservatively so FlowCone never steals a WAN
 /// service port via port preservation.
 #[map]
-static RESERVED_V4: Array<u8> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
+static RESERVED_V4: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
 
 #[map]
-static RESERVED_V6: Array<u8> = Array::with_max_entries(PORT_BITS_ENTRIES, 0);
+static RESERVED_V6: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
 
 #[map]
 static FREE_EVEN_V4: Queue<u16> = Queue::with_max_entries(PORT_QUEUE_ENTRIES, 0);
@@ -453,7 +453,7 @@ fn port_is_reserved(reserved: &Array<u8>, port: u16) -> bool {
 }
 
 #[inline(always)]
-fn port_bit_clear(map: &Array<u8>, port: u16) {
+fn port_state_clear(map: &Array<u8>, port: u16) {
     if let Some(p) = map.get_ptr_mut(port as u32) {
         unsafe {
             *p = 0;
@@ -528,7 +528,7 @@ fn pop_and_claim_v4(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue4) 
         Ok(Some(port)) => port,
         _ => return None,
     };
-    port_bit_clear(&PORT_FREE_V4, port);
+    port_state_clear(&PORT_FREE_V4, port);
     if port >= min && port <= max && claim_port_v4(port, in_val) {
         return Some(port);
     }
@@ -548,7 +548,7 @@ fn pop_and_claim_v6(q: &Queue<u16>, min: u16, max: u16, in_val: &BindingValue6) 
         Ok(Some(port)) => port,
         _ => return None,
     };
-    port_bit_clear(&PORT_FREE_V6, port);
+    port_state_clear(&PORT_FREE_V6, port);
     if port >= min && port <= max && claim_port_v6(port, in_val) {
         return Some(port);
     }

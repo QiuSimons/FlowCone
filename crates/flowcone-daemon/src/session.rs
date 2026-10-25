@@ -49,8 +49,8 @@ pub struct SessionManager {
     events4: Queue<MapData, SessionEvent4>,
     events6: Queue<MapData, SessionEvent6>,
     gc_flags: Array<MapData, u32>,
-    free_bits4: Array<MapData, u8>,
-    free_bits6: Array<MapData, u8>,
+    free_state4: Array<MapData, u8>,
+    free_state6: Array<MapData, u8>,
     reserved4: Array<MapData, u8>,
     reserved6: Array<MapData, u8>,
     free_even4: Queue<MapData, u16>,
@@ -231,8 +231,8 @@ impl SessionManager {
         events4: Queue<MapData, SessionEvent4>,
         events6: Queue<MapData, SessionEvent6>,
         gc_flags: Array<MapData, u32>,
-        free_bits4: Array<MapData, u8>,
-        free_bits6: Array<MapData, u8>,
+        free_state4: Array<MapData, u8>,
+        free_state6: Array<MapData, u8>,
         reserved4: Array<MapData, u8>,
         reserved6: Array<MapData, u8>,
         free_even4: Queue<MapData, u16>,
@@ -251,8 +251,8 @@ impl SessionManager {
             events4,
             events6,
             gc_flags,
-            free_bits4,
-            free_bits6,
+            free_state4,
+            free_state6,
             reserved4,
             reserved6,
             free_even4,
@@ -281,17 +281,17 @@ impl SessionManager {
         while q.pop(0).is_ok() {}
     }
 
-    fn set_range_bits(bits: &mut Array<MapData, u8>, min: u16, max: u16) {
+    fn set_range_state(state: &mut Array<MapData, u8>, min: u16, max: u16) {
         let mut p = min as u32;
         while p <= max as u32 {
-            let _ = bits.set(p, 1, 0);
+            let _ = state.set(p, 1, 0);
             p += 1;
         }
     }
 
-    fn set_reserved_bits(bits: &mut Array<MapData, u8>, ports: &[u16]) {
+    fn set_reserved_state(state: &mut Array<MapData, u8>, ports: &[u16]) {
         for &port in ports {
-            let _ = bits.set(port as u32, 1, 0);
+            let _ = state.set(port as u32, 1, 0);
         }
     }
 
@@ -305,8 +305,8 @@ impl SessionManager {
         let v6 = std::fs::read_to_string("/proc/net/udp6")
             .map(|s| parse_proc_udp_ports(&s))
             .unwrap_or_default();
-        Self::set_reserved_bits(&mut self.reserved4, &v4);
-        Self::set_reserved_bits(&mut self.reserved6, &v6);
+        Self::set_reserved_state(&mut self.reserved4, &v4);
+        Self::set_reserved_state(&mut self.reserved6, &v6);
     }
 
     fn init_family4(&mut self) {
@@ -315,7 +315,7 @@ impl SessionManager {
         }
         Self::drain_queue(&mut self.free_even4);
         Self::drain_queue(&mut self.free_odd4);
-        Self::set_range_bits(&mut self.free_bits4, self.min_port, self.max_port);
+        Self::set_range_state(&mut self.free_state4, self.min_port, self.max_port);
         let mut p = self.min_port;
         loop {
             let q = if (p & 1) == 0 {
@@ -340,7 +340,7 @@ impl SessionManager {
         }
         Self::drain_queue(&mut self.free_even6);
         Self::drain_queue(&mut self.free_odd6);
-        Self::set_range_bits(&mut self.free_bits6, self.min_port, self.max_port);
+        Self::set_range_state(&mut self.free_state6, self.min_port, self.max_port);
         let mut p = self.min_port;
         loop {
             let q = if (p & 1) == 0 {
@@ -369,10 +369,10 @@ impl SessionManager {
     }
 
     fn release_port4(&mut self, port: u16) {
-        if self.free_bits4.get(&(port as u32), 0).unwrap_or(0) != 0 {
+        if self.free_state4.get(&(port as u32), 0).unwrap_or(0) != 0 {
             return;
         }
-        let _ = self.free_bits4.set(port as u32, 1, 0);
+        let _ = self.free_state4.set(port as u32, 1, 0);
         let q = if (port & 1) == 0 {
             &mut self.free_even4
         } else {
@@ -384,10 +384,10 @@ impl SessionManager {
     }
 
     fn release_port6(&mut self, port: u16) {
-        if self.free_bits6.get(&(port as u32), 0).unwrap_or(0) != 0 {
+        if self.free_state6.get(&(port as u32), 0).unwrap_or(0) != 0 {
             return;
         }
-        let _ = self.free_bits6.set(port as u32, 1, 0);
+        let _ = self.free_state6.set(port as u32, 1, 0);
         let q = if (port & 1) == 0 {
             &mut self.free_even6
         } else {
@@ -403,7 +403,7 @@ impl SessionManager {
         Self::drain_queue(&mut self.free_odd4);
         let mut p = self.min_port;
         loop {
-            if self.free_bits4.get(&(p as u32), 0).unwrap_or(0) != 0 {
+            if self.free_state4.get(&(p as u32), 0).unwrap_or(0) != 0 {
                 let q = if (p & 1) == 0 {
                     &mut self.free_even4
                 } else {
@@ -426,7 +426,7 @@ impl SessionManager {
         Self::drain_queue(&mut self.free_odd6);
         let mut p = self.min_port;
         loop {
-            if self.free_bits6.get(&(p as u32), 0).unwrap_or(0) != 0 {
+            if self.free_state6.get(&(p as u32), 0).unwrap_or(0) != 0 {
                 let q = if (p & 1) == 0 {
                     &mut self.free_even6
                 } else {
