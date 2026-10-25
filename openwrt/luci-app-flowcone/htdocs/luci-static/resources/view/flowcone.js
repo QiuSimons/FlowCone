@@ -6,6 +6,7 @@
 'require view';
 'require ui';
 'require dom';
+'require fs';
 'require tools.widgets as widgets';
 
 const callFlowconeStatus = rpc.declare({
@@ -43,12 +44,15 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			L.resolveDefault(callFlowconeStatus(), {}),
-			uci.load('flowcone')
+			uci.load('flowcone'),
+			uci.load('firewall'),
+			L.resolveDefault(fs.stat('/etc/init.d/nat6'), null)
 		]);
 	},
 
 	render: function(res) {
 		var status = res[0] || {};
+		var nat6Installed = res[3] != null;
 		var m, s, o;
 
 		m = new form.Map('flowcone', _('FlowCone'),
@@ -87,7 +91,7 @@ return view.extend({
 						statusEl,
 						reloadBtn
 					])
-				])
+				]),
 			]);
 
 			updateStatus(status, statusEl);
@@ -118,6 +122,21 @@ return view.extend({
 			_('NAT66 for ULA prefixes, direct wire-speed for GUA.'));
 		o.default = o.disabled;
 		o.rmempty = false;
+
+		o = s.option(form.Flag, 'nat6', _('IPv6 NAT6 Helper'),
+			_('Use the nat6 package for ULA/RA/DHCPv6; FlowCone keeps IPv6 UDP fullcone when enabled.'));
+		o.default = o.disabled;
+		o.rmempty = false;
+		o.cfgvalue = function() {
+			return uci.get('firewall', '@defaults[0]', 'nat6') === '1' ? '1' : '0';
+		};
+		o.write = function(section_id, value) {
+			uci.set('firewall', '@defaults[0]', 'nat6', (value === '1' || value === true) ? '1' : '0');
+		};
+		if (!nat6Installed) {
+			o.readonly = true;
+			o.description = _('Use the nat6 package for ULA/RA/DHCPv6; FlowCone keeps IPv6 UDP fullcone when enabled.') + ' ' + _('The nat6 package is not installed.');
+		}
 
 		o = s.option(widgets.DeviceSelect, 'interface', _('WAN Interface'),
 			_('WAN interface device to attach TCX programs to. Leave empty for automatic WAN detection.'));
