@@ -574,7 +574,7 @@ fn alloc_port_v4(pref: u16, min: u16, max: u16, in_val: &BindingValue4) -> Optio
         (&FREE_ODD_V4, &FREE_EVEN_V4)
     };
     let mut i = 0;
-    while i < 8 {
+    while i < 4 {
         match pop_and_claim_v4(q1, min, max, in_val) {
             Ok(Some(port)) => return Some(port),
             Ok(None) => {}
@@ -583,7 +583,7 @@ fn alloc_port_v4(pref: u16, min: u16, max: u16, in_val: &BindingValue4) -> Optio
         i += 1;
     }
     i = 0;
-    while i < 4 {
+    while i < 2 {
         match pop_and_claim_v4(q2, min, max, in_val) {
             Ok(Some(port)) => return Some(port),
             Ok(None) => {}
@@ -606,7 +606,7 @@ fn alloc_port_v6(pref: u16, min: u16, max: u16, in_val: &BindingValue6) -> Optio
         (&FREE_ODD_V6, &FREE_EVEN_V6)
     };
     let mut i = 0;
-    while i < 8 {
+    while i < 4 {
         match pop_and_claim_v6(q1, min, max, in_val) {
             Ok(Some(port)) => return Some(port),
             Ok(None) => {}
@@ -615,7 +615,7 @@ fn alloc_port_v6(pref: u16, min: u16, max: u16, in_val: &BindingValue6) -> Optio
         i += 1;
     }
     i = 0;
-    while i < 4 {
+    while i < 2 {
         match pop_and_claim_v6(q2, min, max, in_val) {
             Ok(Some(port)) => return Some(port),
             Ok(None) => {}
