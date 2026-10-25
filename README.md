@@ -34,7 +34,6 @@ FlowCone 运行在网络接口的 TCX（Ingress / Egress）钩子上，实现符
   - 通用 Linux 环境自动探测并注入系统现有的 `postrouting` (nat) 和 `forward` (filter) 链。
   - 退出时根据 rule handle 自动清理注入的防火墙规则。
 - **私网 IP 泄漏防护**：
-  - 出站分片报文不转发（避免私网源泄漏），入站分片不翻译；完整的分片 NAT 需要独立的数据面特性，当前未启用。
   - DHCP 客户端/中继、链路本地和广播/组播 UDP 不进入 FlowCone SNAT，交给系统防火墙处理。
 - **OpenWrt 支持**：
   - 提供 procd 托管服务、UCI 配置文件（`/etc/config/flowcone`）和 LuCI Web 管理界面（`luci-app-flowcone`）。
