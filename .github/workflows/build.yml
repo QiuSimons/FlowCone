@@ -123,7 +123,7 @@ jobs:
           CONTAINER: docker.io/openwrt/sdk
           ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
           FEEDNAME: packages_ci
-          PACKAGES: flowcone luci-app-flowcone
+          PACKAGES: flowcone luci-app-flowcone nat6
           NO_REFRESH_CHECK: true
           NO_SHFMT_CHECK: true
 
@@ -146,7 +146,7 @@ jobs:
             name="${base%.*}"
 
             # Filter for FlowCone packages only
-            if [[ "$base" != *flowcone* ]]; then
+            if [[ "$base" != *flowcone* && "$base" != nat6* ]]; then
               continue
             fi
 
