@@ -102,6 +102,9 @@ jobs:
       matrix:
         arch:
           - aarch64_generic
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_cortex-a76
           - x86_64
         sdk: ${{ fromJson(needs.prepare.outputs.sdks) }}
 
