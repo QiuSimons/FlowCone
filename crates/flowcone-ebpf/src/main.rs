@@ -11,8 +11,8 @@ use aya_ebpf::{
 };
 use core::mem;
 use flowcone_common::{
-    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FragKey4, FragKey6, FragValue4,
-    FragValue6, GlobalConfig, MAX_BINDINGS, PORT_QUEUE_ENTRIES, PORT_STATE_ENTRIES,
+    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES, FragKey4, FragKey6,
+    FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_QUEUE_ENTRIES, PORT_STATE_ENTRIES,
     SESSION_EVENT_ENTRIES, SessionEvent4, SessionEvent6,
 };
 
@@ -64,20 +64,30 @@ static ICMP_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
 #[map]
 static ICMP6_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
 
-const FRAG_ENTRIES: u32 = 1024;
 const FRAG_TIMEOUT_NS: u64 = 30_000_000_000;
+/// The free queue can contain stale entries for ports claimed by port
+/// preservation. Give a new allocation enough bounded attempts to walk past
+/// them instead of failing while free ports are still queued.
+const EGRESS_ALLOC_PRIMARY: usize = 6;
+const EGRESS_ALLOC_FALLBACK: usize = 2;
+// The fragment target verifier budget is tighter than the main egress
+// program under aya-ebpf 0.3; keep its bounded retries at 3/2.
+const FRAG_ALLOC_PRIMARY: usize = 3;
+const FRAG_ALLOC_FALLBACK: usize = 2;
 
 #[map]
-static FRAG_IN_V4: LruHashMap<FragKey4, FragValue4> = LruHashMap::with_max_entries(FRAG_ENTRIES, 0);
+static FRAG_IN_V4: LruHashMap<FragKey4, FragValue4> =
+    LruHashMap::with_max_entries(FRAG_MAP_ENTRIES, 0);
 #[map]
 static FRAG_OUT_V4: LruHashMap<FragKey4, FragValue4> =
-    LruHashMap::with_max_entries(FRAG_ENTRIES, 0);
+    LruHashMap::with_max_entries(FRAG_MAP_ENTRIES, 0);
 
 #[map]
-static FRAG_IN_V6: LruHashMap<FragKey6, FragValue6> = LruHashMap::with_max_entries(FRAG_ENTRIES, 0);
+static FRAG_IN_V6: LruHashMap<FragKey6, FragValue6> =
+    LruHashMap::with_max_entries(FRAG_MAP_ENTRIES, 0);
 #[map]
 static FRAG_OUT_V6: LruHashMap<FragKey6, FragValue6> =
-    LruHashMap::with_max_entries(FRAG_ENTRIES, 0);
+    LruHashMap::with_max_entries(FRAG_MAP_ENTRIES, 0);
 
 #[map]
 static OUTBOUND_BINDINGS_V4: HashMap<EndpointKey4, BindingValue4> =
@@ -105,8 +115,9 @@ static SESSION_EVENTS_V6: Queue<SessionEvent6> = Queue::with_max_entries(SESSION
 #[map]
 static GC_FLAGS: Array<u32> = Array::with_max_entries(1, 0);
 
-/// Port pool: one state byte per port plus two parity queues. The byte marks
-/// whether the port is still queued; BPF_NOEXIST is the authoritative claim.
+/// Port pool: one free/claimed byte per port plus two parity queues. A port
+/// claimed by preservation leaves a stale queue entry behind; the pop path
+/// discards it and BPF_NOEXIST remains the authoritative claim.
 #[map]
 static PORT_FREE_V4: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
 
@@ -196,8 +207,7 @@ fn read_be16(p: usize) -> u16 {
 /// Parse the PPP protocol field (optional 0xff 0x03 address/control, optional
 /// one-byte protocol compression). Returns the IP ethertype and header offset.
 #[inline(always)]
-fn parse_ppp(data: usize, data_end: usize, mut off: usize) -> Option<L2Info> {
-    let _ = data;
+fn parse_ppp(data_end: usize, mut off: usize) -> Option<L2Info> {
     if off + 2 > data_end {
         return None;
     }
@@ -257,7 +267,7 @@ fn parse_l2(data: usize, data_end: usize, l2_len: u32) -> Option<L2Info> {
             if ip_off + 6 > data_end {
                 return None;
             }
-            return parse_ppp(data, data_end, ip_off + 6);
+            return parse_ppp(data_end, ip_off + 6);
         }
         if proto == ETH_P_IP || proto == ETH_P_IPV6 {
             return Some(L2Info { proto, ip_off });
@@ -266,7 +276,7 @@ fn parse_l2(data: usize, data_end: usize, l2_len: u32) -> Option<L2Info> {
     }
 
     if l2_len == 2 {
-        return parse_ppp(data, data_end, data);
+        return parse_ppp(data_end, data);
     }
 
     // Raw IP / TUN / WireGuard / RAWIP.
@@ -567,8 +577,17 @@ fn pop_and_claim_v6(
 }
 
 #[inline(always)]
-fn alloc_port_v4(pref: u16, min: u16, max: u16, in_val: &BindingValue4) -> Option<u16> {
+fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
+    pref: u16,
+    min: u16,
+    max: u16,
+    in_val: &BindingValue4,
+) -> Option<u16> {
     if pref >= min && pref <= max && claim_port_v4(pref, in_val) {
+        // Port preservation bypasses the queue. Clear the free bit so the
+        // stale queue entry is discarded on pop and release_port() can
+        // return the port after the mapping expires.
+        port_state_clear(&PORT_FREE_V4, pref);
         return Some(pref);
     }
     let parity = pref & 1;
@@ -577,30 +596,42 @@ fn alloc_port_v4(pref: u16, min: u16, max: u16, in_val: &BindingValue4) -> Optio
     } else {
         (&FREE_ODD_V4, &FREE_EVEN_V4)
     };
+    let mut saw_stale = false;
     let mut i = 0;
-    while i < 4 {
+    while i < PRIMARY {
         match pop_and_claim_v4(q1, min, max, in_val) {
             Ok(Some(port)) => return Some(port),
-            Ok(None) => {}
+            Ok(None) => saw_stale = true,
             Err(()) => break,
         }
         i += 1;
     }
     i = 0;
-    while i < 2 {
+    while i < FALLBACK {
         match pop_and_claim_v4(q2, min, max, in_val) {
             Ok(Some(port)) => return Some(port),
-            Ok(None) => {}
+            Ok(None) => saw_stale = true,
             Err(()) => break,
         }
         i += 1;
+    }
+    if saw_stale {
+        let _ = PORT_FLAGS.set(0, &1, 0);
     }
     None
 }
 
 #[inline(always)]
-fn alloc_port_v6(pref: u16, min: u16, max: u16, in_val: &BindingValue6) -> Option<u16> {
+fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
+    pref: u16,
+    min: u16,
+    max: u16,
+    in_val: &BindingValue6,
+) -> Option<u16> {
     if pref >= min && pref <= max && claim_port_v6(pref, in_val) {
+        // See alloc_port_v4(): clear the free bit; the queue entry can only
+        // be consumed lazily and is discarded when popped.
+        port_state_clear(&PORT_FREE_V6, pref);
         return Some(pref);
     }
     let parity = pref & 1;
@@ -609,23 +640,27 @@ fn alloc_port_v6(pref: u16, min: u16, max: u16, in_val: &BindingValue6) -> Optio
     } else {
         (&FREE_ODD_V6, &FREE_EVEN_V6)
     };
+    let mut saw_stale = false;
     let mut i = 0;
-    while i < 4 {
+    while i < PRIMARY {
         match pop_and_claim_v6(q1, min, max, in_val) {
             Ok(Some(port)) => return Some(port),
-            Ok(None) => {}
+            Ok(None) => saw_stale = true,
             Err(()) => break,
         }
         i += 1;
     }
     i = 0;
-    while i < 2 {
+    while i < FALLBACK {
         match pop_and_claim_v6(q2, min, max, in_val) {
             Ok(Some(port)) => return Some(port),
-            Ok(None) => {}
+            Ok(None) => saw_stale = true,
             Err(()) => break,
         }
         i += 1;
+    }
+    if saw_stale {
+        let _ = PORT_FLAGS.set(0, &1, 0);
     }
     None
 }
@@ -651,12 +686,12 @@ fn locate_ipv6_l4(data_end: usize, ip_off: usize, mut nh: u8) -> Ipv6L4 {
             if cur_off + 2 > data_end {
                 return Ipv6L4::NonUdp;
             }
-            let ext = unsafe { &*(cur_off as *const [u8; 2]) };
-            nh = ext[0];
-            let ext_len = (ext[1] as usize + 1) * 8;
+            let next = read_u8(cur_off);
+            let ext_len = (read_u8(cur_off + 1) as usize + 1) * 8;
             if cur_off + ext_len > data_end {
                 return Ipv6L4::NonUdp;
             }
+            nh = next;
             cur_off += ext_len;
         } else if nh == IPPROTO_ROUTING {
             return Ipv6L4::Unsupported;
@@ -711,6 +746,9 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         if (iph.ver_ihl >> 4) != 4 {
             return TC_ACT_UNSPEC;
         }
+        if iph.dst_addr != cfg.wan_ip4 {
+            return TC_ACT_UNSPEC;
+        }
         if iph.protocol == IPPROTO_ICMP {
             unsafe {
                 ICMP_TARGET.tail_call(&ctx, 0);
@@ -718,9 +756,6 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             return TC_ACT_UNSPEC;
         }
         if iph.protocol != IPPROTO_UDP {
-            return TC_ACT_UNSPEC;
-        }
-        if iph.dst_addr != cfg.wan_ip4 {
             return TC_ACT_UNSPEC;
         }
 
@@ -803,9 +838,13 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
 
         let udp_off = match locate_ipv6_l4(data_end, ip_off, iph.next_hdr) {
             Ipv6L4::Udp(off) => off,
-            Ipv6L4::Fragment | Ipv6L4::NonUdp | Ipv6L4::Unsupported => {
+            Ipv6L4::Fragment => {
+                unsafe {
+                    FRAG_TARGET.tail_call(&ctx, 0);
+                }
                 return TC_ACT_UNSPEC;
             }
+            Ipv6L4::NonUdp | Ipv6L4::Unsupported => return TC_ACT_UNSPEC,
         };
 
         if udp_off + mem::size_of::<UdpHdr>() > data_end {
@@ -956,7 +995,12 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
                 _pad: 0,
                 last_seen: now,
             };
-            let alloc = match alloc_port_v4(pref, cfg.min_port4, cfg.max_port4, &in_val) {
+            let alloc = match alloc_port_v4::<EGRESS_ALLOC_PRIMARY, EGRESS_ALLOC_FALLBACK>(
+                pref,
+                cfg.min_port4,
+                cfg.max_port4,
+                &in_val,
+            ) {
                 Some(p) => p,
                 None => return TC_ACT_SHOT,
             };
@@ -1029,14 +1073,16 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         let udp_off = match locate_ipv6_l4(data_end, ip_off, iph.next_hdr) {
             Ipv6L4::Udp(off) => off,
             Ipv6L4::Fragment => {
-                return TC_ACT_SHOT;
-            }
-            Ipv6L4::NonUdp => {
+                unsafe {
+                    FRAG_TARGET.tail_call(&ctx, 0);
+                }
                 return TC_ACT_UNSPEC;
             }
-            Ipv6L4::Unsupported => {
-                return TC_ACT_SHOT;
-            }
+            // Routing headers, AH/ESP and an over-long extension chain are
+            // not NAT-able here. Pass them to the normal stack: ULA sources
+            // are not routable on the WAN, and dropping a non-UDP packet is
+            // strictly worse than leaving it alone.
+            Ipv6L4::NonUdp | Ipv6L4::Unsupported => return TC_ACT_UNSPEC,
         };
 
         if udp_off + mem::size_of::<UdpHdr>() > data_end {
@@ -1087,7 +1133,12 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
                 _pad: [0; 3],
                 last_seen: now,
             };
-            let alloc = match alloc_port_v6(pref, cfg.min_port6, cfg.max_port6, &in_val) {
+            let alloc = match alloc_port_v6::<EGRESS_ALLOC_PRIMARY, EGRESS_ALLOC_FALLBACK>(
+                pref,
+                cfg.min_port6,
+                cfg.max_port6,
+                &in_val,
+            ) {
                 Some(p) => p,
                 None => return TC_ACT_SHOT,
             };
@@ -1141,6 +1192,38 @@ fn read_be32(p: usize) -> u32 {
     u32::from_be_bytes([read_u8(p), read_u8(p + 1), read_u8(p + 2), read_u8(p + 3)])
 }
 
+/// Walk Hop-by-Hop / Destination Options headers until the fragment header.
+/// Only these two headers may legally precede a fragment header that this
+/// program can translate.
+#[inline(always)]
+fn ipv6_fragment_offset(data_end: usize, ip_off: usize, mut nh: u8) -> Option<usize> {
+    let mut cur = ip_off + 40;
+    let mut iter = 0;
+    while iter < 4 {
+        if nh == IPPROTO_FRAGMENT {
+            if cur + 8 <= data_end {
+                return Some(cur);
+            }
+            return None;
+        }
+        if nh != IPPROTO_HOPOPTS && nh != IPPROTO_DSTOPTS {
+            return None;
+        }
+        if cur + 2 > data_end {
+            return None;
+        }
+        let next = read_u8(cur);
+        let len = (read_u8(cur + 1) as usize + 1) * 8;
+        if cur + len > data_end {
+            return None;
+        }
+        nh = next;
+        cur += len;
+        iter += 1;
+    }
+    None
+}
+
 #[inline(always)]
 fn frag_v6_target(
     ctx: &TcContext,
@@ -1149,23 +1232,27 @@ fn frag_v6_target(
     cfg: &GlobalConfig,
     ip_off: usize,
 ) -> i32 {
-    if ip_off + 48 > data_end {
+    if ip_off + 40 > data_end {
         return TC_ACT_UNSPEC;
     }
     let iph = unsafe { &mut *(ip_off as *mut Ipv6Hdr) };
-    if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 || iph.next_hdr != 44 {
+    if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
         return TC_ACT_UNSPEC;
     }
-    let next_hdr = unsafe { *((ip_off + 40) as *const u8) };
+    let Some(frag_off) = ipv6_fragment_offset(data_end, ip_off, iph.next_hdr) else {
+        return TC_ACT_UNSPEC;
+    };
+    if frag_off + 8 > data_end {
+        return TC_ACT_UNSPEC;
+    }
+    let next_hdr = read_u8(frag_off);
     if next_hdr != IPPROTO_UDP {
         return TC_ACT_UNSPEC;
     }
-    let frag_field = u16::from_be_bytes([unsafe { *((ip_off + 42) as *const u8) }, unsafe {
-        *((ip_off + 43) as *const u8)
-    }]);
+    let frag_field = read_be16(frag_off + 2);
     let offset = frag_field & 0xfff8;
     let more = (frag_field & 1) != 0;
-    let id = read_be32(ip_off + 44);
+    let id = read_be32(frag_off + 4);
     let ingress = ipv6_eq(&iph.dst_addr, &cfg.wan_ip6);
     let key = FragKey6 {
         src: iph.src_addr,
@@ -1187,7 +1274,7 @@ fn frag_v6_target(
             }
             return TC_ACT_UNSPEC;
         }
-        let udp_off = ip_off + 48;
+        let udp_off = frag_off + 8;
         if udp_off + mem::size_of::<UdpHdr>() > data_end {
             return TC_ACT_UNSPEC;
         }
@@ -1243,7 +1330,7 @@ fn frag_v6_target(
         ctx.skb.set_mark(mark | cfg.flowcone_mark);
         return TC_ACT_UNSPEC;
     }
-    let udp_off = ip_off + 48;
+    let udp_off = frag_off + 8;
     if udp_off + mem::size_of::<UdpHdr>() > data_end {
         return TC_ACT_SHOT;
     }
@@ -1286,7 +1373,12 @@ fn frag_v6_target(
             _pad: [0; 3],
             last_seen: now,
         };
-        let alloc = match alloc_port_v6(pref, cfg.min_port6, cfg.max_port6, &in_val) {
+        let alloc = match alloc_port_v6::<FRAG_ALLOC_PRIMARY, FRAG_ALLOC_FALLBACK>(
+            pref,
+            cfg.min_port6,
+            cfg.max_port6,
+            &in_val,
+        ) {
             Some(p) => p,
             None => return TC_ACT_SHOT,
         };
@@ -1486,6 +1578,9 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
         if now.saturating_sub(v.last_seen) > FRAG_TIMEOUT_NS {
             return TC_ACT_SHOT;
         }
+        if v.ip == 0 {
+            return TC_ACT_UNSPEC;
+        }
         let old = iph.src_addr;
         iph.src_addr = v.ip;
         if !fixup_l3_v4(&ctx, data, ip_off, old, v.ip) {
@@ -1509,6 +1604,24 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
     let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
     let src_port = udph.src_port;
     if bypass_special_udp4(src_ip, iph.dst_addr, src_port, udph.dst_port) {
+        // The remaining fragments have no UDP header, so remember that this
+        // datagram must stay on the normal firewall path instead of dropping
+        // them for lack of a NAT cache entry.
+        if more {
+            let key = FragKey4 {
+                src: src_ip,
+                dst: iph.dst_addr,
+                id: iph.id,
+                proto: IPPROTO_UDP,
+                _pad: 0,
+            };
+            let value = FragValue4 {
+                ip: 0,
+                _pad: 0,
+                last_seen: now_ns(),
+            };
+            let _ = FRAG_OUT_V4.insert(&key, &value, BPF_ANY);
+        }
         return TC_ACT_UNSPEC;
     }
     let now = now_ns();
@@ -1546,7 +1659,12 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
             _pad: 0,
             last_seen: now,
         };
-        let alloc = match alloc_port_v4(pref, cfg.min_port4, cfg.max_port4, &in_val) {
+        let alloc = match alloc_port_v4::<FRAG_ALLOC_PRIMARY, FRAG_ALLOC_FALLBACK>(
+            pref,
+            cfg.min_port4,
+            cfg.max_port4,
+            &in_val,
+        ) {
             Some(p) => p,
             None => return TC_ACT_SHOT,
         };

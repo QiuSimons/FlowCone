@@ -72,8 +72,10 @@ pub(crate) fn generate_fw4_srcnat_rule_v6(iface: &str, is_masq: bool) -> String 
     }
 }
 
-pub(crate) fn generate_fw4_forward_rules() -> Vec<String> {
-    vec!["meta mark & 0x40000000 == 0x40000000 counter accept comment \"flowcone\"".to_string()]
+pub(crate) fn generate_fw4_forward_rules(mark: u32) -> Vec<String> {
+    vec![format!(
+        "meta mark & {mark:#x} == {mark:#x} counter accept comment \"flowcone\""
+    )]
 }
 
 pub(crate) fn has_table_inet_fw4() -> bool {
@@ -148,7 +150,9 @@ pub(crate) fn strip_fw4_user_block(content: &str) -> String {
 pub(crate) fn clean_firewall4_user_file() {
     if let Ok(current) = fs::read_to_string(FW4_USER_PATH) {
         let cleaned = strip_fw4_user_block(&current);
-        let _ = fs::write(FW4_USER_PATH, cleaned.trim());
+        if cleaned != current {
+            let _ = fs::write(FW4_USER_PATH, cleaned);
+        }
     }
 }
 
@@ -238,7 +242,7 @@ pub(crate) fn bypass_clause(mask: u32, val: u32) -> String {
 
 /// Extra guards matching the eBPF bypass_special_udp4() checks.
 fn special_v4_clause() -> &'static str {
-    " ip saddr != 0.0.0.0/8 udp sport != { 67, 68 } udp dport != { 67, 68 } ip daddr != 255.255.255.255 ip daddr != 224.0.0.0/4 ip daddr != 169.254.0.0/16"
+    " ip saddr != 0.0.0.0 udp sport != { 67, 68 } udp dport != { 67, 68 } ip daddr != 255.255.255.255 ip daddr != 224.0.0.0/4 ip daddr != 169.254.0.0/16"
 }
 
 pub(crate) fn generate_live_srcnat_rule_v4(
@@ -284,7 +288,6 @@ pub(crate) fn build_fw4_insert_script_live(
     iface: &str,
     enable_v4: bool,
     enable_v6: bool,
-    _is_v6_masq: bool,
     mark: u32,
     bypass_mask: u32,
     bypass_val: u32,
@@ -484,10 +487,15 @@ mod tests {
             srcnat_v6_masq,
             "oifname \"eth1\" meta nfproto ipv6 meta l4proto udp counter return comment \"flowcone\""
         );
-        let fwds = generate_fw4_forward_rules();
+        let fwds = generate_fw4_forward_rules(0x40000000);
         assert_eq!(
             fwds[0],
             "meta mark & 0x40000000 == 0x40000000 counter accept comment \"flowcone\""
+        );
+        let custom = generate_fw4_forward_rules(0x8000);
+        assert_eq!(
+            custom[0],
+            "meta mark & 0x8000 == 0x8000 counter accept comment \"flowcone\""
         );
     }
 
@@ -545,7 +553,7 @@ table ip6 nat {
     fn test_live_rules_use_sets_and_new_state() {
         let r4 = generate_live_srcnat_rule_v4("eth1", 0, 0);
         assert!(r4.contains("ip saddr @flowcone_v4"));
-        assert!(r4.contains("ip saddr != 0.0.0.0/8"));
+        assert!(r4.contains("ip saddr != 0.0.0.0"));
         let r6 = generate_live_forward_rule_v6("eth1", 0x40000000);
         assert!(r6.contains("ct state new"));
         assert!(r6.contains("ip6 saddr @flowcone_fwd6"));

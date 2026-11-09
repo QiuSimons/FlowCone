@@ -10,8 +10,11 @@ use aya::programs::tc::{
     SchedClassifier, SchedClassifierLinkId, TcAttach, TcAttachType, qdisc_add_clsact,
 };
 use aya::{EbpfLoader, VerifierLogLevel};
-use flowcone_common::GlobalConfig;
-use session::SessionManager;
+use flowcone_common::{
+    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FragKey4, FragKey6, FragValue4,
+    FragValue6, GlobalConfig, SessionEvent4, SessionEvent6,
+};
+use session::{SessionManager, SessionMaps};
 use std::ffi::CString;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, OwnedFd};
@@ -24,9 +27,30 @@ use std::time::{Duration, Instant};
 /// Safety net for link loss the ifindex cannot reveal (index reuse, ...).
 const REATTACH_INTERVAL: Duration = Duration::from_secs(30);
 
+macro_rules! take_map {
+    ($bpf:expr, $name:literal, $ty:ty) => {
+        <$ty>::try_from(
+            $bpf.take_map($name)
+                .ok_or(concat!("map ", $name, " not found"))?,
+        )?
+    };
+}
+
 static EBPF_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flowcone-ebpf.bin"));
 static RUNNING: AtomicBool = AtomicBool::new(true);
 static RESYNC_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// A poisoned control-plane lock means a thread panicked while holding
+/// shared state. Fail fast instead of silently skipping config/GC forever.
+fn lock_or_exit<'a, T>(mutex: &'a Mutex<T>, what: &str) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!("flowcone: {what} mutex poisoned; exiting");
+            std::process::exit(1);
+        }
+    }
+}
+
 struct ShutdownNotifier {
     running: Mutex<bool>,
     condvar: Condvar,
@@ -220,7 +244,6 @@ struct DataPlane {
     ingress_ids: [u32; 2],
     egress_ids: [u32; 2],
     active: usize,
-    tail_guard: bool,
     _ingress_target: ProgramArray<MapData>,
     _egress_target: ProgramArray<MapData>,
     _frag_target: ProgramArray<MapData>,
@@ -312,7 +335,6 @@ impl DataPlane {
             ingress_ids: [0; 2],
             egress_ids: [0; 2],
             active: 0,
-            tail_guard: false,
             _ingress_target: ingress_target,
             _egress_target: egress_target,
             _frag_target: frag_target,
@@ -324,7 +346,6 @@ impl DataPlane {
         data_plane.egress_ids[0] = loaded_program_id(&data_plane.bpf, "flowcone_tcx_egress_a")?;
         data_plane.egress_ids[1] = loaded_program_id(&data_plane.bpf, "flowcone_tcx_egress_b")?;
         data_plane.attach(true, true)?;
-        data_plane.tail_guard = true;
         Ok(data_plane)
     }
 
@@ -405,9 +426,6 @@ impl DataPlane {
     }
 
     fn ensure_last(&mut self, verbose: bool) -> Result<bool, Box<dyn std::error::Error>> {
-        if !self.tail_guard {
-            return Ok(false);
-        }
         let iface = self.iface.clone();
         let in_id = self.ingress_ids[self.active];
         let out_id = self.egress_ids[self.active];
@@ -417,7 +435,6 @@ impl DataPlane {
                 if verbose {
                     eprintln!("flowcone: TCX ingress order query failed: {:?}", e);
                 }
-                self.tail_guard = false;
                 return Ok(false);
             }
         };
@@ -427,7 +444,6 @@ impl DataPlane {
                 if verbose {
                     eprintln!("flowcone: TCX egress order query failed: {:?}", e);
                 }
-                self.tail_guard = false;
                 return Ok(false);
             }
         };
@@ -529,12 +545,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Without the verifier log first: it does not fit aya's buffer (E2BIG).
     // On failure retry with the log so the verifier reason is reported.
+    // FLOWCONE_VERIFIER_LOG=1 selects the DEBUG log for per-program loads,
+    // which is the only way to diagnose a late load_classifier() failure.
+    let verifier_log = std::env::var_os("FLOWCONE_VERIFIER_LOG").is_some();
     let mut bpf = {
         let mut loader = EbpfLoader::new();
         if let Some(ref b) = btf {
             loader.btf(b);
         }
-        loader.verifier_log_level(VerifierLogLevel::DISABLE);
+        loader.verifier_log_level(if verifier_log {
+            VerifierLogLevel::DEBUG
+        } else {
+            VerifierLogLevel::DISABLE
+        });
         match loader.load(EBPF_BYTES) {
             Ok(bpf) => bpf,
             Err(first) => {
@@ -552,75 +575,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let session_mgr = Arc::new(Mutex::new(SessionManager::new(
-        Array::try_from(bpf.take_map("CONFIG").ok_or("map CONFIG not found")?)?,
-        Array::try_from(
-            bpf.take_map("ACTIVE_CONFIG")
-                .ok_or("map ACTIVE_CONFIG not found")?,
-        )?,
-        HashMap::try_from(
-            bpf.take_map("OUTBOUND_BINDINGS_V4")
-                .ok_or("map OUTBOUND_BINDINGS_V4 not found")?,
-        )?,
-        HashMap::try_from(
-            bpf.take_map("INBOUND_BINDINGS_V4")
-                .ok_or("map INBOUND_BINDINGS_V4 not found")?,
-        )?,
-        HashMap::try_from(
-            bpf.take_map("OUTBOUND_BINDINGS_V6")
-                .ok_or("map OUTBOUND_BINDINGS_V6 not found")?,
-        )?,
-        HashMap::try_from(
-            bpf.take_map("INBOUND_BINDINGS_V6")
-                .ok_or("map INBOUND_BINDINGS_V6 not found")?,
-        )?,
-        Queue::try_from(
-            bpf.take_map("SESSION_EVENTS_V4")
-                .ok_or("map SESSION_EVENTS_V4 not found")?,
-        )?,
-        Queue::try_from(
-            bpf.take_map("SESSION_EVENTS_V6")
-                .ok_or("map SESSION_EVENTS_V6 not found")?,
-        )?,
-        Array::try_from(bpf.take_map("GC_FLAGS").ok_or("map GC_FLAGS not found")?)?,
-        Array::try_from(
-            bpf.take_map("PORT_FREE_V4")
-                .ok_or("map PORT_FREE_V4 not found")?,
-        )?,
-        Array::try_from(
-            bpf.take_map("PORT_FREE_V6")
-                .ok_or("map PORT_FREE_V6 not found")?,
-        )?,
-        Array::try_from(
-            bpf.take_map("RESERVED_V4")
-                .ok_or("map RESERVED_V4 not found")?,
-        )?,
-        Array::try_from(
-            bpf.take_map("RESERVED_V6")
-                .ok_or("map RESERVED_V6 not found")?,
-        )?,
-        Queue::try_from(
-            bpf.take_map("FREE_EVEN_V4")
-                .ok_or("map FREE_EVEN_V4 not found")?,
-        )?,
-        Queue::try_from(
-            bpf.take_map("FREE_ODD_V4")
-                .ok_or("map FREE_ODD_V4 not found")?,
-        )?,
-        Queue::try_from(
-            bpf.take_map("FREE_EVEN_V6")
-                .ok_or("map FREE_EVEN_V6 not found")?,
-        )?,
-        Queue::try_from(
-            bpf.take_map("FREE_ODD_V6")
-                .ok_or("map FREE_ODD_V6 not found")?,
-        )?,
-        Array::try_from(
-            bpf.take_map("PORT_FLAGS")
-                .ok_or("map PORT_FLAGS not found")?,
-        )?,
-    )));
-    if let Ok(mut mgr) = session_mgr.lock() {
+    let session_mgr = Arc::new(Mutex::new(SessionManager::new(SessionMaps {
+        config_map: take_map!(bpf, "CONFIG", Array<MapData, GlobalConfig>),
+        active_map: take_map!(bpf, "ACTIVE_CONFIG", Array<MapData, u32>),
+        ob_map4: take_map!(
+            bpf,
+            "OUTBOUND_BINDINGS_V4",
+            HashMap<MapData, EndpointKey4, BindingValue4>
+        ),
+        ib_map4: take_map!(
+            bpf,
+            "INBOUND_BINDINGS_V4",
+            HashMap<MapData, u16, BindingValue4>
+        ),
+        ob_map6: take_map!(
+            bpf,
+            "OUTBOUND_BINDINGS_V6",
+            HashMap<MapData, EndpointKey6, BindingValue6>
+        ),
+        ib_map6: take_map!(
+            bpf,
+            "INBOUND_BINDINGS_V6",
+            HashMap<MapData, u16, BindingValue6>
+        ),
+        frag_in4: take_map!(bpf, "FRAG_IN_V4", HashMap<MapData, FragKey4, FragValue4>),
+        frag_out4: take_map!(bpf, "FRAG_OUT_V4", HashMap<MapData, FragKey4, FragValue4>),
+        frag_in6: take_map!(bpf, "FRAG_IN_V6", HashMap<MapData, FragKey6, FragValue6>),
+        frag_out6: take_map!(bpf, "FRAG_OUT_V6", HashMap<MapData, FragKey6, FragValue6>),
+        events4: take_map!(bpf, "SESSION_EVENTS_V4", Queue<MapData, SessionEvent4>),
+        events6: take_map!(bpf, "SESSION_EVENTS_V6", Queue<MapData, SessionEvent6>),
+        gc_flags: take_map!(bpf, "GC_FLAGS", Array<MapData, u32>),
+        free_state4: take_map!(bpf, "PORT_FREE_V4", Array<MapData, u8>),
+        free_state6: take_map!(bpf, "PORT_FREE_V6", Array<MapData, u8>),
+        reserved4: take_map!(bpf, "RESERVED_V4", Array<MapData, u8>),
+        reserved6: take_map!(bpf, "RESERVED_V6", Array<MapData, u8>),
+        free_even4: take_map!(bpf, "FREE_EVEN_V4", Queue<MapData, u16>),
+        free_odd4: take_map!(bpf, "FREE_ODD_V4", Queue<MapData, u16>),
+        free_even6: take_map!(bpf, "FREE_EVEN_V6", Queue<MapData, u16>),
+        free_odd6: take_map!(bpf, "FREE_ODD_V6", Queue<MapData, u16>),
+        port_flags: take_map!(bpf, "PORT_FLAGS", Array<MapData, u32>),
+    })));
+    {
+        let mut mgr = lock_or_exit(&session_mgr, "session");
         mgr.configure_port_pool(config.min_port, config.max_port);
         mgr.init_port_pool(config.enable_v4, config.enable_v6);
         mgr.reserve_local_ports();
@@ -705,9 +701,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             if applied.ip4 != 0 {
                                 println!("flowcone: flushing stale v4 mappings");
-                                if let Ok(mut mgr) = ip_session.lock() {
-                                    mgr.clear_v4_mappings();
-                                }
+                                lock_or_exit(&ip_session, "session").clear_v4_mappings();
                             }
                             applied.ip4 = ip4;
                             resolved_ip4 = ip4;
@@ -740,9 +734,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("flowcone: WAN IPv6 updated to {}", Ipv6Addr::from(ip6));
                             if applied.ip6 != [0u8; 16] {
                                 println!("flowcone: flushing stale v6 mappings");
-                                if let Ok(mut mgr) = ip_session.lock() {
-                                    mgr.clear_v6_mappings();
-                                }
+                                lock_or_exit(&ip_session, "session").clear_v6_mappings();
                             }
                             applied.ip6 = ip6;
                             resolved_ip6 = ip6;
@@ -789,22 +781,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (applied.v4_enabled && !active_v4) || (applied.effective_v6 > effective_v6);
                 let mut stage_ok = true;
                 let mut rules_staged = false;
+                let fw_cfg = firewall::FirewallConfig {
+                    iface: &ip_cfg.iface,
+                    enable_v4: active_v4,
+                    enable_v6: effective_v6 != 0,
+                    is_v6_masq,
+                    mark: ip_cfg.flowcone_mark,
+                    bypass_mask: ip_cfg.bypass_mark_mask,
+                    bypass_val: ip_cfg.bypass_mark_val,
+                    verbose: ip_cfg.verbose,
+                };
 
                 // On a shrink, stage the stricter rules before disabling the
                 // data plane. On grow or SIGHUP, sync once after publishing.
                 if ip_cfg.manage_nft && shrinking {
-                    stage_ok = firewall::sync_fw4_rules(
-                        &ip_cfg.iface,
-                        ip_cfg.min_port,
-                        ip_cfg.max_port,
-                        active_v4,
-                        effective_v6 != 0,
-                        is_v6_masq,
-                        ip_cfg.flowcone_mark,
-                        ip_cfg.bypass_mark_mask,
-                        ip_cfg.bypass_mark_val,
-                        ip_cfg.verbose,
-                    );
+                    stage_ok = firewall::sync_fw4_rules(&fw_cfg);
                     if !stage_ok {
                         eprintln!(
                             "flowcone: could not stage new firewall rules; keeping old data plane"
@@ -830,27 +821,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         enabled_v6: effective_v6,
                         flowcone_mark: ip_cfg.flowcone_mark,
                     };
-                    let set_ok = ip_session
-                        .lock()
-                        .map(|mut mgr| mgr.set_config(g_cfg))
-                        .unwrap_or(false);
+                    let set_ok = lock_or_exit(&ip_session, "session").set_config(g_cfg);
                     if !set_ok {
                         eprintln!("flowcone: could not publish data-plane config");
                         RESYNC_REQUESTED.store(true, Ordering::Relaxed);
                     } else if ip_cfg.manage_nft {
-                        let sync_ok = rules_staged
-                            || firewall::sync_fw4_rules(
-                                &ip_cfg.iface,
-                                ip_cfg.min_port,
-                                ip_cfg.max_port,
-                                active_v4,
-                                effective_v6 != 0,
-                                is_v6_masq,
-                                ip_cfg.flowcone_mark,
-                                ip_cfg.bypass_mark_mask,
-                                ip_cfg.bypass_mark_val,
-                                ip_cfg.verbose,
-                            );
+                        let sync_ok = rules_staged || firewall::sync_fw4_rules(&fw_cfg);
                         if sync_ok {
                             applied.v4_enabled = active_v4;
                             applied.effective_v6 = effective_v6;
@@ -877,7 +853,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if reattach {
                 let mut attached = false;
-                if let Ok(mut dp) = ip_dp.lock() {
+                {
+                    let mut dp = lock_or_exit(&ip_dp, "data-plane");
                     let result = if force_new_attach {
                         dp.attach(true, false)
                     } else {
@@ -924,25 +901,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if last_reserve_scan.elapsed() >= Duration::from_secs(30) {
-                if let Ok(mut mgr) = ip_session.lock() {
-                    mgr.reserve_local_ports();
-                }
+                lock_or_exit(&ip_session, "session").reserve_local_ports();
                 last_reserve_scan = Instant::now();
             }
 
-            if ip_cfg.manage_nft && applied.liveness {
-                let _ = firewall::refresh_liveness(
+            if ip_cfg.manage_nft
+                && applied.liveness
+                && !firewall::refresh_liveness(
                     applied.v4_enabled,
                     applied.effective_v6 != 0,
                     applied.v6_masq,
                     ip_cfg.verbose,
-                );
+                )
+            {
+                // The sets can disappear on an fw4 reload; resync recreates
+                // them instead of letting the exemption expire silently.
+                if ip_cfg.verbose {
+                    eprintln!("flowcone: liveness refresh failed; scheduling resync");
+                }
+                RESYNC_REQUESTED.store(true, Ordering::Relaxed);
             }
 
+            let has_wan_addr = resolved_ip4 != 0 || resolved_ip6 != [0u8; 16];
             let sleep_dur = if ip_cfg.manage_nft && applied.liveness {
                 Duration::from_secs(5)
             } else {
-                Duration::from_secs(if resolved_ip4 != 0 { 5 } else { 1 })
+                Duration::from_secs(if has_wan_addr { 5 } else { 1 })
             };
             match monitor {
                 Some(ref monitor) => {
@@ -976,7 +960,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gc_thread = thread::spawn(move || {
         while gc_notifier.wait_timeout(gc_interval) {
             let now = get_monotonic_coarse_ns();
-            if let Ok(mut mgr) = gc_session.lock() {
+            {
+                let mut mgr = lock_or_exit(&gc_session, "session");
                 let (v4_swept, v6_swept) = mgr.gc_tick(now, timeout_ns);
                 if verbose && (v4_swept > 0 || v6_swept > 0) {
                     println!(
@@ -1008,9 +993,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         firewall::remove_rules(config.verbose);
     }
 
-    if let Ok(mut mgr) = session_mgr.lock() {
-        mgr.disable_fail_open();
-    }
+    lock_or_exit(&session_mgr, "session").disable_fail_open();
 
     let _ = ip_thread.join();
     let _ = gc_thread.join();
