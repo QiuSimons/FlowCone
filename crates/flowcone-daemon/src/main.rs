@@ -360,6 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {
                         if applied.ip4 != 0 {
                             println!("flowcone: WAN interface lost IPv4");
+                            lock_or_exit(&ip_session, "session").clear_v4_mappings();
                             frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip4 = 0;
                             resolved_ip4 = 0;
@@ -395,6 +396,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {
                         if applied.ip6 != [0u8; 16] {
                             println!("flowcone: WAN interface lost IPv6");
+                            lock_or_exit(&ip_session, "session").clear_v6_mappings();
                             frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip6 = [0u8; 16];
                             resolved_ip6 = [0u8; 16];

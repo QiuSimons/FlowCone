@@ -386,7 +386,7 @@ fn fixup_l3_v4(ctx: &TcContext, data: usize, ip_off: usize, old_ip: u32, new_ip:
         .is_ok()
 }
 
-/// Fix up the UDP checksum for an IPv6 address/port rewrite.
+/// Compare two IPv6 addresses without alignment assumptions.
 #[inline(always)]
 fn ipv6_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
     let p_a = a.as_ptr() as *const u64;
@@ -736,12 +736,12 @@ fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
             0,
         );
     }
-    if ctx.saw_stale != 0 {
-        let _ = PORT_FLAGS.set(0, &1, 0);
-    }
     if ctx.result != 0 {
         Some(ctx.result)
     } else {
+        if ctx.saw_stale != 0 {
+            let _ = PORT_FLAGS.set(0, &1, 0);
+        }
         None
     }
 }
@@ -775,12 +775,12 @@ fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
             0,
         );
     }
-    if ctx.saw_stale != 0 {
-        let _ = PORT_FLAGS.set(0, &1, 0);
-    }
     if ctx.result != 0 {
         Some(ctx.result)
     } else {
+        if ctx.saw_stale != 0 {
+            let _ = PORT_FLAGS.set(0, &1, 0);
+        }
         None
     }
 }

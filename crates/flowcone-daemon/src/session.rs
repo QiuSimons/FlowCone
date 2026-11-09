@@ -554,12 +554,12 @@ impl SessionManager {
         }
         Self::drain_queue(&mut self.free_even4);
         Self::drain_queue(&mut self.free_odd4);
-        Self::set_range_state(&mut self.free_state4, self.min_port, self.max_port);
         let mut p = self.min_port;
         loop {
-            if self.reserved4.get(&(p as u32), 0).unwrap_or(0) == 0
-                && self.free_state4.get(&(p as u32), 0).unwrap_or(0) & PORT_FREE_BIT != 0
-            {
+            if self.ib_map4.get(&p, 0).is_ok() {
+                let _ = self.free_state4.set(p as u32, &0, 0);
+            } else if self.reserved4.get(&(p as u32), 0).unwrap_or(0) == 0 {
+                let _ = self.free_state4.set(p as u32, &PORT_FREE_BIT, 0);
                 let q = if (p & 1) == 0 {
                     &mut self.free_even4
                 } else {
@@ -572,6 +572,8 @@ impl SessionManager {
                 let _ = self
                     .free_state4
                     .set(p as u32, &(PORT_FREE_BIT | PORT_QUEUED_BIT), 0);
+            } else {
+                let _ = self.free_state4.set(p as u32, &PORT_FREE_BIT, 0);
             }
             if p == self.max_port {
                 break;
@@ -586,12 +588,12 @@ impl SessionManager {
         }
         Self::drain_queue(&mut self.free_even6);
         Self::drain_queue(&mut self.free_odd6);
-        Self::set_range_state(&mut self.free_state6, self.min_port, self.max_port);
         let mut p = self.min_port;
         loop {
-            if self.reserved6.get(&(p as u32), 0).unwrap_or(0) == 0
-                && self.free_state6.get(&(p as u32), 0).unwrap_or(0) & PORT_FREE_BIT != 0
-            {
+            if self.ib_map6.get(&p, 0).is_ok() {
+                let _ = self.free_state6.set(p as u32, &0, 0);
+            } else if self.reserved6.get(&(p as u32), 0).unwrap_or(0) == 0 {
+                let _ = self.free_state6.set(p as u32, &PORT_FREE_BIT, 0);
                 let q = if (p & 1) == 0 {
                     &mut self.free_even6
                 } else {
@@ -604,6 +606,8 @@ impl SessionManager {
                 let _ = self
                     .free_state6
                     .set(p as u32, &(PORT_FREE_BIT | PORT_QUEUED_BIT), 0);
+            } else {
+                let _ = self.free_state6.set(p as u32, &PORT_FREE_BIT, 0);
             }
             if p == self.max_port {
                 break;
