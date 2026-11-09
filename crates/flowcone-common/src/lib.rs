@@ -17,7 +17,7 @@ pub struct BindingValue4 {
     pub ip: u32,
     pub port: u16,
     pub _pad: u16,
-    pub last_seen: u64,
+    pub last_seen: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -40,7 +40,7 @@ pub struct BindingValue6 {
     pub ip: [u8; 16],
     pub port: u16,
     pub _pad: [u16; 3],
-    pub last_seen: u64,
+    pub last_seen: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -78,6 +78,7 @@ pub struct FragKey4 {
     pub id: u16,
     pub proto: u8,
     pub _pad: u8,
+    pub epoch: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -88,7 +89,7 @@ unsafe impl aya::Pod for FragKey4 {}
 pub struct FragValue4 {
     pub ip: u32,
     pub _pad: u32,
-    pub last_seen: u64,
+    pub last_seen: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -102,6 +103,7 @@ pub struct FragKey6 {
     pub id: u32,
     pub proto: u8,
     pub _pad: [u8; 3],
+    pub epoch: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -111,7 +113,7 @@ unsafe impl aya::Pod for FragKey6 {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FragValue6 {
     pub ip: [u8; 16],
-    pub last_seen: u64,
+    pub last_seen: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -132,6 +134,7 @@ pub struct GlobalConfig {
     pub enabled_v4: u32,
     pub enabled_v6: u32,
     pub flowcone_mark: u32,
+    pub frag_epoch: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -389,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_global_config_layout() {
-        assert_eq!(core::mem::size_of::<GlobalConfig>(), 52);
+        assert_eq!(core::mem::size_of::<GlobalConfig>(), 56);
         assert_eq!(core::mem::align_of::<GlobalConfig>(), 4);
     }
 }

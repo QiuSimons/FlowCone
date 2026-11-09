@@ -69,8 +69,8 @@ pub(crate) fn sync_fw4_rules(cfg: &FirewallConfig<'_>) -> bool {
         );
         let ok = nft_apply_with_fallback(&deletes, &body, "inet fw4 rule sync");
         if ok {
-            if native_includes && set_file_ok {
-                update_chain_pre_files_live(
+            let chain_pre_ok = native_includes
+                && update_chain_pre_files_live(
                     iface,
                     enable_v4,
                     enable_v6,
@@ -78,13 +78,17 @@ pub(crate) fn sync_fw4_rules(cfg: &FirewallConfig<'_>) -> bool {
                     bypass_mask,
                     bypass_val,
                 );
+            if native_includes && set_file_ok && chain_pre_ok {
                 clean_firewall4_user_file();
             } else {
+                if native_includes && (!set_file_ok || !chain_pre_ok) {
+                    eprintln!("flowcone: error: could not persist fw4 chain-pre rules");
+                }
                 clean_chain_pre_files();
                 clean_firewall4_user_file();
             }
             refresh_fw4_liveness(enable_v4, enable_v6, is_v6_masq, verbose);
-            if native_includes && set_file_ok {
+            if native_includes && set_file_ok && chain_pre_ok {
                 report_layer(1, "fw4 chain-pre includes", verbose);
             } else {
                 report_layer(2, "live fw4 rules (reload is recovered by SIGHUP)", verbose);

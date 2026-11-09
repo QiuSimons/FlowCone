@@ -1,6 +1,7 @@
 //! OpenWrt fw4 integration: rule text, liveness sets and persistence files.
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -320,6 +321,14 @@ pub(crate) fn build_fw4_insert_script_live(
     script
 }
 
+fn remove_persisted(path: &str) -> bool {
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn update_chain_pre_files_live(
     iface: &str,
     enable_v4: bool,
@@ -327,9 +336,9 @@ pub(crate) fn update_chain_pre_files_live(
     mark: u32,
     bypass_mask: u32,
     bypass_val: u32,
-) {
-    let _ = fs::create_dir_all(FW4_CHAIN_PRE_SRCNAT_DIR);
-    let _ = fs::create_dir_all(FW4_CHAIN_PRE_FORWARD_DIR);
+) -> bool {
+    let mut ok = fs::create_dir_all(FW4_CHAIN_PRE_SRCNAT_DIR).is_ok();
+    ok &= fs::create_dir_all(FW4_CHAIN_PRE_FORWARD_DIR).is_ok();
 
     let mut srcnat_lines = Vec::new();
     if enable_v4 {
@@ -339,9 +348,9 @@ pub(crate) fn update_chain_pre_files_live(
         srcnat_lines.push(generate_live_srcnat_rule_v6(iface, bypass_mask, bypass_val));
     }
     if !srcnat_lines.is_empty() {
-        let _ = fs::write(FW4_CHAIN_PRE_SRCNAT_FILE, srcnat_lines.join("\n") + "\n");
+        ok &= fs::write(FW4_CHAIN_PRE_SRCNAT_FILE, srcnat_lines.join("\n") + "\n").is_ok();
     } else {
-        let _ = fs::remove_file(FW4_CHAIN_PRE_SRCNAT_FILE);
+        ok &= remove_persisted(FW4_CHAIN_PRE_SRCNAT_FILE);
     }
 
     let mut fwd_lines = Vec::new();
@@ -352,10 +361,11 @@ pub(crate) fn update_chain_pre_files_live(
         fwd_lines.push(generate_live_forward_rule_v6(iface, mark));
     }
     if !fwd_lines.is_empty() {
-        let _ = fs::write(FW4_CHAIN_PRE_FORWARD_FILE, fwd_lines.join("\n") + "\n");
+        ok &= fs::write(FW4_CHAIN_PRE_FORWARD_FILE, fwd_lines.join("\n") + "\n").is_ok();
     } else {
-        let _ = fs::remove_file(FW4_CHAIN_PRE_FORWARD_FILE);
+        ok &= remove_persisted(FW4_CHAIN_PRE_FORWARD_FILE);
     }
+    ok
 }
 
 pub(crate) fn v6_elements(is_masq: bool) -> &'static str {

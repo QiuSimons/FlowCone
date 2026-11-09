@@ -222,7 +222,7 @@ config flowcone 'config'
 
 ## 实现边界与兼容性
 
-> 仓库内没有自动化网络回归。本次交付在 A/B 双路由验证了 eBPF verifier 加载；在 B 上验证了 STUN 映射与外部主动 UDP 的 fullcone 收包；同源端口 40000 的两个 LAN 客户端，第二个由 `bpf_loop` 回调分配到 1024 并完成外部主动 UDP 收包。其他内核/拓扑仍需复测。以下为代码实现边界。
+> 仓库内没有自动化网络回归。本次交付在 A/B 双路由验证了 IPv4 eBPF verifier 加载；在 B 上验证了 STUN 映射与外部主动 UDP 的 fullcone 收包；同源端口 40000 的两个 LAN 客户端，第二个由 `bpf_loop` 回调分配到 1024 并完成外部主动 UDP 收包。IPv6/frag fullcone 仍需独立的 IPv6 WAN 实验室复测；不要用 verifier 通过冒充数据面通过。以下为代码实现边界。
 
 - UDP 数据面：FlowCone 负责 UDP EIM/EIF 和端口保持；TCP/ICMP 仍由系统 NAT/fw4 处理。standalone 表会为 TCP/ICMP 提供 masquerade 回退。
 - IPv4 分片：出站/入站分片通过独立 fragment target 做首片建映射、后续片查缓存。分片缓存为 1024 条/方向/族（LRU，30 秒超时）；首片晚于后续片到达时，后续片可能被丢弃并依赖上层重传。
@@ -239,8 +239,8 @@ config flowcone 'config'
 - L2/PPPoE：挂在 pppoe-wan/ppp0 时 TC 看到裸 IP（l2_len=0）。若把程序挂到承载 PPPoE 的以太网口，且 PPP 协议字段为 1 字节压缩，IP 头会从奇数偏移开始；内核 bpf_l3/l4_csum_replace 拒绝奇数 offset，当前会丢弃该包。OpenWrt 默认挂 pppoe-wan，不会走到该路径。
 - 分片表容量：1024 条 LRU，表满时旧记录被挤出，后续分片会被丢弃；不会把私网地址发出去，但单个大数据报可能缺片。
 - 本机监听端口：守护进程每 30 秒按当前 /proc/net/udp{,6} 的监听集合整体对账；服务停止后端口会回到池中。仍被映射占用的端口不会立即回收。
-- 端口池：端口保留成功会清除空闲状态；空闲队列中可能残留历史条目。主 egress 和 frag target 每侧最多 64 次（32 primary + 32 fallback），由 `bpf_loop` 回调执行；仍失败时置 `PORT_FLAGS`，由用户态重建队列，避免少量脏条目误判端口耗尽。eBPF 对象携带 BTF，目标需有 vmlinux BTF；`bpf_loop` 还需 CAP_BPF（当前 root 运行）。
-- 过期回收：删除前复核 inbound/outbound 的 last_seen；数据面刷新与删除不是原子操作，仍存在极小的竞态窗口。
+- 端口池：端口状态使用 FREE/QUEUED 位；preferred 成功只清 FREE、保留 QUEUED，release 不会重复入队。主 egress 和 frag v4 每侧最多 64 次（32 primary + 32 fallback），由 `bpf_loop` 回调执行；frag v6 因 verifier 预算只能 1/0。仍失败时置 `PORT_FLAGS`，由用户态重建队列。eBPF 对象携带 BTF，目标需有 vmlinux BTF；`bpf_loop` 还需 CAP_BPF（当前 root 运行）。
+- 过期回收：`last_seen` 为 u32 秒，32 位读原子；删除前复核 inbound/outbound，删除本身仍非原子。WAN 变化递增 frag key epoch，旧缓存不命中。
 
 ---
 

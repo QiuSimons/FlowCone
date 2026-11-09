@@ -247,6 +247,7 @@ struct DataPlane {
     _ingress_target: ProgramArray<MapData>,
     _egress_target: ProgramArray<MapData>,
     _frag_target: ProgramArray<MapData>,
+    _frag6_target: ProgramArray<MapData>,
     _icmp_target: ProgramArray<MapData>,
     _icmp6_target: ProgramArray<MapData>,
 }
@@ -296,6 +297,11 @@ impl DataPlane {
                 format!("load target flowcone_tcx_egress: {e}").into()
             },
         )?;
+        load_classifier(&mut bpf, "flowcone_frag_v6").map_err(
+            |e| -> Box<dyn std::error::Error> {
+                format!("load target flowcone_frag_v6: {e}").into()
+            },
+        )?;
         load_classifier(&mut bpf, "flowcone_frag_target").map_err(
             |e| -> Box<dyn std::error::Error> {
                 format!("load target flowcone_frag_target: {e}").into()
@@ -325,6 +331,7 @@ impl DataPlane {
         let ingress_target = load_target_map(&mut bpf, "INGRESS_TARGET", "flowcone_tcx_ingress")?;
         let egress_target = load_target_map(&mut bpf, "EGRESS_TARGET", "flowcone_tcx_egress")?;
         let frag_target = load_target_map(&mut bpf, "FRAG_TARGET", "flowcone_frag_target")?;
+        let frag6_target = load_target_map(&mut bpf, "FRAG6_TARGET", "flowcone_frag_v6")?;
         let icmp_target = load_target_map(&mut bpf, "ICMP_TARGET", "flowcone_icmp_target")?;
         let icmp6_target = load_target_map(&mut bpf, "ICMP6_TARGET", "flowcone_icmp6_target")?;
         let mut data_plane = Self {
@@ -338,6 +345,7 @@ impl DataPlane {
             _ingress_target: ingress_target,
             _egress_target: egress_target,
             _frag_target: frag_target,
+            _frag6_target: frag6_target,
             _icmp_target: icmp_target,
             _icmp6_target: icmp6_target,
         };
@@ -650,6 +658,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ifindex: start_ifindex,
             present: start_ifindex != 0,
         };
+        let mut frag_epoch: u32 = 0;
         let mut attach_timer = Instant::now();
 
         loop {
@@ -703,6 +712,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("flowcone: flushing stale v4 mappings");
                                 lock_or_exit(&ip_session, "session").clear_v4_mappings();
                             }
+                            frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip4 = ip4;
                             resolved_ip4 = ip4;
                             config_dirty = true;
@@ -711,6 +721,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {
                         if applied.ip4 != 0 {
                             println!("flowcone: WAN interface lost IPv4");
+                            frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip4 = 0;
                             resolved_ip4 = 0;
                             config_dirty = true;
@@ -736,6 +747,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("flowcone: flushing stale v6 mappings");
                                 lock_or_exit(&ip_session, "session").clear_v6_mappings();
                             }
+                            frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip6 = ip6;
                             resolved_ip6 = ip6;
                             config_dirty = true;
@@ -744,6 +756,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {
                         if applied.ip6 != [0u8; 16] {
                             println!("flowcone: WAN interface lost IPv6");
+                            frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip6 = [0u8; 16];
                             resolved_ip6 = [0u8; 16];
                             config_dirty = true;
@@ -820,6 +833,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         enabled_v4: if active_v4 { 1 } else { 0 },
                         enabled_v6: effective_v6,
                         flowcone_mark: ip_cfg.flowcone_mark,
+                        frag_epoch,
                     };
                     let set_ok = lock_or_exit(&ip_session, "session").set_config(g_cfg);
                     if !set_ok {
@@ -952,17 +966,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let gc_session = Arc::clone(&session_mgr);
-    let timeout_ns = config.timeout_sec.saturating_mul(1_000_000_000);
+    let timeout = config.timeout_sec as u32;
     let verbose = config.verbose;
     let gc_notifier = Arc::clone(&notifier);
     let gc_interval = Duration::from_secs(config.gc_interval_sec.max(1));
 
     let gc_thread = thread::spawn(move || {
         while gc_notifier.wait_timeout(gc_interval) {
-            let now = get_monotonic_coarse_ns();
+            let now = (get_monotonic_coarse_ns() / 1_000_000_000) as u32;
             {
                 let mut mgr = lock_or_exit(&gc_session, "session");
-                let (v4_swept, v6_swept) = mgr.gc_tick(now, timeout_ns);
+                let (v4_swept, v6_swept) = mgr.gc_tick(now, timeout);
                 if verbose && (v4_swept > 0 || v6_swept > 0) {
                     println!(
                         "flowcone: swept {} v4 and {} v6 expired sessions",
