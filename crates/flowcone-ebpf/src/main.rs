@@ -68,8 +68,8 @@ const FRAG_TIMEOUT_NS: u64 = 30_000_000_000;
 /// The free queue can contain stale entries for ports claimed by port
 /// preservation. Give a new allocation enough bounded attempts to walk past
 /// them instead of failing while free ports are still queued.
-const EGRESS_ALLOC_PRIMARY: usize = 6;
-const EGRESS_ALLOC_FALLBACK: usize = 2;
+const EGRESS_ALLOC_PRIMARY: usize = 8;
+const EGRESS_ALLOC_FALLBACK: usize = 8;
 // The fragment target verifier budget is tighter than the main egress
 // program under aya-ebpf 0.3; keep its bounded retries at 3/2.
 const FRAG_ALLOC_PRIMARY: usize = 3;
@@ -460,19 +460,12 @@ fn push_event_v6(key: &EndpointKey6, port: u16) {
 
 #[inline(always)]
 fn port_is_reserved(reserved: &Array<u8>, port: u16) -> bool {
-    match reserved.get_ptr_mut(port as u32) {
-        Some(p) => unsafe { *p != 0 },
-        None => false,
-    }
+    reserved.get(port as u32).map(|v| *v).unwrap_or(0) != 0
 }
 
 #[inline(always)]
 fn port_state_clear(map: &Array<u8>, port: u16) {
-    if let Some(p) = map.get_ptr_mut(port as u32) {
-        unsafe {
-            *p = 0;
-        }
-    }
+    let _ = map.set(port as u32, &0, 0);
 }
 
 #[inline(always)]
@@ -541,36 +534,26 @@ fn claim_port_v6(port: u16, in_val: &BindingValue6) -> bool {
 }
 
 #[inline(always)]
-fn pop_and_claim_v4(
-    q: &Queue<u16>,
-    min: u16,
-    max: u16,
-    in_val: &BindingValue4,
-) -> Result<Option<u16>, ()> {
+fn pop_and_claim_v4(q: &Queue<u16>, in_val: &BindingValue4) -> Result<Option<u16>, ()> {
     let port = match q.pop() {
         Ok(Some(port)) => port,
         _ => return Err(()),
     };
     port_state_clear(&PORT_FREE_V4, port);
-    if port >= min && port <= max && claim_port_v4(port, in_val) {
+    if claim_port_v4(port, in_val) {
         return Ok(Some(port));
     }
     Ok(None)
 }
 
 #[inline(always)]
-fn pop_and_claim_v6(
-    q: &Queue<u16>,
-    min: u16,
-    max: u16,
-    in_val: &BindingValue6,
-) -> Result<Option<u16>, ()> {
+fn pop_and_claim_v6(q: &Queue<u16>, in_val: &BindingValue6) -> Result<Option<u16>, ()> {
     let port = match q.pop() {
         Ok(Some(port)) => port,
         _ => return Err(()),
     };
     port_state_clear(&PORT_FREE_V6, port);
-    if port >= min && port <= max && claim_port_v6(port, in_val) {
+    if claim_port_v6(port, in_val) {
         return Ok(Some(port));
     }
     Ok(None)
@@ -599,7 +582,7 @@ fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
     let mut saw_stale = false;
     let mut i = 0;
     while i < PRIMARY {
-        match pop_and_claim_v4(q1, min, max, in_val) {
+        match pop_and_claim_v4(q1, in_val) {
             Ok(Some(port)) => return Some(port),
             Ok(None) => saw_stale = true,
             Err(()) => break,
@@ -608,7 +591,7 @@ fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
     }
     i = 0;
     while i < FALLBACK {
-        match pop_and_claim_v4(q2, min, max, in_val) {
+        match pop_and_claim_v4(q2, in_val) {
             Ok(Some(port)) => return Some(port),
             Ok(None) => saw_stale = true,
             Err(()) => break,
@@ -643,7 +626,7 @@ fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
     let mut saw_stale = false;
     let mut i = 0;
     while i < PRIMARY {
-        match pop_and_claim_v6(q1, min, max, in_val) {
+        match pop_and_claim_v6(q1, in_val) {
             Ok(Some(port)) => return Some(port),
             Ok(None) => saw_stale = true,
             Err(()) => break,
@@ -652,7 +635,7 @@ fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
     }
     i = 0;
     while i < FALLBACK {
-        match pop_and_claim_v6(q2, min, max, in_val) {
+        match pop_and_claim_v6(q2, in_val) {
             Ok(Some(port)) => return Some(port),
             Ok(None) => saw_stale = true,
             Err(()) => break,
