@@ -451,7 +451,9 @@ mod tests {
                     let _ = stdin.write_all(
                         b"add table inet flowcone_nl_test\n\
                           add set inet flowcone_nl_test flowcone_v4 { type ipv4_addr; flags interval,timeout; }\n\
-                          add set inet flowcone_nl_test flowcone_fwd4 { type ipv4_addr; flags interval,timeout; }\n"
+                          add set inet flowcone_nl_test flowcone_fwd4 { type ipv4_addr; flags interval,timeout; }\n\
+                          add set inet flowcone_nl_test flowcone_v6 { type ipv6_addr; flags interval,timeout; }\n\
+                          add set inet flowcone_nl_test flowcone_fwd6 { type ipv6_addr; flags interval,timeout; }\n"
                     );
                 }
                 child.wait()
@@ -462,12 +464,12 @@ mod tests {
             return;
         }
 
-        let res1 = refresh_liveness_netlink("flowcone_nl_test", true, false, false);
+        let res1 = refresh_liveness_netlink("flowcone_nl_test", true, true, false);
         assert!(res1.is_ok());
 
         std::thread::sleep(Duration::from_millis(300));
 
-        let res2 = refresh_liveness_netlink("flowcone_nl_test", true, false, false);
+        let res2 = refresh_liveness_netlink("flowcone_nl_test", true, true, false);
         assert!(res2.is_ok());
 
         let _ = std::process::Command::new("nft")
