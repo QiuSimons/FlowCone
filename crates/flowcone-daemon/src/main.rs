@@ -298,6 +298,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             present: start_ifindex != 0,
         };
         let mut frag_epoch: u32 = 0;
+        let mut flush_v4 = false;
+        let mut flush_v6 = false;
         let mut attach_timer = Instant::now();
 
         loop {
@@ -349,8 +351,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             if applied.ip4 != 0 {
                                 println!("flowcone: flushing stale v4 mappings");
-                                lock_or_exit(&ip_session, "session").clear_v4_mappings();
                             }
+                            flush_v4 = true;
                             frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip4 = ip4;
                             resolved_ip4 = ip4;
@@ -360,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {
                         if applied.ip4 != 0 {
                             println!("flowcone: WAN interface lost IPv4");
-                            lock_or_exit(&ip_session, "session").clear_v4_mappings();
+                            flush_v4 = true;
                             frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip4 = 0;
                             resolved_ip4 = 0;
@@ -385,8 +387,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("flowcone: WAN IPv6 updated to {}", Ipv6Addr::from(ip6));
                             if applied.ip6 != [0u8; 16] {
                                 println!("flowcone: flushing stale v6 mappings");
-                                lock_or_exit(&ip_session, "session").clear_v6_mappings();
                             }
+                            flush_v6 = true;
                             frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip6 = ip6;
                             resolved_ip6 = ip6;
@@ -396,7 +398,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {
                         if applied.ip6 != [0u8; 16] {
                             println!("flowcone: WAN interface lost IPv6");
-                            lock_or_exit(&ip_session, "session").clear_v6_mappings();
+                            flush_v6 = true;
                             frag_epoch = frag_epoch.wrapping_add(1);
                             applied.ip6 = [0u8; 16];
                             resolved_ip6 = [0u8; 16];
@@ -476,6 +478,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         flowcone_mark: ip_cfg.flowcone_mark,
                         frag_epoch,
                     };
+                    if flush_v4 || flush_v6 {
+                        let mut off = g_cfg;
+                        off.enabled_v4 = 0;
+                        off.enabled_v6 = 0;
+                        off.wan_ip4 = 0;
+                        off.wan_ip6 = [0u8; 16];
+                        off.frag_epoch = frag_epoch;
+                        let off_ok = lock_or_exit(&ip_session, "session").set_config(off);
+                        if off_ok {
+                            if flush_v4 {
+                                lock_or_exit(&ip_session, "session").clear_v4_mappings();
+                            }
+                            if flush_v6 {
+                                lock_or_exit(&ip_session, "session").clear_v6_mappings();
+                            }
+                        } else {
+                            eprintln!("flowcone: could not publish off-state config");
+                            RESYNC_REQUESTED.store(true, Ordering::Relaxed);
+                        }
+                        flush_v4 = false;
+                        flush_v6 = false;
+                    }
                     let set_ok = lock_or_exit(&ip_session, "session").set_config(g_cfg);
                     if !set_ok {
                         eprintln!("flowcone: could not publish data-plane config");
