@@ -590,6 +590,18 @@ fn pop_and_claim_v4(q: &Queue<u16>, in_val: &BindingValue4) -> Result<Option<u16
         port_state_bound(&PORT_FREE_V4, port);
         return Ok(Some(port));
     }
+    if !port_is_reserved(&RESERVED_V4, port)
+        && PORT_FREE_V4
+            .get(port as u32)
+            .map(|s| *s & PORT_FREE_BIT != 0)
+            .unwrap_or(false)
+    {
+        if (port & 1) == 0 {
+            queue_push(&FREE_EVEN_V4, &PORT_FREE_V4, port);
+        } else {
+            queue_push(&FREE_ODD_V4, &PORT_FREE_V4, port);
+        }
+    }
     Ok(None)
 }
 
@@ -603,6 +615,18 @@ fn pop_and_claim_v6(q: &Queue<u16>, in_val: &BindingValue6) -> Result<Option<u16
     if claim_port_v6(port, in_val) {
         port_state_bound(&PORT_FREE_V6, port);
         return Ok(Some(port));
+    }
+    if !port_is_reserved(&RESERVED_V6, port)
+        && PORT_FREE_V6
+            .get(port as u32)
+            .map(|s| *s & PORT_FREE_BIT != 0)
+            .unwrap_or(false)
+    {
+        if (port & 1) == 0 {
+            queue_push(&FREE_EVEN_V6, &PORT_FREE_V6, port);
+        } else {
+            queue_push(&FREE_ODD_V6, &PORT_FREE_V6, port);
+        }
     }
     Ok(None)
 }

@@ -383,7 +383,6 @@ impl SessionManager {
             }
         }
         self.reserved4_ports = current.to_vec();
-        self.rebuild_family4();
         true
     }
 
@@ -403,7 +402,6 @@ impl SessionManager {
             }
         }
         self.reserved6_ports = current.to_vec();
-        self.rebuild_family6();
         true
     }
 
@@ -552,11 +550,15 @@ impl SessionManager {
         if !self.pool_enable_v4 || !self.pool_ready() {
             return;
         }
+        let mut in_use: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        for key in self.ib_map4.keys().flatten() {
+            in_use.insert(key);
+        }
         Self::drain_queue(&mut self.free_even4);
         Self::drain_queue(&mut self.free_odd4);
         let mut p = self.min_port;
         loop {
-            if self.ib_map4.get(&p, 0).is_ok() {
+            if in_use.contains(&p) {
                 let _ = self.free_state4.set(p as u32, &0, 0);
             } else if self.reserved4.get(&(p as u32), 0).unwrap_or(0) == 0 {
                 let _ = self.free_state4.set(p as u32, &PORT_FREE_BIT, 0);
@@ -573,7 +575,7 @@ impl SessionManager {
                     .free_state4
                     .set(p as u32, &(PORT_FREE_BIT | PORT_QUEUED_BIT), 0);
             } else {
-                let _ = self.free_state4.set(p as u32, &PORT_FREE_BIT, 0);
+                let _ = self.free_state4.set(p as u32, &0, 0);
             }
             if p == self.max_port {
                 break;
@@ -586,11 +588,15 @@ impl SessionManager {
         if !self.pool_enable_v6 || !self.pool_ready() {
             return;
         }
+        let mut in_use: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        for key in self.ib_map6.keys().flatten() {
+            in_use.insert(key);
+        }
         Self::drain_queue(&mut self.free_even6);
         Self::drain_queue(&mut self.free_odd6);
         let mut p = self.min_port;
         loop {
-            if self.ib_map6.get(&p, 0).is_ok() {
+            if in_use.contains(&p) {
                 let _ = self.free_state6.set(p as u32, &0, 0);
             } else if self.reserved6.get(&(p as u32), 0).unwrap_or(0) == 0 {
                 let _ = self.free_state6.set(p as u32, &PORT_FREE_BIT, 0);
@@ -607,7 +613,7 @@ impl SessionManager {
                     .free_state6
                     .set(p as u32, &(PORT_FREE_BIT | PORT_QUEUED_BIT), 0);
             } else {
-                let _ = self.free_state6.set(p as u32, &PORT_FREE_BIT, 0);
+                let _ = self.free_state6.set(p as u32, &0, 0);
             }
             if p == self.max_port {
                 break;

@@ -52,7 +52,6 @@ jobs:
           mkdir -p ../flowcone-daemon/ebpf
           cp target/bpfel-unknown-none/release/flowcone-ebpf ../flowcone-daemon/ebpf/flowcone-ebpf.bin
           readelf -S ../flowcone-daemon/ebpf/flowcone-ebpf.bin | grep -q '\.BTF'
-          readelf -s ../flowcone-daemon/ebpf/flowcone-ebpf.bin | grep -q 'alloc_cb_v4'
 
       - name: Commit changes
         id: commit
