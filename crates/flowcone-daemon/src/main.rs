@@ -478,31 +478,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         flowcone_mark: ip_cfg.flowcone_mark,
                         frag_epoch,
                     };
-                    let mut flush_failed = false;
-                    if flush_v4 || flush_v6 {
-                        let mut off = g_cfg;
-                        let mut need_off = false;
-                        if flush_v4 && g_cfg.enabled_v4 == 0 {
-                            off.enabled_v4 = 0;
-                            off.wan_ip4 = 0;
-                            need_off = true;
-                        }
-                        if flush_v6 && g_cfg.enabled_v6 == 0 {
-                            off.enabled_v6 = 0;
-                            off.wan_ip6 = [0u8; 16];
-                            need_off = true;
-                        }
-                        off.frag_epoch = frag_epoch;
-                        let pre_ok = if need_off {
-                            lock_or_exit(&ip_session, "session").set_config(off)
-                        } else {
-                            lock_or_exit(&ip_session, "session").set_config(g_cfg)
-                        };
-                        if !pre_ok {
-                            eprintln!("flowcone: could not publish pre-clear config");
-                            RESYNC_REQUESTED.store(true, Ordering::Relaxed);
-                            flush_failed = true;
-                        } else {
+                    let had_flush = flush_v4 || flush_v6;
+                    let set_ok = if had_flush {
+                        let ok = lock_or_exit(&ip_session, "session").set_config(g_cfg);
+                        if ok {
                             if flush_v4 {
                                 lock_or_exit(&ip_session, "session").clear_v4_mappings();
                             }
@@ -511,10 +490,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             flush_v4 = false;
                             flush_v6 = false;
+                        } else {
+                            eprintln!("flowcone: could not publish pre-clear config");
+                            RESYNC_REQUESTED.store(true, Ordering::Relaxed);
                         }
-                    }
-                    let set_ok = if flush_failed {
-                        false
+                        ok
                     } else {
                         lock_or_exit(&ip_session, "session").set_config(g_cfg)
                     };

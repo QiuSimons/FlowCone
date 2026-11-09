@@ -493,6 +493,9 @@ impl SessionManager {
     }
 
     fn release_port4(&mut self, port: u16) {
+        if port < self.min_port || port > self.max_port {
+            return;
+        }
         if self.reserved4.get(&(port as u32), 0).unwrap_or(0) != 0 {
             return;
         }
@@ -520,6 +523,9 @@ impl SessionManager {
     }
 
     fn release_port6(&mut self, port: u16) {
+        if port < self.min_port || port > self.max_port {
+            return;
+        }
         if self.reserved6.get(&(port as u32), 0).unwrap_or(0) != 0 {
             return;
         }
