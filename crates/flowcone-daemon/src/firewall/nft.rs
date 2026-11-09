@@ -359,7 +359,11 @@ fn refresh_generic_table_cli(t: &GenericTable, is_v6_masq: bool) -> bool {
 fn refresh_generic_table(t: &GenericTable, is_v6_masq: bool, verbose: bool) -> bool {
     let v4 = t.src_v4 || t.fwd_v4;
     let v6 = t.src_v6 || t.fwd_v6;
-    if t.family == "inet" {
+    // The netlink batch refreshes both the src and the forward set of an
+    // enabled family. Only use it when the table actually has both; a table
+    // with just one would fail every refresh and fall back to CLI anyway.
+    let netlink_sets_match = t.src_v4 == t.fwd_v4 && t.src_v6 == t.fwd_v6;
+    if t.family == "inet" && netlink_sets_match {
         match super::netlink::refresh_liveness_netlink(&t.table, v4, v6, is_v6_masq) {
             Ok(()) => return true,
             Err(e) if verbose => eprintln!(

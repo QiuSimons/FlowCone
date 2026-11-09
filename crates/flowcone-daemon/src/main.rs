@@ -285,7 +285,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        None => eprintln!("flowcone: interface TYPE unreadable; NAT stays disabled"),
+        None => eprintln!(
+            "flowcone: interface {} TYPE unreadable; NAT stays disabled",
+            config.iface
+        ),
     }
 
     let data_plane = Arc::new(Mutex::new(DataPlane::start(bpf, &config.iface)?));
@@ -338,7 +341,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         config_dirty = true;
                     }
                     if !l2_warned {
-                        eprintln!("flowcone: interface TYPE unreadable; NAT stays disabled");
+                        eprintln!(
+                            "flowcone: interface {} TYPE unreadable; NAT stays disabled",
+                            ip_cfg.iface
+                        );
                         l2_warned = true;
                     }
                 }
