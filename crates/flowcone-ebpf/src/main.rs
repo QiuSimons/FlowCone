@@ -4,12 +4,12 @@
 use aya_ebpf::{
     EbpfContext,
     bindings::{__sk_buff, TC_ACT_SHOT, TC_ACT_UNSPEC},
-    helpers::bpf_ktime_get_coarse_ns,
+    helpers::{bpf_ktime_get_coarse_ns, bpf_loop},
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, ProgramArray, Queue},
     programs::TcContext,
 };
-use core::mem;
+use core::{ffi::c_void, mem};
 use flowcone_common::{
     BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES, FragKey4, FragKey6,
     FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_QUEUE_ENTRIES, PORT_STATE_ENTRIES,
@@ -66,14 +66,13 @@ static ICMP6_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
 
 const FRAG_TIMEOUT_NS: u64 = 30_000_000_000;
 /// The free queue can contain stale entries for ports claimed by port
-/// preservation. Give a new allocation enough bounded attempts to walk past
-/// them instead of failing while free ports are still queued.
-const EGRESS_ALLOC_PRIMARY: usize = 8;
-const EGRESS_ALLOC_FALLBACK: usize = 8;
-// The fragment target verifier budget is tighter than the main egress
-// program under aya-ebpf 0.3; keep its bounded retries at 3/2.
-const FRAG_ALLOC_PRIMARY: usize = 3;
-const FRAG_ALLOC_FALLBACK: usize = 2;
+/// preservation. `bpf_loop` walks up to PRIMARY + FALLBACK entries at runtime;
+/// the callback is verified once, so this bound does not expand the classifier
+/// verifier state like an unrolled loop would.
+const EGRESS_ALLOC_PRIMARY: usize = 32;
+const EGRESS_ALLOC_FALLBACK: usize = 32;
+const FRAG_ALLOC_PRIMARY: usize = 32;
+const FRAG_ALLOC_FALLBACK: usize = 32;
 
 #[map]
 static FRAG_IN_V4: LruHashMap<FragKey4, FragValue4> =
@@ -559,6 +558,105 @@ fn pop_and_claim_v6(q: &Queue<u16>, in_val: &BindingValue6) -> Result<Option<u16
     Ok(None)
 }
 
+/// `bpf_loop` callback context. Keeping the retry state here keeps the
+/// classifier small: the verifier checks the callback once instead of
+/// unrolling 64 queue/claim sequences into the main program.
+#[repr(C)]
+struct PortAllocCtx4 {
+    in_val: BindingValue4,
+    primary: u32,
+    index: u32,
+    parity: u8,
+    saw_stale: u8,
+    result: u16,
+}
+
+#[repr(C)]
+struct PortAllocCtx6 {
+    in_val: BindingValue6,
+    primary: u32,
+    index: u32,
+    parity: u8,
+    saw_stale: u8,
+    result: u16,
+}
+
+#[inline(never)]
+unsafe extern "C" fn alloc_cb_v4(_index: u32, ctx: *mut c_void) -> i64 {
+    let c = unsafe { &mut *(ctx as *mut PortAllocCtx4) };
+    let primary = c.index < c.primary;
+    let q = if primary {
+        if c.parity == 0 {
+            &FREE_EVEN_V4
+        } else {
+            &FREE_ODD_V4
+        }
+    } else if c.parity == 0 {
+        &FREE_ODD_V4
+    } else {
+        &FREE_EVEN_V4
+    };
+
+    match pop_and_claim_v4(q, &c.in_val) {
+        Ok(Some(port)) => {
+            c.result = port;
+            1
+        }
+        Ok(None) => {
+            c.saw_stale = 1;
+            c.index += 1;
+            0
+        }
+        Err(()) => {
+            if primary {
+                // The primary parity queue is empty; skip straight to the
+                // fallback queue instead of burning the remaining iterations.
+                c.index = c.primary;
+                0
+            } else {
+                1
+            }
+        }
+    }
+}
+
+#[inline(never)]
+unsafe extern "C" fn alloc_cb_v6(_index: u32, ctx: *mut c_void) -> i64 {
+    let c = unsafe { &mut *(ctx as *mut PortAllocCtx6) };
+    let primary = c.index < c.primary;
+    let q = if primary {
+        if c.parity == 0 {
+            &FREE_EVEN_V6
+        } else {
+            &FREE_ODD_V6
+        }
+    } else if c.parity == 0 {
+        &FREE_ODD_V6
+    } else {
+        &FREE_EVEN_V6
+    };
+
+    match pop_and_claim_v6(q, &c.in_val) {
+        Ok(Some(port)) => {
+            c.result = port;
+            1
+        }
+        Ok(None) => {
+            c.saw_stale = 1;
+            c.index += 1;
+            0
+        }
+        Err(()) => {
+            if primary {
+                c.index = c.primary;
+                0
+            } else {
+                1
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
     pref: u16,
@@ -573,35 +671,30 @@ fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
         port_state_clear(&PORT_FREE_V4, pref);
         return Some(pref);
     }
-    let parity = pref & 1;
-    let (q1, q2) = if parity == 0 {
-        (&FREE_EVEN_V4, &FREE_ODD_V4)
-    } else {
-        (&FREE_ODD_V4, &FREE_EVEN_V4)
+    let mut ctx = PortAllocCtx4 {
+        in_val: *in_val,
+        primary: PRIMARY as u32,
+        index: 0,
+        parity: (pref & 1) as u8,
+        saw_stale: 0,
+        result: 0,
     };
-    let mut saw_stale = false;
-    let mut i = 0;
-    while i < PRIMARY {
-        match pop_and_claim_v4(q1, in_val) {
-            Ok(Some(port)) => return Some(port),
-            Ok(None) => saw_stale = true,
-            Err(()) => break,
-        }
-        i += 1;
+    unsafe {
+        bpf_loop(
+            (PRIMARY + FALLBACK) as u32,
+            alloc_cb_v4 as *const () as *mut c_void,
+            &mut ctx as *mut PortAllocCtx4 as *mut c_void,
+            0,
+        );
     }
-    i = 0;
-    while i < FALLBACK {
-        match pop_and_claim_v4(q2, in_val) {
-            Ok(Some(port)) => return Some(port),
-            Ok(None) => saw_stale = true,
-            Err(()) => break,
-        }
-        i += 1;
-    }
-    if saw_stale {
+    if ctx.saw_stale != 0 {
         let _ = PORT_FLAGS.set(0, &1, 0);
     }
-    None
+    if ctx.result != 0 {
+        Some(ctx.result)
+    } else {
+        None
+    }
 }
 
 #[inline(always)]
@@ -617,35 +710,30 @@ fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
         port_state_clear(&PORT_FREE_V6, pref);
         return Some(pref);
     }
-    let parity = pref & 1;
-    let (q1, q2) = if parity == 0 {
-        (&FREE_EVEN_V6, &FREE_ODD_V6)
-    } else {
-        (&FREE_ODD_V6, &FREE_EVEN_V6)
+    let mut ctx = PortAllocCtx6 {
+        in_val: *in_val,
+        primary: PRIMARY as u32,
+        index: 0,
+        parity: (pref & 1) as u8,
+        saw_stale: 0,
+        result: 0,
     };
-    let mut saw_stale = false;
-    let mut i = 0;
-    while i < PRIMARY {
-        match pop_and_claim_v6(q1, in_val) {
-            Ok(Some(port)) => return Some(port),
-            Ok(None) => saw_stale = true,
-            Err(()) => break,
-        }
-        i += 1;
+    unsafe {
+        bpf_loop(
+            (PRIMARY + FALLBACK) as u32,
+            alloc_cb_v6 as *const () as *mut c_void,
+            &mut ctx as *mut PortAllocCtx6 as *mut c_void,
+            0,
+        );
     }
-    i = 0;
-    while i < FALLBACK {
-        match pop_and_claim_v6(q2, in_val) {
-            Ok(Some(port)) => return Some(port),
-            Ok(None) => saw_stale = true,
-            Err(()) => break,
-        }
-        i += 1;
-    }
-    if saw_stale {
+    if ctx.saw_stale != 0 {
         let _ = PORT_FLAGS.set(0, &1, 0);
     }
-    None
+    if ctx.result != 0 {
+        Some(ctx.result)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
