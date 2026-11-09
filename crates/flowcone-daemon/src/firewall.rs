@@ -175,13 +175,11 @@ pub(crate) fn refresh_liveness(
     is_v6_masq: bool,
     verbose: bool,
 ) -> bool {
-    if has_table_inet_fw4() {
-        return refresh_fw4_liveness(enable_v4, enable_v6, is_v6_masq, verbose);
+    match LAST_LAYER.load(Ordering::Relaxed) {
+        1 | 2 => refresh_fw4_liveness(enable_v4, enable_v6, is_v6_masq, verbose),
+        3 | 4 => refresh_standalone_liveness(enable_v4, enable_v6, is_v6_masq, verbose),
+        _ => false,
     }
-    if nft_table_exists("inet", "flowcone") {
-        return refresh_standalone_liveness(enable_v4, enable_v6, is_v6_masq, verbose);
-    }
-    false
 }
 
 pub(crate) fn liveness_supported() -> bool {
