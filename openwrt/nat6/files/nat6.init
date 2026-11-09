@@ -25,6 +25,11 @@ interface() {
 			break
 		fi
 	done
+	local default_dev
+	default_dev=$(ip -6 route show default 2>/dev/null | awk '/^default/{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+	if [ -n "$default_dev" ] && ifconfig "$default_dev" 2>/dev/null | grep -q "inet6 addr"; then
+		device="$default_dev"
+	fi
 }
 
 common_config() {
