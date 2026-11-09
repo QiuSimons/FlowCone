@@ -379,7 +379,7 @@ impl SessionManager {
         for port in removed {
             let _ = self.reserved4.set(port as u32, &0, 0);
             if self.ib_map4.get(&port, 0).is_err() {
-                let _ = self.free_state4.set(port as u32, &1, 0);
+                self.release_port4(port);
             }
         }
         self.reserved4_ports = current.to_vec();
@@ -398,7 +398,7 @@ impl SessionManager {
         for port in removed {
             let _ = self.reserved6.set(port as u32, &0, 0);
             if self.ib_map6.get(&port, 0).is_err() {
-                let _ = self.free_state6.set(port as u32, &1, 0);
+                self.release_port6(port);
             }
         }
         self.reserved6_ports = current.to_vec();
