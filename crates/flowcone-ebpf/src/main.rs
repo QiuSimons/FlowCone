@@ -12,8 +12,9 @@ use aya_ebpf::{
 use core::{ffi::c_void, mem};
 use flowcone_common::{
     BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES,
-    FragKey4, FragKey6, FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_QUEUE_ENTRIES,
-    PORT_STATE_ENTRIES, SESSION_EVENT_RINGBUF_BYTES, SessionEvent4, SessionEvent6,
+    FragKey4, FragKey6, FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_FREE_BIT,
+    PORT_QUEUE_ENTRIES, PORT_QUEUED_BIT, PORT_STATE_ENTRIES, SESSION_EVENT_RINGBUF_BYTES,
+    SessionEvent4, SessionEvent6,
 };
 
 const IPPROTO_ICMP: u8 = 1;
@@ -34,9 +35,6 @@ const BPF_ANY: u64 = 0;
 const BPF_NOEXIST: u64 = 1;
 const BPF_F_NO_PREALLOC: u32 = 1;
 const BPF_RB_NO_WAKEUP: u64 = 1;
-
-const PORT_FREE_BIT: u8 = 1;
-const PORT_QUEUED_BIT: u8 = 2;
 
 #[unsafe(link_section = "license")]
 #[used]
@@ -480,7 +478,7 @@ fn port_is_reserved(reserved: &Array<u8>, port: u16) -> bool {
 fn port_state_unqueue(map: &Array<u8>, port: u16) {
     if let Some(p) = map.get_ptr_mut(port as u32) {
         unsafe {
-            *p &= !PORT_QUEUED_BIT;
+            *p = flowcone_common::port_state_on_unqueue(*p);
         }
     }
 }
@@ -489,7 +487,7 @@ fn port_state_unqueue(map: &Array<u8>, port: u16) {
 fn port_state_bound(map: &Array<u8>, port: u16) {
     if let Some(p) = map.get_ptr_mut(port as u32) {
         unsafe {
-            *p &= !PORT_FREE_BIT;
+            *p = flowcone_common::port_state_on_bound(*p);
         }
     }
 }
@@ -510,7 +508,7 @@ fn queue_push(q: &Queue<u16>, state: &Array<u8>, port: u16) {
         let _ = PORT_FLAGS.set(0, &1, 0);
         if let Some(p) = state.get_ptr_mut(port as u32) {
             unsafe {
-                *p &= !PORT_QUEUED_BIT;
+                *p = flowcone_common::port_state_on_unqueue(*p);
             }
         }
     }
@@ -518,22 +516,19 @@ fn queue_push(q: &Queue<u16>, state: &Array<u8>, port: u16) {
 
 #[inline(always)]
 fn release_port_v4(port: u16) {
-    if let Some(p) = PORT_FREE_V4.get_ptr_mut(port as u32) {
-        unsafe {
-            if *p & PORT_FREE_BIT != 0 {
-                if *p & PORT_QUEUED_BIT != 0 {
-                    return;
-                }
-            } else {
-                *p |= PORT_FREE_BIT;
-                if *p & PORT_QUEUED_BIT != 0 {
-                    return;
-                }
-            }
+    let p = match PORT_FREE_V4.get_ptr_mut(port as u32) {
+        Some(p) => p,
+        None => return,
+    };
+    let state = unsafe { *p };
+    let (needs_push, new_state) = flowcone_common::port_state_on_release(state);
+    if !needs_push {
+        if new_state != state {
+            unsafe { *p = new_state };
         }
-    } else {
         return;
     }
+    unsafe { *p = new_state };
     if (port & 1) == 0 {
         queue_push(&FREE_EVEN_V4, &PORT_FREE_V4, port);
     } else {
@@ -543,22 +538,19 @@ fn release_port_v4(port: u16) {
 
 #[inline(always)]
 fn release_port_v6(port: u16) {
-    if let Some(p) = PORT_FREE_V6.get_ptr_mut(port as u32) {
-        unsafe {
-            if *p & PORT_FREE_BIT != 0 {
-                if *p & PORT_QUEUED_BIT != 0 {
-                    return;
-                }
-            } else {
-                *p |= PORT_FREE_BIT;
-                if *p & PORT_QUEUED_BIT != 0 {
-                    return;
-                }
-            }
+    let p = match PORT_FREE_V6.get_ptr_mut(port as u32) {
+        Some(p) => p,
+        None => return,
+    };
+    let state = unsafe { *p };
+    let (needs_push, new_state) = flowcone_common::port_state_on_release(state);
+    if !needs_push {
+        if new_state != state {
+            unsafe { *p = new_state };
         }
-    } else {
         return;
     }
+    unsafe { *p = new_state };
     if (port & 1) == 0 {
         queue_push(&FREE_EVEN_V6, &PORT_FREE_V6, port);
     } else {
@@ -1795,22 +1787,20 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
         // The remaining fragments have no UDP header, so remember that this
         // datagram must stay on the normal firewall path instead of dropping
         // them for lack of a NAT cache entry.
-        if more {
-            let key = FragKey4 {
-                epoch: cfg.frag_epoch,
-                src: src_ip,
-                dst: iph.dst_addr,
-                id: iph.id,
-                proto: IPPROTO_UDP,
-                _pad: 0,
-            };
-            let value = FragValue4 {
-                ip: 0,
-                _pad: 0,
-                last_seen: now_sec(),
-            };
-            let _ = FRAG_OUT_V4.insert(&key, &value, BPF_ANY);
-        }
+        let key = FragKey4 {
+            epoch: cfg.frag_epoch,
+            src: src_ip,
+            dst: iph.dst_addr,
+            id: iph.id,
+            proto: IPPROTO_UDP,
+            _pad: 0,
+        };
+        let value = FragValue4 {
+            ip: 0,
+            _pad: 0,
+            last_seen: now_sec(),
+        };
+        let _ = FRAG_OUT_V4.insert(&key, &value, BPF_ANY);
         return TC_ACT_UNSPEC;
     }
     let now = now_sec();

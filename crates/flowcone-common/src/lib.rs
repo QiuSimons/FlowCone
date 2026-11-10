@@ -250,6 +250,36 @@ pub const PORT_STATE_ENTRIES: u32 = 65536;
 /// per-port state, and a full queue sets a user-space rebuild flag.
 pub const PORT_QUEUE_ENTRIES: u32 = 65536;
 
+pub const PORT_FREE_BIT: u8 = 1;
+pub const PORT_QUEUED_BIT: u8 = 2;
+
+/// Port popped from queue. Clears `PORT_QUEUED_BIT`.
+#[inline(always)]
+pub fn port_state_on_unqueue(state: u8) -> u8 {
+    state & !PORT_QUEUED_BIT
+}
+
+/// Port bound to an active session. Clears `PORT_FREE_BIT`.
+#[inline(always)]
+pub fn port_state_on_bound(state: u8) -> u8 {
+    state & !PORT_FREE_BIT
+}
+
+/// Evaluate whether a released port needs to be pushed back to queue.
+/// Returns `(needs_queue_push, new_state)`.
+///
+/// If `PORT_QUEUED_BIT` is already set (e.g. redundant release or port preservation
+/// left a stale queue entry), no duplicate queue push is needed.
+#[inline(always)]
+pub fn port_state_on_release(state: u8) -> (bool, u8) {
+    let next = state | PORT_FREE_BIT;
+    if next & PORT_QUEUED_BIT != 0 {
+        (false, next)
+    } else {
+        (true, next | PORT_QUEUED_BIT)
+    }
+}
+
 /// Packet mark set on DNAT-translated inbound packets. The daemon can override
 /// this through GlobalConfig to avoid colliding with proxy/policy marks.
 pub const DEFAULT_FLOWCONE_MARK: u32 = 0x40000000;
@@ -433,5 +463,48 @@ mod tests {
         assert_eq!(core::mem::align_of::<GlobalConfig>(), 4);
         assert_eq!(core::mem::size_of::<ConfigStore>(), 116);
         assert_eq!(core::mem::align_of::<ConfigStore>(), 4);
+    }
+
+    #[test]
+    fn test_port_lifecycle_state_machine() {
+        // Initial state after pool rebuild: both FREE and QUEUED bits set.
+        let initial = PORT_FREE_BIT | PORT_QUEUED_BIT;
+        assert_eq!(initial, 0x03);
+
+        // 1. Normal allocation flow:
+        // Pop from queue -> unqueue clears QUEUED_BIT.
+        let unqueued = port_state_on_unqueue(initial);
+        assert_eq!(unqueued, PORT_FREE_BIT); // 0x01: free but unqueued
+
+        // Claim port -> bound clears FREE_BIT.
+        let bound = port_state_on_bound(unqueued);
+        assert_eq!(bound, 0); // 0x00: fully bound to active session
+
+        // Session expires -> release:
+        let (needs_push, released) = port_state_on_release(bound);
+        assert!(needs_push);
+        assert_eq!(released, PORT_FREE_BIT | PORT_QUEUED_BIT); // 0x03: ready in queue
+
+        // 2. Port preservation flow (direct claim without pop):
+        // Preferred port claimed directly while stale entry remains in queue.
+        let preserved_bound = port_state_on_bound(initial);
+        assert_eq!(preserved_bound, PORT_QUEUED_BIT); // 0x02: bound, but QUEUED_BIT remains
+
+        // When the stale queue entry is popped later:
+        let stale_popped = port_state_on_unqueue(preserved_bound);
+        assert_eq!(stale_popped, 0); // Both bits clear
+        // Inbound claim will fail (port already in use). The pop handler checks:
+        // `stale_popped & PORT_FREE_BIT != 0` -> false! Entry is discarded without requeueing.
+
+        // If release is called while stale QUEUED_BIT was still present:
+        let (needs_push, refreshed) = port_state_on_release(preserved_bound);
+        assert!(!needs_push); // Stale entry already in queue, do not push duplicate!
+        assert_eq!(refreshed, PORT_FREE_BIT | PORT_QUEUED_BIT);
+
+        // 3. Duplicate release guard:
+        // Calling release on an already free/queued port does not push a duplicate entry.
+        let (needs_push, dup_state) = port_state_on_release(PORT_FREE_BIT | PORT_QUEUED_BIT);
+        assert!(!needs_push);
+        assert_eq!(dup_state, PORT_FREE_BIT | PORT_QUEUED_BIT);
     }
 }

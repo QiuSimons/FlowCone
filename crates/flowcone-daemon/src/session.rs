@@ -1,7 +1,8 @@
 use aya::maps::{Array, HashMap, MapData, Queue, RingBuf};
 use flowcone_common::{
     BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FragKey4, FragKey6,
-    FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, SessionEvent4, SessionEvent6,
+    FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_FREE_BIT, PORT_QUEUED_BIT,
+    SessionEvent4, SessionEvent6, port_state_on_release,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -10,8 +11,6 @@ type Expiry4 = Reverse<(u32, EndpointKey4, u16, u8)>;
 type Expiry6 = Reverse<(u32, EndpointKey6, u16, u8)>;
 
 const GC_QUEUE_DRAIN_MAX: usize = 8192;
-const PORT_FREE_BIT: u8 = 1;
-const PORT_QUEUED_BIT: u8 = 2;
 const GC_EXPIRY_STRIKE_SEC: u32 = 1;
 const GC_EXPIRY_MAX_PER_TICK: usize = 1024;
 
@@ -516,9 +515,11 @@ impl SessionManager {
             return;
         }
         let state = self.free_state4.get(&(port as u32), 0).unwrap_or(0);
-        let state = state | PORT_FREE_BIT;
-        if state & PORT_QUEUED_BIT != 0 {
-            let _ = self.free_state4.set(port as u32, &state, 0);
+        let (needs_push, new_state) = port_state_on_release(state);
+        if !needs_push {
+            if new_state != state {
+                let _ = self.free_state4.set(port as u32, &new_state, 0);
+            }
             return;
         }
         let q = if (port & 1) == 0 {
@@ -528,13 +529,9 @@ impl SessionManager {
         };
         if q.push(&port, 0).is_err() {
             let _ = self.port_flags.set(0, &1, 0);
-            let _ = self
-                .free_state4
-                .set(port as u32, &(state & !PORT_QUEUED_BIT), 0);
+            let _ = self.free_state4.set(port as u32, &state, 0);
         } else {
-            let _ = self
-                .free_state4
-                .set(port as u32, &(state | PORT_QUEUED_BIT), 0);
+            let _ = self.free_state4.set(port as u32, &new_state, 0);
         }
     }
 
@@ -546,9 +543,11 @@ impl SessionManager {
             return;
         }
         let state = self.free_state6.get(&(port as u32), 0).unwrap_or(0);
-        let state = state | PORT_FREE_BIT;
-        if state & PORT_QUEUED_BIT != 0 {
-            let _ = self.free_state6.set(port as u32, &state, 0);
+        let (needs_push, new_state) = port_state_on_release(state);
+        if !needs_push {
+            if new_state != state {
+                let _ = self.free_state6.set(port as u32, &new_state, 0);
+            }
             return;
         }
         let q = if (port & 1) == 0 {
@@ -558,13 +557,9 @@ impl SessionManager {
         };
         if q.push(&port, 0).is_err() {
             let _ = self.port_flags.set(0, &1, 0);
-            let _ = self
-                .free_state6
-                .set(port as u32, &(state & !PORT_QUEUED_BIT), 0);
+            let _ = self.free_state6.set(port as u32, &state, 0);
         } else {
-            let _ = self
-                .free_state6
-                .set(port as u32, &(state | PORT_QUEUED_BIT), 0);
+            let _ = self.free_state6.set(port as u32, &new_state, 0);
         }
     }
 
