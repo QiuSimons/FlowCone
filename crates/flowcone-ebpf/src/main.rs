@@ -890,16 +890,16 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         if (iph.ver_ihl >> 4) != 4 {
             return TC_ACT_UNSPEC;
         }
-        if iph.dst_addr != cfg.wan_ip4 {
-            return TC_ACT_UNSPEC;
-        }
-        if iph.protocol == IPPROTO_ICMP {
-            unsafe {
-                ICMP_TARGET.tail_call(&ctx, 0);
+        let proto = iph.protocol;
+        if proto != IPPROTO_UDP {
+            if proto == IPPROTO_ICMP && iph.dst_addr == cfg.wan_ip4 {
+                unsafe {
+                    ICMP_TARGET.tail_call(&ctx, 0);
+                }
             }
             return TC_ACT_UNSPEC;
         }
-        if iph.protocol != IPPROTO_UDP {
+        if iph.dst_addr != cfg.wan_ip4 {
             return TC_ACT_UNSPEC;
         }
 
@@ -966,19 +966,29 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
             return TC_ACT_UNSPEC;
         }
+        let nh = iph.next_hdr;
+        if nh != IPPROTO_UDP {
+            if nh == 58 {
+                if ipv6_eq(&iph.dst_addr, &cfg.wan_ip6) {
+                    unsafe {
+                        ICMP6_TARGET.tail_call(&ctx, 0);
+                    }
+                }
+                return TC_ACT_UNSPEC;
+            }
+            if nh == 44 {
+                if ipv6_eq(&iph.dst_addr, &cfg.wan_ip6) {
+                    unsafe {
+                        FRAG_TARGET.tail_call(&ctx, 0);
+                    }
+                }
+                return TC_ACT_UNSPEC;
+            }
+            if nh != IPPROTO_HOPOPTS && nh != IPPROTO_DSTOPTS {
+                return TC_ACT_UNSPEC;
+            }
+        }
         if !ipv6_eq(&iph.dst_addr, &cfg.wan_ip6) {
-            return TC_ACT_UNSPEC;
-        }
-        if iph.next_hdr == 44 {
-            unsafe {
-                FRAG_TARGET.tail_call(&ctx, 0);
-            }
-            return TC_ACT_UNSPEC;
-        }
-        if iph.next_hdr == 58 {
-            unsafe {
-                ICMP6_TARGET.tail_call(&ctx, 0);
-            }
             return TC_ACT_UNSPEC;
         }
 
