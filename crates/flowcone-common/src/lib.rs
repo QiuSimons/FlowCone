@@ -120,7 +120,7 @@ pub struct FragValue6 {
 unsafe impl aya::Pod for FragValue6 {}
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlobalConfig {
     pub wan_ip4: u32,
     pub bypass_mark_mask: u32,
@@ -139,6 +139,16 @@ pub struct GlobalConfig {
 
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for GlobalConfig {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConfigStore {
+    pub active: u32,
+    pub slots: [GlobalConfig; 2],
+}
+
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for ConfigStore {}
 
 /// Non-routable IPv4 source ranges, as CIDR strings.
 ///
@@ -394,5 +404,7 @@ mod tests {
     fn test_global_config_layout() {
         assert_eq!(core::mem::size_of::<GlobalConfig>(), 56);
         assert_eq!(core::mem::align_of::<GlobalConfig>(), 4);
+        assert_eq!(core::mem::size_of::<ConfigStore>(), 116);
+        assert_eq!(core::mem::align_of::<ConfigStore>(), 4);
     }
 }

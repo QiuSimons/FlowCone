@@ -11,7 +11,7 @@ use aya_ebpf::{
 };
 use core::{ffi::c_void, mem};
 use flowcone_common::{
-    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES, FragKey4, FragKey6,
+    BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES, FragKey4, FragKey6,
     FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_QUEUE_ENTRIES, PORT_STATE_ENTRIES,
     SESSION_EVENT_ENTRIES, SessionEvent4, SessionEvent6,
 };
@@ -46,12 +46,15 @@ fn get_mark(ctx: &TcContext) -> u32 {
     unsafe { (*(ctx.as_ptr() as *const __sk_buff)).mark }
 }
 
-/// Double-buffered config: ACTIVE_CONFIG selects one of two immutable slots.
+/// Double-buffered config in a single slot. `active & 1` selects the active slot.
 #[map]
-static CONFIG: Array<GlobalConfig> = Array::with_max_entries(2, 0);
+static CONFIG_STORE: Array<ConfigStore> = Array::with_max_entries(1, 0);
 
-#[map]
-static ACTIVE_CONFIG: Array<u32> = Array::with_max_entries(1, 0);
+#[inline(always)]
+fn get_config() -> Option<&'static GlobalConfig> {
+    let store = CONFIG_STORE.get(0)?;
+    Some(&store.slots[(store.active & 1) as usize])
+}
 
 /// Tail-call targets for the tiny A/B dispatchers. The real FlowCone program
 /// is loaded once and is never attached directly; the dispatchers are the
@@ -860,11 +863,7 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
     let data = ctx.data();
     let data_end = ctx.data_end();
 
-    let active = match ACTIVE_CONFIG.get(0) {
-        Some(v) => *v & 1,
-        None => 0,
-    };
-    let cfg = match CONFIG.get(active) {
+    let cfg = match get_config() {
         Some(c) => c,
         None => return TC_ACT_UNSPEC,
     };
@@ -1046,11 +1045,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
     let data = ctx.data();
     let data_end = ctx.data_end();
 
-    let active = match ACTIVE_CONFIG.get(0) {
-        Some(v) => *v & 1,
-        None => 0,
-    };
-    let cfg = match CONFIG.get(active) {
+    let cfg = match get_config() {
         Some(c) => c,
         None => return TC_ACT_UNSPEC,
     };
@@ -1593,11 +1588,7 @@ fn frag_v6_target(
 pub fn flowcone_frag_v6(ctx: TcContext) -> i32 {
     let data = ctx.data();
     let data_end = ctx.data_end();
-    let active = match ACTIVE_CONFIG.get(0) {
-        Some(v) => *v & 1,
-        None => 0,
-    };
-    let cfg = match CONFIG.get(active) {
+    let cfg = match get_config() {
         Some(c) => c,
         None => return TC_ACT_UNSPEC,
     };
@@ -1626,11 +1617,7 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
     let data = ctx.data();
     let data_end = ctx.data_end();
 
-    let active = match ACTIVE_CONFIG.get(0) {
-        Some(v) => *v & 1,
-        None => 0,
-    };
-    let cfg = match CONFIG.get(active) {
+    let cfg = match get_config() {
         Some(c) => c,
         None => return TC_ACT_UNSPEC,
     };
@@ -1950,11 +1937,7 @@ fn csum_replace(csum: u16, old: u16, new: u16) -> u16 {
 pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
     let data = ctx.data();
     let data_end = ctx.data_end();
-    let active = match ACTIVE_CONFIG.get(0) {
-        Some(v) => *v & 1,
-        None => 0,
-    };
-    let cfg = match CONFIG.get(active) {
+    let cfg = match get_config() {
         Some(c) => c,
         None => return TC_ACT_UNSPEC,
     };
@@ -2168,11 +2151,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
     let data = ctx.data();
     let data_end = ctx.data_end();
-    let active = match ACTIVE_CONFIG.get(0) {
-        Some(v) => *v & 1,
-        None => 0,
-    };
-    let cfg = match CONFIG.get(active) {
+    let cfg = match get_config() {
         Some(c) => c,
         None => return TC_ACT_UNSPEC,
     };

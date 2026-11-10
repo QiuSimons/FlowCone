@@ -9,8 +9,8 @@ use aya::maps::{Array, HashMap, MapData, Queue};
 use aya::{EbpfLoader, VerifierLogLevel};
 use data_plane::DataPlane;
 use flowcone_common::{
-    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FragKey4, FragKey6, FragValue4,
-    FragValue6, GlobalConfig, SessionEvent4, SessionEvent6,
+    BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FragKey4, FragKey6,
+    FragValue4, FragValue6, GlobalConfig, SessionEvent4, SessionEvent6,
 };
 use session::{SessionManager, SessionMaps};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -229,8 +229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let session_mgr = Arc::new(Mutex::new(SessionManager::new(SessionMaps {
-        config_map: take_map!(bpf, "CONFIG", Array<MapData, GlobalConfig>),
-        active_map: take_map!(bpf, "ACTIVE_CONFIG", Array<MapData, u32>),
+        config_store: take_map!(bpf, "CONFIG_STORE", Array<MapData, ConfigStore>),
         ob_map4: take_map!(
             bpf,
             "OUTBOUND_BINDINGS_V4",

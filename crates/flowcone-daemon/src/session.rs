@@ -1,7 +1,7 @@
 use aya::maps::{Array, HashMap, MapData, MapError, Queue};
 use flowcone_common::{
-    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FragKey4, FragKey6, FragValue4,
-    FragValue6, GlobalConfig, MAX_BINDINGS, SessionEvent4, SessionEvent6,
+    BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FragKey4, FragKey6,
+    FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, SessionEvent4, SessionEvent6,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -57,8 +57,7 @@ fn reserved_delta(previous: &[u16], current: &[u16]) -> (Vec<u16>, Vec<u16>) {
 }
 
 pub struct SessionManager {
-    config_map: Array<MapData, GlobalConfig>,
-    active_map: Array<MapData, u32>,
+    config_store: Array<MapData, ConfigStore>,
     ob_map4: HashMap<MapData, EndpointKey4, BindingValue4>,
     ib_map4: HashMap<MapData, u16, BindingValue4>,
     ob_map6: HashMap<MapData, EndpointKey6, BindingValue6>,
@@ -254,8 +253,7 @@ fn sweep_family<V: ConeBinding>(
 /// All maps owned by the control plane. Grouping them keeps the manager
 /// constructor readable and makes the map-to-field wiring obvious.
 pub struct SessionMaps {
-    pub config_map: Array<MapData, GlobalConfig>,
-    pub active_map: Array<MapData, u32>,
+    pub config_store: Array<MapData, ConfigStore>,
     pub ob_map4: HashMap<MapData, EndpointKey4, BindingValue4>,
     pub ib_map4: HashMap<MapData, u16, BindingValue4>,
     pub ob_map6: HashMap<MapData, EndpointKey6, BindingValue6>,
@@ -301,8 +299,7 @@ fn expiry_step(now: u32, timeout: u32, seen: Option<u32>, strike: u8) -> ExpiryS
 impl SessionManager {
     pub fn new(maps: SessionMaps) -> Self {
         let SessionMaps {
-            config_map,
-            active_map,
+            config_store,
             ob_map4,
             ib_map4,
             ob_map6,
@@ -325,8 +322,7 @@ impl SessionManager {
             port_flags,
         } = maps;
         Self {
-            config_map,
-            active_map,
+            config_store,
             ob_map4,
             ib_map4,
             ob_map6,
@@ -661,17 +657,14 @@ impl SessionManager {
     }
 
     /// Publish a new immutable config slot, then atomically switch the active
-    /// index. Readers can never observe a partially written GlobalConfig.
+    /// index in a single store update. Readers can never observe a partially
+    /// written GlobalConfig.
     pub fn set_config(&mut self, cfg: GlobalConfig) -> bool {
-        let active = self.active_map.get(&0, 0).unwrap_or(0) & 1;
-        let next = 1 - active;
-        if self.config_map.set(next, &cfg, 0).is_err() {
-            return false;
-        }
-        if self.active_map.set(0, &next, 0).is_err() {
-            return false;
-        }
-        true
+        let mut store = self.config_store.get(&0, 0).unwrap_or_default();
+        let next = 1 - (store.active & 1);
+        store.slots[next as usize] = cfg;
+        store.active = next;
+        self.config_store.set(0, &store, 0).is_ok()
     }
 
     pub fn clear_v4_mappings(&mut self) {
