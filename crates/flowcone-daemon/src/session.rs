@@ -583,19 +583,19 @@ impl SessionManager {
             if in_use.contains(&p) {
                 let _ = self.free_state4.set(p as u32, &0, 0);
             } else if self.reserved4.get(&(p as u32), 0).unwrap_or(0) == 0 {
-                let _ = self.free_state4.set(p as u32, &PORT_FREE_BIT, 0);
+                let _ = self
+                    .free_state4
+                    .set(p as u32, &(PORT_FREE_BIT | PORT_QUEUED_BIT), 0);
                 let q = if (p & 1) == 0 {
                     &mut self.free_even4
                 } else {
                     &mut self.free_odd4
                 };
                 if q.push(&p, 0).is_err() {
+                    let _ = self.free_state4.set(p as u32, &0, 0);
                     let _ = self.port_flags.set(0, &1, 0);
                     return;
                 }
-                let _ = self
-                    .free_state4
-                    .set(p as u32, &(PORT_FREE_BIT | PORT_QUEUED_BIT), 0);
             } else {
                 let _ = self.free_state4.set(p as u32, &0, 0);
             }
@@ -621,19 +621,19 @@ impl SessionManager {
             if in_use.contains(&p) {
                 let _ = self.free_state6.set(p as u32, &0, 0);
             } else if self.reserved6.get(&(p as u32), 0).unwrap_or(0) == 0 {
-                let _ = self.free_state6.set(p as u32, &PORT_FREE_BIT, 0);
+                let _ = self
+                    .free_state6
+                    .set(p as u32, &(PORT_FREE_BIT | PORT_QUEUED_BIT), 0);
                 let q = if (p & 1) == 0 {
                     &mut self.free_even6
                 } else {
                     &mut self.free_odd6
                 };
                 if q.push(&p, 0).is_err() {
+                    let _ = self.free_state6.set(p as u32, &0, 0);
                     let _ = self.port_flags.set(0, &1, 0);
                     return;
                 }
-                let _ = self
-                    .free_state6
-                    .set(p as u32, &(PORT_FREE_BIT | PORT_QUEUED_BIT), 0);
             } else {
                 let _ = self.free_state6.set(p as u32, &0, 0);
             }
@@ -656,13 +656,19 @@ impl SessionManager {
         }
     }
 
-    /// Publish a new immutable config slot, then atomically switch the active
-    /// index in a single store update. Readers can never observe a partially
-    /// written GlobalConfig.
+    /// Double-buffered config update.
+    ///
+    /// The update is executed in two stages so concurrent eBPF packet processing
+    /// never observes a torn (partially copied) GlobalConfig:
+    /// 1. Write the new configuration into the inactive slot while preserving `active`.
+    /// 2. Flip `active` to publish the freshly written slot.
     pub fn set_config(&mut self, cfg: GlobalConfig) -> bool {
         let mut store = self.config_store.get(&0, 0).unwrap_or_default();
         let next = 1 - (store.active & 1);
         store.slots[next as usize] = cfg;
+        if self.config_store.set(0, &store, 0).is_err() {
+            return false;
+        }
         store.active = next;
         self.config_store.set(0, &store, 0).is_ok()
     }

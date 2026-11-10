@@ -217,18 +217,15 @@ pub fn is_ula_ipv6(addr: &[u8; 16]) -> bool {
     (addr[0] & 0xfe) == 0xfc
 }
 
-/// Check if IPv6 address is a valid routable internal unicast address (excluding link-local, multicast, loopback)
+/// Check if IPv6 address is a valid routable internal unicast address.
+///
+/// In ULA-only mode (`allow_all_internal = false`), only ULA `fc00::/7` is allowed.
+/// In full NAT66 mode (`allow_all_internal = true`), Global Unicast `2000::/3`
+/// is also accepted. This aligns exactly with the firewall liveness exemption
+/// sets (`{2000::/3, fc00::/7}`), avoiding Double NAT while excluding multicast
+/// (`ff00::/8`), link-local (`fe80::/10`), loopback (`::1`), and unspecified (`::`).
 #[inline(always)]
 pub fn is_routable_internal_ipv6(addr: &[u8; 16], allow_all_internal: bool) -> bool {
-    // Multicast: ff00::/8
-    if addr[0] == 0xff {
-        return false;
-    }
-    // Link-Local: fe80::/10 (fe80..febf)
-    if addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80 {
-        return false;
-    }
-    // ULA (fc00::/7) is never loopback or unspecified; accept immediately.
     if is_ula_ipv6(addr) {
         return true;
     }
@@ -236,8 +233,7 @@ pub fn is_routable_internal_ipv6(addr: &[u8; 16], allow_all_internal: bool) -> b
         return false;
     }
 
-    // Loopback / Unspecified: ::1 or ::
-    u128::from_be_bytes(*addr) > 1
+    (addr[0] & 0xe0) == 0x20
 }
 
 pub const MAX_BINDINGS: u32 = 65536;

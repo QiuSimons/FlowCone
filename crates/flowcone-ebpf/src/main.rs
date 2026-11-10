@@ -11,9 +11,9 @@ use aya_ebpf::{
 };
 use core::{ffi::c_void, mem};
 use flowcone_common::{
-    BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES, FragKey4, FragKey6,
-    FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_QUEUE_ENTRIES, PORT_STATE_ENTRIES,
-    SESSION_EVENT_RINGBUF_BYTES, SessionEvent4, SessionEvent6,
+    BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES,
+    FragKey4, FragKey6, FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_QUEUE_ENTRIES,
+    PORT_STATE_ENTRIES, SESSION_EVENT_RINGBUF_BYTES, SessionEvent4, SessionEvent6,
 };
 
 const IPPROTO_ICMP: u8 = 1;
@@ -284,10 +284,6 @@ fn parse_l2(data: usize, data_end: usize, l2_len: u32) -> Option<L2Info> {
             return Some(L2Info { proto, ip_off });
         }
         return None;
-    }
-
-    if l2_len == 2 {
-        return parse_ppp(data_end, data);
     }
 
     // Raw IP / TUN / WireGuard / RAWIP.
@@ -909,7 +905,7 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         }
 
         let frag_off = u16::from_be(iph.frag_off);
-        if (frag_off & 0x3fff) != 0 || (frag_off & 0x2000) != 0 {
+        if (frag_off & 0x3fff) != 0 {
             unsafe {
                 FRAG_TARGET.tail_call(&ctx, 0);
             }
@@ -1094,7 +1090,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         }
 
         let frag_off = u16::from_be(iph.frag_off);
-        if (frag_off & 0x3fff) != 0 || (frag_off & 0x2000) != 0 {
+        if (frag_off & 0x3fff) != 0 {
             unsafe {
                 FRAG_TARGET.tail_call(&ctx, 0);
             }
@@ -1418,7 +1414,7 @@ fn frag_v6_target(
     let id = read_be32(frag_off + 4);
     let ingress = ipv6_eq(&iph.dst_addr, &cfg.wan_ip6);
     let key = FragKey6 {
-                epoch: cfg.frag_epoch,
+        epoch: cfg.frag_epoch,
         src: iph.src_addr,
         dst: iph.dst_addr,
         id,
@@ -1711,7 +1707,7 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
             }
         }
         let key = FragKey4 {
-                epoch: cfg.frag_epoch,
+            epoch: cfg.frag_epoch,
             src: iph.src_addr,
             dst: iph.dst_addr,
             id: iph.id,
@@ -1754,7 +1750,7 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
     }
     if offset != 0 {
         let key = FragKey4 {
-                epoch: cfg.frag_epoch,
+            epoch: cfg.frag_epoch,
             src: iph.src_addr,
             dst: iph.dst_addr,
             id: iph.id,
@@ -1884,7 +1880,7 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
         }
     };
     let key = FragKey4 {
-                epoch: cfg.frag_epoch,
+        epoch: cfg.frag_epoch,
         src: src_ip,
         dst: iph.dst_addr,
         id: iph.id,
