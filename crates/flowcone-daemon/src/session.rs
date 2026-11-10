@@ -529,7 +529,9 @@ impl SessionManager {
         };
         if q.push(&port, 0).is_err() {
             let _ = self.port_flags.set(0, &1, 0);
-            let _ = self.free_state4.set(port as u32, &state, 0);
+            let _ = self
+                .free_state4
+                .set(port as u32, &(state | PORT_FREE_BIT), 0);
         } else {
             let _ = self.free_state4.set(port as u32, &new_state, 0);
         }
@@ -557,7 +559,9 @@ impl SessionManager {
         };
         if q.push(&port, 0).is_err() {
             let _ = self.port_flags.set(0, &1, 0);
-            let _ = self.free_state6.set(port as u32, &state, 0);
+            let _ = self
+                .free_state6
+                .set(port as u32, &(state | PORT_FREE_BIT), 0);
         } else {
             let _ = self.free_state6.set(port as u32, &new_state, 0);
         }
