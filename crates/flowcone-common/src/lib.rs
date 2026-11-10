@@ -228,21 +228,21 @@ pub fn is_routable_internal_ipv6(addr: &[u8; 16], allow_all_internal: bool) -> b
     if addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80 {
         return false;
     }
-    // Loopback / Unspecified: ::1 or ::
-    let hi = u64::from_ne_bytes([
-        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
-    ]);
-    let mid = u32::from_ne_bytes([addr[8], addr[9], addr[10], addr[11]]);
-    let lo_hi = u16::from_ne_bytes([addr[12], addr[13]]);
-    if hi == 0 && mid == 0 && lo_hi == 0 && addr[14] == 0 && (addr[15] == 0 || addr[15] == 1) {
-        return false;
-    }
-
+    // ULA (fc00::/7) is never loopback or unspecified; accept immediately.
     if is_ula_ipv6(addr) {
         return true;
     }
+    if !allow_all_internal {
+        return false;
+    }
 
-    allow_all_internal
+    // Loopback / Unspecified: ::1 or ::
+    let p = addr.as_ptr() as *const u64;
+    unsafe {
+        let hi = core::ptr::read_unaligned(p);
+        let lo = core::ptr::read_unaligned(p.add(1));
+        hi != 0 || (lo != 0 && lo != 1u64.to_be())
+    }
 }
 
 pub const MAX_BINDINGS: u32 = 65536;
