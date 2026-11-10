@@ -366,6 +366,39 @@ mod tests {
         assert!(!is_routable_internal_ipv6(&gua, false));
         // True if allow_all_internal is true (GUA+ULA mode)
         assert!(is_routable_internal_ipv6(&gua, true));
+
+        // Exact 2000::/3 boundaries and non-GUA exclusions
+        let mut pfx_100 = [0u8; 16];
+        pfx_100[0] = 0x01;
+        pfx_100[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_100, false));
+        assert!(!is_routable_internal_ipv6(&pfx_100, true));
+
+        let mut pfx_1fff = [0u8; 16];
+        pfx_1fff[0] = 0x1f;
+        pfx_1fff[1] = 0xff;
+        pfx_1fff[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_1fff, false));
+        assert!(!is_routable_internal_ipv6(&pfx_1fff, true));
+
+        let mut pfx_2000 = [0u8; 16];
+        pfx_2000[0] = 0x20;
+        pfx_2000[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_2000, false));
+        assert!(is_routable_internal_ipv6(&pfx_2000, true));
+
+        let mut pfx_3fff = [0u8; 16];
+        pfx_3fff[0] = 0x3f;
+        pfx_3fff[1] = 0xff;
+        pfx_3fff[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_3fff, false));
+        assert!(is_routable_internal_ipv6(&pfx_3fff, true));
+
+        let mut pfx_4000 = [0u8; 16];
+        pfx_4000[0] = 0x40;
+        pfx_4000[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_4000, false));
+        assert!(!is_routable_internal_ipv6(&pfx_4000, true));
     }
 
     #[test]
