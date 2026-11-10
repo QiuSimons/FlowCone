@@ -255,8 +255,10 @@ fn parse_ppp(data_end: usize, mut off: usize) -> Option<L2Info> {
     })
 }
 
-/// Parse Ethernet, one/two VLAN tags, PPPoE session, or a bare PPP/IP frame.
-/// l2_len is 0 for raw IP (including bare PPP), 14 for Ethernet.
+/// Parse Ethernet, VLAN tags, and PPPoE session, or handle bare IP frames
+/// (raw IP, TUN, WireGuard, and PPP interfaces where the kernel already stripped
+/// the PPP header).
+/// l2_len is 0 for bare IP, 14 for Ethernet.
 #[inline(always)]
 fn parse_l2(data: usize, data_end: usize, l2_len: u32) -> Option<L2Info> {
     if l2_len == 14 {
