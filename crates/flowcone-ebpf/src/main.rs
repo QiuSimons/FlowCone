@@ -368,15 +368,16 @@ fn fixup_csum_v4(
                 BPF_F_PSEUDO_HDR | BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U32,
             )
             .is_ok()
-        && ctx
-            .skb
-            .l4_csum_replace(
-                l4_off,
-                old_port as u64,
-                new_port as u64,
-                BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U16,
-            )
-            .is_ok()
+        && (old_port == new_port
+            || ctx
+                .skb
+                .l4_csum_replace(
+                    l4_off,
+                    old_port as u64,
+                    new_port as u64,
+                    BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U16,
+                )
+                .is_ok())
 }
 
 /// Fix up only the IPv4 header checksum (non-first fragments have no UDP header).
@@ -436,14 +437,16 @@ fn fixup_csum_v6(
         i += 1;
     }
 
-    ctx.skb
-        .l4_csum_replace(
-            l4_off,
-            old_port as u64,
-            new_port as u64,
-            BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U16,
-        )
-        .is_ok()
+    old_port == new_port
+        || ctx
+            .skb
+            .l4_csum_replace(
+                l4_off,
+                old_port as u64,
+                new_port as u64,
+                BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U16,
+            )
+            .is_ok()
 }
 
 #[inline(always)]

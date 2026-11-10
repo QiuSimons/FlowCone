@@ -237,12 +237,7 @@ pub fn is_routable_internal_ipv6(addr: &[u8; 16], allow_all_internal: bool) -> b
     }
 
     // Loopback / Unspecified: ::1 or ::
-    let p = addr.as_ptr() as *const u64;
-    unsafe {
-        let hi = core::ptr::read_unaligned(p);
-        let lo = core::ptr::read_unaligned(p.add(1));
-        hi != 0 || (lo != 0 && lo != 1u64.to_be())
-    }
+    u128::from_be_bytes(*addr) > 1
 }
 
 pub const MAX_BINDINGS: u32 = 65536;
