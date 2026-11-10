@@ -249,7 +249,10 @@ pub const MAX_BINDINGS: u32 = 65536;
 /// Per-direction, per-family fragment cache capacity. Keep this the single
 /// source of truth for the eBPF LRU maps.
 pub const FRAG_MAP_ENTRIES: u32 = 1024;
-pub const SESSION_EVENT_ENTRIES: u32 = 16384;
+/// Capacity in bytes for the session event ring buffers.
+/// Must be a power of 2 and a multiple of page size (4096).
+/// 262,144 bytes (256 KiB) holds ~10,000 session creation events.
+pub const SESSION_EVENT_RINGBUF_BYTES: u32 = 262144;
 /// One byte of state per port; 65536 entries cover the full u16 port space.
 pub const PORT_STATE_ENTRIES: u32 = 65536;
 /// Each parity queue can hold the whole pool; duplicates are skipped via the

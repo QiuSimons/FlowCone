@@ -6,14 +6,14 @@ use aya_ebpf::{
     bindings::{__sk_buff, TC_ACT_SHOT, TC_ACT_UNSPEC},
     helpers::{bpf_ktime_get_coarse_ns, bpf_loop},
     macros::{classifier, map},
-    maps::{Array, HashMap, LruHashMap, ProgramArray, Queue},
+    maps::{Array, HashMap, LruHashMap, ProgramArray, Queue, RingBuf},
     programs::TcContext,
 };
 use core::{ffi::c_void, mem};
 use flowcone_common::{
     BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES, FragKey4, FragKey6,
     FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_QUEUE_ENTRIES, PORT_STATE_ENTRIES,
-    SESSION_EVENT_ENTRIES, SessionEvent4, SessionEvent6,
+    SESSION_EVENT_RINGBUF_BYTES, SessionEvent4, SessionEvent6,
 };
 
 const IPPROTO_ICMP: u8 = 1;
@@ -33,6 +33,7 @@ const UDP_CSUM_OFFSET: usize = 6;
 const BPF_ANY: u64 = 0;
 const BPF_NOEXIST: u64 = 1;
 const BPF_F_NO_PREALLOC: u32 = 1;
+const BPF_RB_NO_WAKEUP: u64 = 1;
 
 const PORT_FREE_BIT: u8 = 1;
 const PORT_QUEUED_BIT: u8 = 2;
@@ -117,10 +118,10 @@ static INBOUND_BINDINGS_V6: HashMap<u16, BindingValue6> =
 
 /// Session-create notifications for the user-space expiry scheduler.
 #[map]
-static SESSION_EVENTS_V4: Queue<SessionEvent4> = Queue::with_max_entries(SESSION_EVENT_ENTRIES, 0);
+static SESSION_EVENTS_V4: RingBuf = RingBuf::with_byte_size(SESSION_EVENT_RINGBUF_BYTES, 0);
 
 #[map]
-static SESSION_EVENTS_V6: Queue<SessionEvent6> = Queue::with_max_entries(SESSION_EVENT_ENTRIES, 0);
+static SESSION_EVENTS_V6: RingBuf = RingBuf::with_byte_size(SESSION_EVENT_RINGBUF_BYTES, 0);
 
 #[map]
 static GC_FLAGS: Array<u32> = Array::with_max_entries(1, 0);
@@ -451,7 +452,7 @@ fn push_event_v4(key: &EndpointKey4, port: u16) {
         port,
         _pad: 0,
     };
-    if SESSION_EVENTS_V4.push(&event, 0).is_err() {
+    if SESSION_EVENTS_V4.output(&event, BPF_RB_NO_WAKEUP).is_err() {
         let _ = GC_FLAGS.set(0, &1, 0);
     }
 }
@@ -463,7 +464,7 @@ fn push_event_v6(key: &EndpointKey6, port: u16) {
         port,
         _pad: [0; 3],
     };
-    if SESSION_EVENTS_V6.push(&event, 0).is_err() {
+    if SESSION_EVENTS_V6.output(&event, BPF_RB_NO_WAKEUP).is_err() {
         let _ = GC_FLAGS.set(0, &1, 0);
     }
 }

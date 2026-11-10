@@ -1,4 +1,4 @@
-use aya::maps::{Array, HashMap, MapData, MapError, Queue};
+use aya::maps::{Array, HashMap, MapData, Queue, RingBuf};
 use flowcone_common::{
     BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FragKey4, FragKey6,
     FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, SessionEvent4, SessionEvent6,
@@ -66,8 +66,8 @@ pub struct SessionManager {
     frag_out4: HashMap<MapData, FragKey4, FragValue4>,
     frag_in6: HashMap<MapData, FragKey6, FragValue6>,
     frag_out6: HashMap<MapData, FragKey6, FragValue6>,
-    events4: Queue<MapData, SessionEvent4>,
-    events6: Queue<MapData, SessionEvent6>,
+    events4: RingBuf<MapData>,
+    events6: RingBuf<MapData>,
     gc_flags: Array<MapData, u32>,
     free_state4: Array<MapData, u8>,
     free_state6: Array<MapData, u8>,
@@ -262,8 +262,8 @@ pub struct SessionMaps {
     pub frag_out4: HashMap<MapData, FragKey4, FragValue4>,
     pub frag_in6: HashMap<MapData, FragKey6, FragValue6>,
     pub frag_out6: HashMap<MapData, FragKey6, FragValue6>,
-    pub events4: Queue<MapData, SessionEvent4>,
-    pub events6: Queue<MapData, SessionEvent6>,
+    pub events4: RingBuf<MapData>,
+    pub events6: RingBuf<MapData>,
     pub gc_flags: Array<MapData, u32>,
     pub free_state4: Array<MapData, u8>,
     pub free_state6: Array<MapData, u8>,
@@ -712,26 +712,40 @@ impl SessionManager {
         let mut drained = 0;
         if self.pool_enable_v4 {
             while drained < GC_QUEUE_DRAIN_MAX {
-                match self.events4.pop(0) {
-                    Ok(ev) => {
-                        self.schedule4(now.saturating_add(timeout), ev.key, ev.port, 0);
-                        drained += 1;
+                let ev = if let Some(item) = self.events4.next() {
+                    if item.len() >= std::mem::size_of::<SessionEvent4>() {
+                        Some(unsafe {
+                            std::ptr::read_unaligned(item.as_ptr() as *const SessionEvent4)
+                        })
+                    } else {
+                        None
                     }
-                    Err(MapError::ElementNotFound) => break,
-                    Err(_) => break,
+                } else {
+                    break;
+                };
+                if let Some(ev) = ev {
+                    self.schedule4(now.saturating_add(timeout), ev.key, ev.port, 0);
+                    drained += 1;
                 }
             }
         }
         if self.pool_enable_v6 {
             let limit = drained + GC_QUEUE_DRAIN_MAX;
             while drained < limit {
-                match self.events6.pop(0) {
-                    Ok(ev) => {
-                        self.schedule6(now.saturating_add(timeout), ev.key, ev.port, 0);
-                        drained += 1;
+                let ev = if let Some(item) = self.events6.next() {
+                    if item.len() >= std::mem::size_of::<SessionEvent6>() {
+                        Some(unsafe {
+                            std::ptr::read_unaligned(item.as_ptr() as *const SessionEvent6)
+                        })
+                    } else {
+                        None
                     }
-                    Err(MapError::ElementNotFound) => break,
-                    Err(_) => break,
+                } else {
+                    break;
+                };
+                if let Some(ev) = ev {
+                    self.schedule6(now.saturating_add(timeout), ev.key, ev.port, 0);
+                    drained += 1;
                 }
             }
         }
