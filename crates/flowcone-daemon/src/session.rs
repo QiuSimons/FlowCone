@@ -752,39 +752,6 @@ impl SessionManager {
         drained
     }
 
-    /// Re-read both sides of a binding immediately before deletion. The data
-    /// plane updates last_seen without a lock, so the value observed when the
-    /// heap entry was popped may already be stale.
-    fn last_seen4(&self, key: &EndpointKey4, port: u16) -> Option<u32> {
-        let mut last = None;
-        if let Ok(val) = self.ob_map4.get(key, 0)
-            && u16::from_be(val.port) == port
-        {
-            last = Some(val.last_seen);
-        }
-        if let Ok(iv) = self.ib_map4.get(&port, 0)
-            && iv.matches_key(key)
-        {
-            last = Some(last.map_or(iv.last_seen, |t| t.max(iv.last_seen)));
-        }
-        last
-    }
-
-    fn last_seen6(&self, key: &EndpointKey6, port: u16) -> Option<u32> {
-        let mut last = None;
-        if let Ok(val) = self.ob_map6.get(key, 0)
-            && u16::from_be(val.port) == port
-        {
-            last = Some(val.last_seen);
-        }
-        if let Ok(iv) = self.ib_map6.get(&port, 0)
-            && iv.matches_key(key)
-        {
-            last = Some(last.map_or(iv.last_seen, |t| t.max(iv.last_seen)));
-        }
-        last
-    }
-
     fn expiry_tick(&mut self, now: u32, timeout: u32) -> (usize, usize) {
         let mut swept4 = 0;
         let mut swept6 = 0;
@@ -812,8 +779,7 @@ impl SessionManager {
             }
             if !ob_matches {
                 if ib_matches {
-                    let refreshed = self.last_seen4(&key, port);
-                    if let Some(t) = refreshed.filter(|t| now.saturating_sub(*t) <= timeout) {
+                    if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= timeout) {
                         self.schedule4(t.saturating_add(timeout), key, port, 0);
                     } else if self.ib_map4.remove(&port).is_ok() {
                         self.release_port4(port);
@@ -829,22 +795,17 @@ impl SessionManager {
                         self.schedule4(deadline, key, port, 1);
                     }
                     ExpiryStep::Drop => {
-                        let refreshed = self.last_seen4(&key, port);
-                        if let Some(t) = refreshed.filter(|t| now.saturating_sub(*t) <= timeout) {
-                            self.schedule4(t.saturating_add(timeout), key, port, 0);
+                        let ob_removed = self.ob_map4.remove(&key).is_ok();
+                        let ib_removed = if ib_matches {
+                            self.ib_map4.remove(&port).is_ok()
                         } else {
-                            let ob_removed = self.ob_map4.remove(&key).is_ok();
-                            let ib_removed = if ib_matches {
-                                self.ib_map4.remove(&port).is_ok()
-                            } else {
-                                false
-                            };
-                            if ib_removed {
-                                self.release_port4(port);
-                            }
-                            if ob_removed || ib_removed {
-                                swept4 += 1;
-                            }
+                            false
+                        };
+                        if ib_removed {
+                            self.release_port4(port);
+                        }
+                        if ob_removed || ib_removed {
+                            swept4 += 1;
                         }
                     }
                 }
@@ -875,8 +836,7 @@ impl SessionManager {
             }
             if !ob_matches {
                 if ib_matches {
-                    let refreshed = self.last_seen6(&key, port);
-                    if let Some(t) = refreshed.filter(|t| now.saturating_sub(*t) <= timeout) {
+                    if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= timeout) {
                         self.schedule6(t.saturating_add(timeout), key, port, 0);
                     } else if self.ib_map6.remove(&port).is_ok() {
                         self.release_port6(port);
@@ -892,22 +852,17 @@ impl SessionManager {
                         self.schedule6(deadline, key, port, 1);
                     }
                     ExpiryStep::Drop => {
-                        let refreshed = self.last_seen6(&key, port);
-                        if let Some(t) = refreshed.filter(|t| now.saturating_sub(*t) <= timeout) {
-                            self.schedule6(t.saturating_add(timeout), key, port, 0);
+                        let ob_removed = self.ob_map6.remove(&key).is_ok();
+                        let ib_removed = if ib_matches {
+                            self.ib_map6.remove(&port).is_ok()
                         } else {
-                            let ob_removed = self.ob_map6.remove(&key).is_ok();
-                            let ib_removed = if ib_matches {
-                                self.ib_map6.remove(&port).is_ok()
-                            } else {
-                                false
-                            };
-                            if ib_removed {
-                                self.release_port6(port);
-                            }
-                            if ob_removed || ib_removed {
-                                swept6 += 1;
-                            }
+                            false
+                        };
+                        if ib_removed {
+                            self.release_port6(port);
+                        }
+                        if ob_removed || ib_removed {
+                            swept6 += 1;
                         }
                     }
                 }

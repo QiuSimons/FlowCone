@@ -323,17 +323,18 @@ fn is_link_local_v4(raw_ip: u32) -> bool {
     b[0] == 169 && b[1] == 254
 }
 
+const DHCP_SERVER_PORT_BE: u16 = 67u16.to_be();
+const DHCP_CLIENT_PORT_BE: u16 = 68u16.to_be();
+
 /// DHCP client/relay and link-local/broadcast traffic must stay on the normal
 /// firewall path. The nftables exemption is generated with the same guards.
 #[inline(always)]
 fn bypass_special_udp4(src: u32, dst: u32, sport: u16, dport: u16) -> bool {
-    let sport = u16::from_be(sport);
-    let dport = u16::from_be(dport);
     src == 0
-        || sport == 67
-        || sport == 68
-        || dport == 67
-        || dport == 68
+        || sport == DHCP_SERVER_PORT_BE
+        || sport == DHCP_CLIENT_PORT_BE
+        || dport == DHCP_SERVER_PORT_BE
+        || dport == DHCP_CLIENT_PORT_BE
         || is_multicast_or_broadcast_v4(dst)
         || is_link_local_v4(dst)
 }
@@ -980,7 +981,7 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             if nh == 44 {
                 if ipv6_eq(&iph.dst_addr, &cfg.wan_ip6) {
                     unsafe {
-                        FRAG_TARGET.tail_call(&ctx, 0);
+                        FRAG6_TARGET.tail_call(&ctx, 0);
                     }
                 }
                 return TC_ACT_UNSPEC;
@@ -997,7 +998,7 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             Ipv6L4::Udp(off) => off,
             Ipv6L4::Fragment => {
                 unsafe {
-                    FRAG_TARGET.tail_call(&ctx, 0);
+                    FRAG6_TARGET.tail_call(&ctx, 0);
                 }
                 return TC_ACT_UNSPEC;
             }
@@ -1222,7 +1223,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         }
         if iph.next_hdr == 44 {
             unsafe {
-                FRAG_TARGET.tail_call(&ctx, 0);
+                FRAG6_TARGET.tail_call(&ctx, 0);
             }
             return TC_ACT_SHOT;
         }
@@ -1231,7 +1232,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
             Ipv6L4::Udp(off) => off,
             Ipv6L4::Fragment => {
                 unsafe {
-                    FRAG_TARGET.tail_call(&ctx, 0);
+                    FRAG6_TARGET.tail_call(&ctx, 0);
                 }
                 return TC_ACT_SHOT;
             }
@@ -1642,12 +1643,6 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
         Some(v) => v,
         None => return TC_ACT_UNSPEC,
     };
-    if l2.proto == ETH_P_IPV6 && cfg.enabled_v6 != 0 {
-        unsafe {
-            FRAG6_TARGET.tail_call(&ctx, 0);
-        }
-        return TC_ACT_SHOT;
-    }
     if l2.proto != ETH_P_IP || cfg.enabled_v4 != 1 {
         return TC_ACT_UNSPEC;
     }
