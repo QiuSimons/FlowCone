@@ -7,11 +7,10 @@ use flowcone_common::{
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-type Expiry4 = Reverse<(u32, EndpointKey4, u16, u8)>;
-type Expiry6 = Reverse<(u32, EndpointKey6, u16, u8)>;
+type Expiry4 = Reverse<(u32, EndpointKey4, u16)>;
+type Expiry6 = Reverse<(u32, EndpointKey6, u16)>;
 
 const GC_QUEUE_DRAIN_MAX: usize = 8192;
-const GC_EXPIRY_STRIKE_SEC: u32 = 1;
 const GC_EXPIRY_MAX_PER_TICK: usize = 1024;
 
 /// Parse local UDP ports from /proc/net/udp[6]. Only state 07 (unconnected,
@@ -292,18 +291,15 @@ pub struct SessionMaps {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExpiryStep {
     Keep { deadline: u32 },
-    Strike { deadline: u32 },
     Drop,
 }
 
 /// Calculates expiry action for binding.
-fn expiry_step(now: u32, timeout: u32, seen: Option<u32>, strike: u8) -> ExpiryStep {
+#[inline]
+fn expiry_step(now: u32, timeout: u32, seen: Option<u32>) -> ExpiryStep {
     match seen {
         Some(last) if now.saturating_sub(last) <= timeout => ExpiryStep::Keep {
             deadline: last.saturating_add(timeout),
-        },
-        Some(_) if strike == 0 => ExpiryStep::Strike {
-            deadline: now.saturating_add(GC_EXPIRY_STRIKE_SEC),
         },
         _ => ExpiryStep::Drop,
     }
@@ -689,18 +685,18 @@ impl SessionManager {
     }
 
     #[inline]
-    fn schedule4(&mut self, deadline: u32, key: EndpointKey4, port: u16, strike: u8) {
+    fn schedule4(&mut self, deadline: u32, key: EndpointKey4, port: u16) {
         if self.heap4.len() < MAX_BINDINGS as usize {
-            self.heap4.push(Reverse((deadline, key, port, strike)));
+            self.heap4.push(Reverse((deadline, key, port)));
         } else {
             self.lost_notifications = true;
         }
     }
 
     #[inline]
-    fn schedule6(&mut self, deadline: u32, key: EndpointKey6, port: u16, strike: u8) {
+    fn schedule6(&mut self, deadline: u32, key: EndpointKey6, port: u16) {
         if self.heap6.len() < MAX_BINDINGS as usize {
-            self.heap6.push(Reverse((deadline, key, port, strike)));
+            self.heap6.push(Reverse((deadline, key, port)));
         } else {
             self.lost_notifications = true;
         }
@@ -722,7 +718,7 @@ impl SessionManager {
                     break;
                 };
                 if let Some(ev) = ev {
-                    self.schedule4(now.saturating_add(timeout), ev.key, ev.port, 0);
+                    self.schedule4(now.saturating_add(timeout), ev.key, ev.port);
                     drained += 1;
                 }
             }
@@ -742,7 +738,7 @@ impl SessionManager {
                     break;
                 };
                 if let Some(ev) = ev {
-                    self.schedule6(now.saturating_add(timeout), ev.key, ev.port, 0);
+                    self.schedule6(now.saturating_add(timeout), ev.key, ev.port);
                     drained += 1;
                 }
             }
@@ -756,7 +752,7 @@ impl SessionManager {
         let mut processed4 = 0;
 
         while processed4 < GC_EXPIRY_MAX_PER_TICK {
-            let Some(Reverse((deadline, key, port, strike))) = self.heap4.peek().copied() else {
+            let Some(Reverse((deadline, key, port))) = self.heap4.peek().copied() else {
                 break;
             };
             if deadline > now {
@@ -772,7 +768,7 @@ impl SessionManager {
             if ob_matches && let Ok(val) = ob {
                 if now.saturating_sub(val.last_seen) <= timeout {
                     // Outbound active; skip inbound check (RFC 4787).
-                    self.schedule4(val.last_seen.saturating_add(timeout), key, port, 0);
+                    self.schedule4(val.last_seen.saturating_add(timeout), key, port);
                     processed4 += 1;
                     continue;
                 }
@@ -792,19 +788,16 @@ impl SessionManager {
             if !ob_matches {
                 if ib_matches {
                     if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= timeout) {
-                        self.schedule4(t.saturating_add(timeout), key, port, 0);
+                        self.schedule4(t.saturating_add(timeout), key, port);
                     } else if self.ib_map4.remove(&port).is_ok() {
                         self.release_port4(port);
                         swept4 += 1;
                     }
                 }
             } else {
-                match expiry_step(now, timeout, seen, strike) {
+                match expiry_step(now, timeout, seen) {
                     ExpiryStep::Keep { deadline } => {
-                        self.schedule4(deadline, key, port, 0);
-                    }
-                    ExpiryStep::Strike { deadline } => {
-                        self.schedule4(deadline, key, port, 1);
+                        self.schedule4(deadline, key, port);
                     }
                     ExpiryStep::Drop => {
                         let ob_removed = self.ob_map4.remove(&key).is_ok();
@@ -827,7 +820,7 @@ impl SessionManager {
 
         let mut processed6 = 0;
         while processed6 < GC_EXPIRY_MAX_PER_TICK {
-            let Some(Reverse((deadline, key, port, strike))) = self.heap6.peek().copied() else {
+            let Some(Reverse((deadline, key, port))) = self.heap6.peek().copied() else {
                 break;
             };
             if deadline > now {
@@ -843,7 +836,7 @@ impl SessionManager {
             if ob_matches && let Ok(val) = ob {
                 if now.saturating_sub(val.last_seen) <= timeout {
                     // Outbound active; skip inbound check (RFC 4787).
-                    self.schedule6(val.last_seen.saturating_add(timeout), key, port, 0);
+                    self.schedule6(val.last_seen.saturating_add(timeout), key, port);
                     processed6 += 1;
                     continue;
                 }
@@ -863,19 +856,16 @@ impl SessionManager {
             if !ob_matches {
                 if ib_matches {
                     if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= timeout) {
-                        self.schedule6(t.saturating_add(timeout), key, port, 0);
+                        self.schedule6(t.saturating_add(timeout), key, port);
                     } else if self.ib_map6.remove(&port).is_ok() {
                         self.release_port6(port);
                         swept6 += 1;
                     }
                 }
             } else {
-                match expiry_step(now, timeout, seen, strike) {
+                match expiry_step(now, timeout, seen) {
                     ExpiryStep::Keep { deadline } => {
-                        self.schedule6(deadline, key, port, 0);
-                    }
-                    ExpiryStep::Strike { deadline } => {
-                        self.schedule6(deadline, key, port, 1);
+                        self.schedule6(deadline, key, port);
                     }
                     ExpiryStep::Drop => {
                         let ob_removed = self.ob_map6.remove(&key).is_ok();
@@ -920,7 +910,7 @@ impl SessionManager {
                     .unwrap_or(0);
                 let deadline = val.last_seen().max(ib_last).saturating_add(timeout);
                 if entries4.len() < MAX_BINDINGS as usize {
-                    entries4.push(Reverse((deadline, key, port, 0)));
+                    entries4.push(Reverse((deadline, key, port)));
                 } else {
                     self.lost_notifications = true;
                     break;
@@ -942,7 +932,7 @@ impl SessionManager {
                     .unwrap_or(0);
                 let deadline = val.last_seen().max(ib_last).saturating_add(timeout);
                 if entries6.len() < MAX_BINDINGS as usize {
-                    entries6.push(Reverse((deadline, key, port, 0)));
+                    entries6.push(Reverse((deadline, key, port)));
                 } else {
                     self.lost_notifications = true;
                     break;
@@ -1044,17 +1034,15 @@ mod port_parser_tests {
     #[test]
     fn expiry_step_treats_zero_as_a_valid_timestamp() {
         let cases = [
-            (10, 120, Some(0), 0, ExpiryStep::Keep { deadline: 120 }),
-            (0, 120, Some(0), 0, ExpiryStep::Keep { deadline: 120 }),
-            (130, 120, Some(0), 0, ExpiryStep::Strike { deadline: 131 }),
-            (130, 120, Some(0), 1, ExpiryStep::Drop),
-            (200, 120, Some(100), 0, ExpiryStep::Keep { deadline: 220 }),
-            (230, 120, Some(100), 0, ExpiryStep::Strike { deadline: 231 }),
-            (230, 120, Some(100), 1, ExpiryStep::Drop),
-            (10, 120, None, 0, ExpiryStep::Drop),
+            (10, 120, Some(0), ExpiryStep::Keep { deadline: 120 }),
+            (0, 120, Some(0), ExpiryStep::Keep { deadline: 120 }),
+            (130, 120, Some(0), ExpiryStep::Drop),
+            (200, 120, Some(100), ExpiryStep::Keep { deadline: 220 }),
+            (230, 120, Some(100), ExpiryStep::Drop),
+            (10, 120, None, ExpiryStep::Drop),
         ];
-        for (now, timeout, seen, strike, want) in cases {
-            assert_eq!(expiry_step(now, timeout, seen, strike), want);
+        for (now, timeout, seen, want) in cases {
+            assert_eq!(expiry_step(now, timeout, seen), want);
         }
     }
 
