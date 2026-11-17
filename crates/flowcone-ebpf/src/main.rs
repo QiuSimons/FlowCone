@@ -297,7 +297,7 @@ fn parse_l2(data: usize, data_end: usize, l2_len: u32) -> Option<L2Info> {
     })
 }
 
-#[inline(never)]
+#[inline(always)]
 fn now_sec() -> u32 {
     (unsafe { bpf_ktime_get_coarse_ns() } / 1_000_000_000) as u32
 }

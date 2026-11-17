@@ -10,8 +10,8 @@ use std::collections::BinaryHeap;
 type Expiry4 = Reverse<(u32, EndpointKey4, u16)>;
 type Expiry6 = Reverse<(u32, EndpointKey6, u16)>;
 
-const GC_QUEUE_DRAIN_MAX: usize = 8192;
-const GC_EXPIRY_MAX_PER_TICK: usize = 256;
+const GC_QUEUE_DRAIN_MAX: usize = 32768;
+const GC_EXPIRY_MAX_PER_TICK: usize = 1024;
 
 /// Queries listening UDP service ports via NETLINK_INET_DIAG binary interface.
 fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
