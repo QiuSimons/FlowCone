@@ -90,31 +90,10 @@ pub(crate) fn parse_has_ipv6_masq(nft_output: &str) -> bool {
 }
 
 pub(crate) fn is_ipv6_masq_enabled() -> bool {
-    if let Ok(out) = Command::new("nft")
-        .args(["list", "chain", "inet", "fw4", "srcnat_wan"])
-        .output()
+    if let Ok(out) = Command::new("nft").args(["-t", "list", "ruleset"]).output()
         && out.status.success()
     {
-        let text = format!("table inet fw4\n{}", String::from_utf8_lossy(&out.stdout));
-        if parse_has_ipv6_masq(&text) {
-            return true;
-        }
-    }
-    if let Ok(out) = Command::new("nft")
-        .args(["list", "table", "inet", "fw4"])
-        .output()
-        && out.status.success()
-        && parse_has_ipv6_masq(&String::from_utf8_lossy(&out.stdout))
-    {
-        return true;
-    }
-    if let Ok(out) = Command::new("nft")
-        .args(["list", "table", "ip6", "nat"])
-        .output()
-        && out.status.success()
-        && parse_has_ipv6_masq(&String::from_utf8_lossy(&out.stdout))
-    {
-        return true;
+        return parse_has_ipv6_masq(&String::from_utf8_lossy(&out.stdout));
     }
     let Ok(out) = Command::new("nft").args(["list", "ruleset"]).output() else {
         return false;
