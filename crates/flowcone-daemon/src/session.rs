@@ -11,7 +11,16 @@ type Expiry4 = Reverse<(u32, EndpointKey4, u16)>;
 type Expiry6 = Reverse<(u32, EndpointKey6, u16)>;
 
 const GC_QUEUE_DRAIN_MAX: usize = 8192;
-const GC_EXPIRY_MAX_PER_TICK: usize = 1024;
+const GC_EXPIRY_MAX_PER_TICK: usize = 256;
+
+/// Parses listening UDP service ports from /proc/net/udp[6].
+pub fn scan_local_udp_ports(path: &str) -> Option<Vec<u16>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut ports = parse_proc_udp_ports(&text);
+    ports.sort_unstable();
+    ports.dedup();
+    Some(ports)
+}
 
 /// Parse local UDP ports from /proc/net/udp[6]. Only state 07 (unconnected,
 /// i.e. a bound/listening service) is reserved; connected client sockets are
@@ -420,17 +429,13 @@ impl SessionManager {
         true
     }
 
-    /// Synchronizes reserved local UDP service ports from /proc/net/udp[6].
-    pub fn reserve_local_ports(&mut self) {
-        // Ignore transient read errors to preserve existing reservations.
+    /// Applies updated local listening UDP ports to reserved maps.
+    pub fn apply_reserved_ports(&mut self, ports4: Option<&[u16]>, ports6: Option<&[u16]>) {
         let mut to_release = Vec::new();
-        if let Ok(text) = std::fs::read_to_string("/proc/net/udp") {
-            let mut ports = parse_proc_udp_ports(&text);
-            ports.sort_unstable();
-            ports.dedup();
+        if let Some(ports) = ports4 {
             Self::sync_family_reserved(
                 &mut self.reserved4_ports,
-                &ports,
+                ports,
                 &mut self.reserved4,
                 &mut self.free_state4,
                 |p| self.ib_map4.get(&p, 0).is_ok(),
@@ -440,13 +445,10 @@ impl SessionManager {
                 self.release_port4(p);
             }
         }
-        if let Ok(text) = std::fs::read_to_string("/proc/net/udp6") {
-            let mut ports = parse_proc_udp_ports(&text);
-            ports.sort_unstable();
-            ports.dedup();
+        if let Some(ports) = ports6 {
             Self::sync_family_reserved(
                 &mut self.reserved6_ports,
-                &ports,
+                ports,
                 &mut self.reserved6,
                 &mut self.free_state6,
                 |p| self.ib_map6.get(&p, 0).is_ok(),
@@ -456,6 +458,13 @@ impl SessionManager {
                 self.release_port6(p);
             }
         }
+    }
+
+    /// Synchronizes reserved local UDP service ports from /proc/net/udp[6].
+    pub fn reserve_local_ports(&mut self) {
+        let p4 = scan_local_udp_ports("/proc/net/udp");
+        let p6 = scan_local_udp_ports("/proc/net/udp6");
+        self.apply_reserved_ports(p4.as_deref(), p6.as_deref());
     }
 
     fn init_family_pool(min_port: u16, max_port: u16, pool: &mut FamilyPortPool<'_>) {
@@ -755,7 +764,7 @@ impl SessionManager {
             let Some(Reverse((deadline, key, port))) = self.heap4.peek().copied() else {
                 break;
             };
-            if deadline > now {
+            if deadline >= now {
                 break;
             }
             self.heap4.pop();
@@ -823,7 +832,7 @@ impl SessionManager {
             let Some(Reverse((deadline, key, port))) = self.heap6.peek().copied() else {
                 break;
             };
-            if deadline > now {
+            if deadline >= now {
                 break;
             }
             self.heap6.pop();
@@ -887,9 +896,9 @@ impl SessionManager {
         }
 
         let backlog4 = processed4 == GC_EXPIRY_MAX_PER_TICK
-            && self.heap4.peek().is_some_and(|Reverse((d, ..))| *d <= now);
+            && self.heap4.peek().is_some_and(|Reverse((d, ..))| *d < now);
         let backlog6 = processed6 == GC_EXPIRY_MAX_PER_TICK
-            && self.heap6.peek().is_some_and(|Reverse((d, ..))| *d <= now);
+            && self.heap6.peek().is_some_and(|Reverse((d, ..))| *d < now);
 
         (swept4, swept6, backlog4 || backlog6)
     }

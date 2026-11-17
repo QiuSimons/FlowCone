@@ -80,7 +80,7 @@ const EGRESS_ALLOC_PRIMARY: usize = 32;
 const EGRESS_ALLOC_FALLBACK: usize = 32;
 const FRAG_ALLOC_PRIMARY: usize = 32;
 const FRAG_ALLOC_FALLBACK: usize = 32;
-const FRAG6_ALLOC_PRIMARY: usize = 1;
+const FRAG6_ALLOC_PRIMARY: usize = 2;
 const FRAG6_ALLOC_FALLBACK: usize = 0;
 
 #[map]
@@ -1022,6 +1022,9 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
 
         let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
         let ext_port = u16::from_be(udph.dst_port);
+        if ext_port < cfg.min_port4 || ext_port > cfg.max_port4 {
+            return TC_ACT_UNSPEC;
+        }
 
         if let Some(target) = INBOUND_BINDINGS_V4.get_ptr_mut(&ext_port) {
             let new_dst_ip = unsafe { (*target).ip };
@@ -1113,6 +1116,9 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         }
 
         let ext_port = u16::from_be(udph.dst_port);
+        if ext_port < cfg.min_port6 || ext_port > cfg.max_port6 {
+            return TC_ACT_UNSPEC;
+        }
 
         if let Some(target) = INBOUND_BINDINGS_V6.get_ptr_mut(&ext_port) {
             let new_dst_ip = unsafe { (*target).ip };

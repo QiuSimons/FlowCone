@@ -623,7 +623,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if last_reserve_scan.elapsed() >= Duration::from_secs(30) {
-                lock_or_exit(&ip_session, "session").reserve_local_ports();
+                let p4 = session::scan_local_udp_ports("/proc/net/udp");
+                let p6 = session::scan_local_udp_ports("/proc/net/udp6");
+                lock_or_exit(&ip_session, "session")
+                    .apply_reserved_ports(p4.as_deref(), p6.as_deref());
                 last_reserve_scan = Instant::now();
             }
 
