@@ -1026,6 +1026,12 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             return TC_ACT_UNSPEC;
         }
 
+        if let Some(state) = PORT_FREE_V4.get(ext_port as u32) {
+            if *state & PORT_FREE_BIT != 0 {
+                return TC_ACT_UNSPEC;
+            }
+        }
+
         if let Some(target) = INBOUND_BINDINGS_V4.get_ptr_mut(&ext_port) {
             let new_dst_ip = unsafe { (*target).ip };
             let new_dst_port = unsafe { (*target).port };
@@ -1118,6 +1124,12 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         let ext_port = u16::from_be(udph.dst_port);
         if ext_port < cfg.min_port6 || ext_port > cfg.max_port6 {
             return TC_ACT_UNSPEC;
+        }
+
+        if let Some(state) = PORT_FREE_V6.get(ext_port as u32) {
+            if *state & PORT_FREE_BIT != 0 {
+                return TC_ACT_UNSPEC;
+            }
         }
 
         if let Some(target) = INBOUND_BINDINGS_V6.get_ptr_mut(&ext_port) {

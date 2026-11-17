@@ -702,7 +702,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backlog
             };
             if has_more {
-                interval = Duration::from_millis(50);
+                interval = Duration::from_millis(5);
             } else {
                 rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let jitter_ms = ((rng_state >> 33) % 501) as i64 - 250;
