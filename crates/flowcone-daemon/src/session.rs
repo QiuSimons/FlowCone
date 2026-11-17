@@ -34,9 +34,9 @@ fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
         Some(Duration::from_millis(100)),
     );
 
-    // 48-byte inet_diag_req_v2 netlink dump request
-    let mut req = [0u8; 48];
-    req[0..4].copy_from_slice(&(48u32).to_ne_bytes());
+    // 72-byte netlink dump request: 16-byte nlmsghdr + 56-byte inet_diag_req_v2
+    let mut req = [0u8; 72];
+    req[0..4].copy_from_slice(&(72u32).to_ne_bytes());
     req[4..6].copy_from_slice(&(20u16).to_ne_bytes()); // SOCK_DIAG_BY_FAMILY
     req[6..8].copy_from_slice(&(0x0001u16 | 0x0004u16).to_ne_bytes()); // NLM_F_REQUEST | NLM_F_DUMP
     req[8..12].copy_from_slice(&(1u32).to_ne_bytes()); // nlmsg_seq
@@ -61,8 +61,12 @@ fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
             if nlmsg_len < 16 || offset + nlmsg_len > n {
                 break;
             }
-            if nlmsg_type == 3 || nlmsg_type == 2 {
-                // NLMSG_DONE or NLMSG_ERROR
+            if nlmsg_type == 2 {
+                // NLMSG_ERROR: request rejected or unsupported protocol; fallback to procfs
+                return None;
+            }
+            if nlmsg_type == 3 {
+                // NLMSG_DONE: multi-part dump finished normally
                 break 'recv_loop;
             }
             if nlmsg_type == 20 {
@@ -77,7 +81,7 @@ fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
             offset += (nlmsg_len + 3) & !3; // NLMSG_ALIGN
         }
     }
-    Some(ports)
+    if ports.is_empty() { None } else { Some(ports) }
 }
 
 /// Parses listening UDP service ports from Netlink INET_DIAG with procfs fallback.
@@ -856,14 +860,20 @@ impl SessionManager {
             let mut seen = None;
             let ib_matches;
 
-            let item_timeout = match &ob {
-                Ok(val) if val.is_short_lived() => flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC,
-                _ => match self.ib_map4.get(&port, 0) {
-                    Ok(iv) if iv.is_short_lived() => {
-                        flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
-                    }
-                    _ => timeout,
-                },
+            let item_timeout = if let Ok(val) = &ob {
+                if val.is_short_lived() {
+                    flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                } else {
+                    timeout
+                }
+            } else if let Ok(iv) = self.ib_map4.get(&port, 0) {
+                if iv.is_short_lived() {
+                    flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                } else {
+                    timeout
+                }
+            } else {
+                timeout
             };
 
             if ob_matches && let Ok(val) = ob {
@@ -934,14 +944,20 @@ impl SessionManager {
             let mut seen = None;
             let ib_matches;
 
-            let item_timeout = match &ob {
-                Ok(val) if val.is_short_lived() => flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC,
-                _ => match self.ib_map6.get(&port, 0) {
-                    Ok(iv) if iv.is_short_lived() => {
-                        flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
-                    }
-                    _ => timeout,
-                },
+            let item_timeout = if let Ok(val) = &ob {
+                if val.is_short_lived() {
+                    flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                } else {
+                    timeout
+                }
+            } else if let Ok(iv) = self.ib_map6.get(&port, 0) {
+                if iv.is_short_lived() {
+                    flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                } else {
+                    timeout
+                }
+            } else {
+                timeout
             };
 
             if ob_matches && let Ok(val) = ob {
