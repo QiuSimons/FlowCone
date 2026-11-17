@@ -13,9 +13,81 @@ type Expiry6 = Reverse<(u32, EndpointKey6, u16)>;
 const GC_QUEUE_DRAIN_MAX: usize = 8192;
 const GC_EXPIRY_MAX_PER_TICK: usize = 256;
 
-/// Parses listening UDP service ports from /proc/net/udp[6].
-pub fn scan_local_udp_ports(path: &str) -> Option<Vec<u16>> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// Queries listening UDP service ports via NETLINK_INET_DIAG binary interface.
+fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
+    use rustix::net::{AddressFamily, Protocol, SocketFlags, SocketType, recv, send, socket_with};
+    use std::num::NonZeroU32;
+    use std::time::Duration;
+
+    let proto = Protocol::from_raw(NonZeroU32::new(4)?);
+    let sock = socket_with(
+        AddressFamily::NETLINK,
+        SocketType::RAW,
+        SocketFlags::CLOEXEC,
+        Some(proto),
+    )
+    .ok()?;
+
+    let _ = rustix::net::sockopt::set_socket_timeout(
+        &sock,
+        rustix::net::sockopt::Timeout::Recv,
+        Some(Duration::from_millis(100)),
+    );
+
+    // 48-byte inet_diag_req_v2 netlink dump request
+    let mut req = [0u8; 48];
+    req[0..4].copy_from_slice(&(48u32).to_ne_bytes());
+    req[4..6].copy_from_slice(&(20u16).to_ne_bytes()); // SOCK_DIAG_BY_FAMILY
+    req[6..8].copy_from_slice(&(0x0001u16 | 0x0004u16).to_ne_bytes()); // NLM_F_REQUEST | NLM_F_DUMP
+    req[8..12].copy_from_slice(&(1u32).to_ne_bytes()); // nlmsg_seq
+    req[16] = family;
+    req[17] = 17; // IPPROTO_UDP
+    req[20..24].copy_from_slice(&(1u32 << 7).to_ne_bytes()); // TCP_CLOSE (listening UDP)
+
+    send(&sock, &req, rustix::net::SendFlags::empty()).ok()?;
+
+    let mut buf = [0u8; 8192];
+    let mut ports = Vec::new();
+    'recv_loop: loop {
+        let (n, _) = recv(&sock, &mut buf, rustix::net::RecvFlags::empty()).ok()?;
+        if n == 0 {
+            break;
+        }
+        let mut offset = 0;
+        while offset + 16 <= n {
+            let nlmsg_len =
+                u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+            let nlmsg_type = u16::from_ne_bytes(buf[offset + 4..offset + 6].try_into().unwrap());
+            if nlmsg_len < 16 || offset + nlmsg_len > n {
+                break;
+            }
+            if nlmsg_type == 3 || nlmsg_type == 2 {
+                // NLMSG_DONE or NLMSG_ERROR
+                break 'recv_loop;
+            }
+            if nlmsg_type == 20 {
+                let payload = &buf[offset + 16..offset + nlmsg_len];
+                if payload.len() >= 72 && payload[1] == 7 {
+                    let sport = u16::from_be_bytes([payload[4], payload[5]]);
+                    if sport != 0 {
+                        ports.push(sport);
+                    }
+                }
+            }
+            offset += (nlmsg_len + 3) & !3; // NLMSG_ALIGN
+        }
+    }
+    Some(ports)
+}
+
+/// Parses listening UDP service ports from Netlink INET_DIAG with procfs fallback.
+pub fn scan_local_udp_ports(family: u8, procfs_path: &str) -> Option<Vec<u16>> {
+    if let Some(mut ports) = scan_netlink_udp_ports(family) {
+        ports.sort_unstable();
+        ports.dedup();
+        return Some(ports);
+    }
+    let text = std::fs::read_to_string(procfs_path).ok()?;
     let mut ports = parse_proc_udp_ports(&text);
     ports.sort_unstable();
     ports.dedup();
@@ -460,10 +532,10 @@ impl SessionManager {
         }
     }
 
-    /// Synchronizes reserved local UDP service ports from /proc/net/udp[6].
+    /// Synchronizes reserved local UDP service ports from Netlink or /proc/net/udp[6].
     pub fn reserve_local_ports(&mut self) {
-        let p4 = scan_local_udp_ports("/proc/net/udp");
-        let p6 = scan_local_udp_ports("/proc/net/udp6");
+        let p4 = scan_local_udp_ports(2, "/proc/net/udp");
+        let p6 = scan_local_udp_ports(10, "/proc/net/udp6");
         self.apply_reserved_ports(p4.as_deref(), p6.as_deref());
     }
 
@@ -1062,5 +1134,18 @@ mod port_parser_tests {
         assert!(ports.contains(&0x1450));
         assert!(ports.contains(&0x35));
         assert!(!ports.contains(&0xC000));
+    }
+
+    #[test]
+    fn test_scan_local_udp_ports_procfs_fallback() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join("test_proc_net_udp");
+        let content = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n 0: 00000000:1450 00000000:0000 07 00000000:00000000 00:00000000 00000000  0 0 1 1\n";
+        let _ = std::fs::write(&temp_file, content);
+        // Valid file parsed correctly via parse_proc_udp_ports
+        let text = std::fs::read_to_string(&temp_file).unwrap();
+        let ports = parse_proc_udp_ports(&text);
+        assert_eq!(ports, vec![0x1450]);
+        let _ = std::fs::remove_file(&temp_file);
     }
 }
