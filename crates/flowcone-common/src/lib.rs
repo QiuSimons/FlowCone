@@ -140,16 +140,6 @@ pub struct GlobalConfig {
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for GlobalConfig {}
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ConfigStore {
-    pub active: u32,
-    pub slots: [GlobalConfig; 2],
-}
-
-#[cfg(not(target_arch = "bpf"))]
-unsafe impl aya::Pod for ConfigStore {}
-
 /// Non-routable IPv4 source ranges matching `is_private_ipv4()` (RFC 6890).
 #[cfg(not(target_arch = "bpf"))]
 pub const INTERNAL_V4_PREFIXES: &[&str] = &[
@@ -435,8 +425,6 @@ mod tests {
     fn test_global_config_layout() {
         assert_eq!(core::mem::size_of::<GlobalConfig>(), 56);
         assert_eq!(core::mem::align_of::<GlobalConfig>(), 4);
-        assert_eq!(core::mem::size_of::<ConfigStore>(), 116);
-        assert_eq!(core::mem::align_of::<ConfigStore>(), 4);
     }
 
     #[test]

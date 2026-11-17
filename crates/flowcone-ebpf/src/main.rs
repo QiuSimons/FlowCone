@@ -12,7 +12,7 @@ use aya_ebpf::{
 };
 use core::{ffi::c_void, mem};
 use flowcone_common::{
-    BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES,
+    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FRAG_MAP_ENTRIES,
     FragKey4, FragKey6, FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_FREE_BIT,
     PORT_QUEUE_ENTRIES, PORT_QUEUED_BIT, PORT_STATE_ENTRIES, SESSION_EVENT_RINGBUF_BYTES,
     SessionEvent4, SessionEvent6,
@@ -46,14 +46,17 @@ fn get_mark(ctx: &TcContext) -> u32 {
     unsafe { (*(ctx.as_ptr() as *const __sk_buff)).mark }
 }
 
-/// Double-buffered config in a single slot. `active & 1` selects the active slot.
+/// Double-buffered config: ACTIVE_CONFIG selects one of two immutable slots.
 #[map]
-static CONFIG_STORE: Array<ConfigStore> = Array::with_max_entries(1, 0);
+static CONFIG: Array<GlobalConfig> = Array::with_max_entries(2, 0);
+
+#[map]
+static ACTIVE_CONFIG: Array<u32> = Array::with_max_entries(1, 0);
 
 #[inline(always)]
 fn get_config() -> Option<&'static GlobalConfig> {
-    let store = CONFIG_STORE.get(0)?;
-    Some(&store.slots[(store.active & 1) as usize])
+    let active = *ACTIVE_CONFIG.get(0)? & 1;
+    CONFIG.get(active)
 }
 
 /// Tail-call targets for TC dispatchers.

@@ -1,8 +1,8 @@
 use aya::maps::{Array, HashMap, MapData, Queue, RingBuf};
 use flowcone_common::{
-    BindingValue4, BindingValue6, ConfigStore, EndpointKey4, EndpointKey6, FragKey4, FragKey6,
-    FragValue4, FragValue6, GlobalConfig, MAX_BINDINGS, PORT_FREE_BIT, PORT_QUEUED_BIT,
-    SessionEvent4, SessionEvent6, port_state_on_release,
+    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FragKey4, FragKey6, FragValue4,
+    FragValue6, GlobalConfig, MAX_BINDINGS, PORT_FREE_BIT, PORT_QUEUED_BIT, SessionEvent4,
+    SessionEvent6, port_state_on_release,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -72,7 +72,8 @@ fn reserved_delta(previous: &[u16], current: &[u16]) -> (Vec<u16>, Vec<u16>) {
 }
 
 pub struct SessionManager {
-    config_store: Array<MapData, ConfigStore>,
+    config_map: Array<MapData, GlobalConfig>,
+    active_map: Array<MapData, u32>,
     ob_map4: HashMap<MapData, EndpointKey4, BindingValue4>,
     ib_map4: HashMap<MapData, u16, BindingValue4>,
     ob_map6: HashMap<MapData, EndpointKey6, BindingValue6>,
@@ -264,7 +265,8 @@ fn sweep_family<V: ConeBinding>(
 
 /// Collection of eBPF maps used by SessionManager.
 pub struct SessionMaps {
-    pub config_store: Array<MapData, ConfigStore>,
+    pub config_map: Array<MapData, GlobalConfig>,
+    pub active_map: Array<MapData, u32>,
     pub ob_map4: HashMap<MapData, EndpointKey4, BindingValue4>,
     pub ib_map4: HashMap<MapData, u16, BindingValue4>,
     pub ob_map6: HashMap<MapData, EndpointKey6, BindingValue6>,
@@ -318,7 +320,8 @@ struct FamilyPortPool<'a> {
 impl SessionManager {
     pub fn new(maps: SessionMaps) -> Self {
         let SessionMaps {
-            config_store,
+            config_map,
+            active_map,
             ob_map4,
             ib_map4,
             ob_map6,
@@ -341,7 +344,8 @@ impl SessionManager {
             port_flags,
         } = maps;
         Self {
-            config_store,
+            config_map,
+            active_map,
             ob_map4,
             ib_map4,
             ob_map6,
@@ -655,14 +659,12 @@ impl SessionManager {
 
     /// Atomically updates active GlobalConfig via double-buffering.
     pub fn set_config(&mut self, cfg: GlobalConfig) -> bool {
-        let mut store = self.config_store.get(&0, 0).unwrap_or_default();
-        let next = 1 - (store.active & 1);
-        store.slots[next as usize] = cfg;
-        if self.config_store.set(0, &store, 0).is_err() {
+        let active = self.active_map.get(&0, 0).unwrap_or(0) & 1;
+        let next = 1 - active;
+        if self.config_map.set(next, &cfg, 0).is_err() {
             return false;
         }
-        store.active = next;
-        self.config_store.set(0, &store, 0).is_ok()
+        self.active_map.set(0, &next, 0).is_ok()
     }
 
     pub fn clear_v4_mappings(&mut self) {
@@ -748,6 +750,36 @@ impl SessionManager {
         drained
     }
 
+    fn last_seen4(&self, key: &EndpointKey4, port: u16) -> Option<u32> {
+        let mut last = None;
+        if let Ok(val) = self.ob_map4.get(key, 0)
+            && u16::from_be(val.port) == port
+        {
+            last = Some(val.last_seen);
+        }
+        if let Ok(iv) = self.ib_map4.get(&port, 0)
+            && iv.matches_key(key)
+        {
+            last = Some(last.map_or(iv.last_seen, |t| t.max(iv.last_seen)));
+        }
+        last
+    }
+
+    fn last_seen6(&self, key: &EndpointKey6, port: u16) -> Option<u32> {
+        let mut last = None;
+        if let Ok(val) = self.ob_map6.get(key, 0)
+            && u16::from_be(val.port) == port
+        {
+            last = Some(val.last_seen);
+        }
+        if let Ok(iv) = self.ib_map6.get(&port, 0)
+            && iv.matches_key(key)
+        {
+            last = Some(last.map_or(iv.last_seen, |t| t.max(iv.last_seen)));
+        }
+        last
+    }
+
     fn expiry_tick(&mut self, now: u32, timeout: u32) -> (usize, usize, bool) {
         let mut swept4 = 0;
         let mut swept6 = 0;
@@ -789,7 +821,8 @@ impl SessionManager {
             }
             if !ob_matches {
                 if ib_matches {
-                    if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= timeout) {
+                    let refreshed = self.last_seen4(&key, port);
+                    if let Some(t) = refreshed.filter(|t| now.saturating_sub(*t) <= timeout) {
                         self.schedule4(t.saturating_add(timeout), key, port, 0);
                     } else if self.ib_map4.remove(&port).is_ok() {
                         self.release_port4(port);
@@ -805,17 +838,22 @@ impl SessionManager {
                         self.schedule4(deadline, key, port, 1);
                     }
                     ExpiryStep::Drop => {
-                        let ob_removed = self.ob_map4.remove(&key).is_ok();
-                        let ib_removed = if ib_matches {
-                            self.ib_map4.remove(&port).is_ok()
+                        let refreshed = self.last_seen4(&key, port);
+                        if let Some(t) = refreshed.filter(|t| now.saturating_sub(*t) <= timeout) {
+                            self.schedule4(t.saturating_add(timeout), key, port, 0);
                         } else {
-                            false
-                        };
-                        if ib_removed {
-                            self.release_port4(port);
-                        }
-                        if ob_removed || ib_removed {
-                            swept4 += 1;
+                            let ob_removed = self.ob_map4.remove(&key).is_ok();
+                            let ib_removed = if ib_matches {
+                                self.ib_map4.remove(&port).is_ok()
+                            } else {
+                                false
+                            };
+                            if ib_removed {
+                                self.release_port4(port);
+                            }
+                            if ob_removed || ib_removed {
+                                swept4 += 1;
+                            }
                         }
                     }
                 }
@@ -860,7 +898,8 @@ impl SessionManager {
             }
             if !ob_matches {
                 if ib_matches {
-                    if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= timeout) {
+                    let refreshed = self.last_seen6(&key, port);
+                    if let Some(t) = refreshed.filter(|t| now.saturating_sub(*t) <= timeout) {
                         self.schedule6(t.saturating_add(timeout), key, port, 0);
                     } else if self.ib_map6.remove(&port).is_ok() {
                         self.release_port6(port);
@@ -876,17 +915,22 @@ impl SessionManager {
                         self.schedule6(deadline, key, port, 1);
                     }
                     ExpiryStep::Drop => {
-                        let ob_removed = self.ob_map6.remove(&key).is_ok();
-                        let ib_removed = if ib_matches {
-                            self.ib_map6.remove(&port).is_ok()
+                        let refreshed = self.last_seen6(&key, port);
+                        if let Some(t) = refreshed.filter(|t| now.saturating_sub(*t) <= timeout) {
+                            self.schedule6(t.saturating_add(timeout), key, port, 0);
                         } else {
-                            false
-                        };
-                        if ib_removed {
-                            self.release_port6(port);
-                        }
-                        if ob_removed || ib_removed {
-                            swept6 += 1;
+                            let ob_removed = self.ob_map6.remove(&key).is_ok();
+                            let ib_removed = if ib_matches {
+                                self.ib_map6.remove(&port).is_ok()
+                            } else {
+                                false
+                            };
+                            if ib_removed {
+                                self.release_port6(port);
+                            }
+                            if ob_removed || ib_removed {
+                                swept6 += 1;
+                            }
                         }
                     }
                 }
