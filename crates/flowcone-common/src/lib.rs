@@ -11,6 +11,9 @@ pub struct EndpointKey4 {
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for EndpointKey4 {}
 
+pub const BINDING_FLAG_SHORT_LIVED: u16 = 1;
+pub const DEFAULT_SHORT_LIVED_TIMEOUT_SEC: u32 = 5;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BindingValue4 {
@@ -18,6 +21,13 @@ pub struct BindingValue4 {
     pub port: u16,
     pub _pad: u16,
     pub last_seen: u32,
+}
+
+impl BindingValue4 {
+    #[inline(always)]
+    pub fn is_short_lived(&self) -> bool {
+        self._pad & BINDING_FLAG_SHORT_LIVED != 0
+    }
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -43,6 +53,13 @@ pub struct BindingValue6 {
     pub last_seen: u32,
 }
 
+impl BindingValue6 {
+    #[inline(always)]
+    pub fn is_short_lived(&self) -> bool {
+        self._pad[0] & BINDING_FLAG_SHORT_LIVED != 0
+    }
+}
+
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for BindingValue6 {}
 
@@ -55,6 +72,13 @@ pub struct SessionEvent4 {
     pub _pad: u16,
 }
 
+impl SessionEvent4 {
+    #[inline(always)]
+    pub fn is_short_lived(&self) -> bool {
+        self._pad & BINDING_FLAG_SHORT_LIVED != 0
+    }
+}
+
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for SessionEvent4 {}
 
@@ -64,6 +88,13 @@ pub struct SessionEvent6 {
     pub key: EndpointKey6,
     pub port: u16,
     pub _pad: [u16; 3],
+}
+
+impl SessionEvent6 {
+    #[inline(always)]
+    pub fn is_short_lived(&self) -> bool {
+        self._pad[0] & BINDING_FLAG_SHORT_LIVED != 0
+    }
 }
 
 #[cfg(not(target_arch = "bpf"))]

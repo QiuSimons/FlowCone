@@ -440,11 +440,16 @@ fn fixup_csum_v6(
 }
 
 #[inline(always)]
-fn push_event_v4(key: &EndpointKey4, port: u16) {
+fn is_short_lived_port(dst_port: u16) -> bool {
+    dst_port == 53 || dst_port == 123
+}
+
+#[inline(always)]
+fn push_event_v4(key: &EndpointKey4, port: u16, flags: u16) {
     let event = SessionEvent4 {
         key: *key,
         port,
-        _pad: 0,
+        _pad: flags,
     };
     if SESSION_EVENTS_V4.output(&event, BPF_RB_NO_WAKEUP).is_err() {
         let _ = GC_FLAGS.set(0, &1, 0);
@@ -452,11 +457,11 @@ fn push_event_v4(key: &EndpointKey4, port: u16) {
 }
 
 #[inline(always)]
-fn push_event_v6(key: &EndpointKey6, port: u16) {
+fn push_event_v6(key: &EndpointKey6, port: u16, flags: u16) {
     let event = SessionEvent6 {
         key: *key,
         port,
-        _pad: [0; 3],
+        _pad: [flags, 0, 0],
     };
     if SESSION_EVENTS_V6.output(&event, BPF_RB_NO_WAKEUP).is_err() {
         let _ = GC_FLAGS.set(0, &1, 0);
@@ -793,6 +798,7 @@ fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
     src_ip: u32,
     src_port: u16,
     now: u32,
+    is_short_lived: bool,
 ) -> Option<u16> {
     let ep_key = EndpointKey4 {
         ip: src_ip,
@@ -820,11 +826,16 @@ fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
         }
     }
 
+    let flags = if is_short_lived {
+        flowcone_common::BINDING_FLAG_SHORT_LIVED
+    } else {
+        0
+    };
     let pref = u16::from_be(src_port);
     let in_val = BindingValue4 {
         ip: src_ip,
         port: src_port,
-        _pad: 0,
+        _pad: flags,
         last_seen: now,
     };
     let alloc = alloc_port_v4::<PRIMARY, FALLBACK>(pref, cfg.min_port4, cfg.max_port4, &in_val)?;
@@ -832,14 +843,14 @@ fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
     let new_val = BindingValue4 {
         ip: cfg.wan_ip4,
         port: m_port,
-        _pad: 0,
+        _pad: flags,
         last_seen: now,
     };
     if OUTBOUND_BINDINGS_V4
         .insert(&ep_key, &new_val, BPF_NOEXIST)
         .is_ok()
     {
-        push_event_v4(&ep_key, alloc);
+        push_event_v4(&ep_key, alloc, flags);
         Some(m_port)
     } else {
         let _ = INBOUND_BINDINGS_V4.remove(&alloc);
@@ -856,6 +867,7 @@ fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
     src_ip: [u8; 16],
     src_port: u16,
     now: u32,
+    is_short_lived: bool,
 ) -> Option<u16> {
     let ep_key = EndpointKey6 {
         ip: src_ip,
@@ -883,11 +895,16 @@ fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
         }
     }
 
+    let flags = if is_short_lived {
+        flowcone_common::BINDING_FLAG_SHORT_LIVED
+    } else {
+        0
+    };
     let pref = u16::from_be(src_port);
     let in_val = BindingValue6 {
         ip: src_ip,
         port: src_port,
-        _pad: [0; 3],
+        _pad: [flags, 0, 0],
         last_seen: now,
     };
     let alloc = alloc_port_v6::<PRIMARY, FALLBACK>(pref, cfg.min_port6, cfg.max_port6, &in_val)?;
@@ -895,14 +912,14 @@ fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
     let new_val = BindingValue6 {
         ip: cfg.wan_ip6,
         port: m_port,
-        _pad: [0; 3],
+        _pad: [flags, 0, 0],
         last_seen: now,
     };
     if OUTBOUND_BINDINGS_V6
         .insert(&ep_key, &new_val, BPF_NOEXIST)
         .is_ok()
     {
-        push_event_v6(&ep_key, alloc);
+        push_event_v6(&ep_key, alloc, flags);
         Some(m_port)
     } else {
         let _ = INBOUND_BINDINGS_V6.remove(&alloc);
@@ -1233,7 +1250,13 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         let mapped_port = match get_or_create_mapping_v4::<
             EGRESS_ALLOC_PRIMARY,
             EGRESS_ALLOC_FALLBACK,
-        >(cfg, src_ip, src_port, now_sec())
+        >(
+            cfg,
+            src_ip,
+            src_port,
+            now_sec(),
+            is_short_lived_port(u16::from_be(udph.dst_port)),
+        )
         {
             Some(p) => p,
             None => return TC_ACT_SHOT,
@@ -1308,7 +1331,13 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         let mapped_port = match get_or_create_mapping_v6::<
             EGRESS_ALLOC_PRIMARY,
             EGRESS_ALLOC_FALLBACK,
-        >(cfg, src_addr, src_port, now_sec())
+        >(
+            cfg,
+            src_addr,
+            src_port,
+            now_sec(),
+            is_short_lived_port(u16::from_be(udph.dst_port)),
+        )
         {
             Some(p) => p,
             None => return TC_ACT_SHOT,
@@ -1492,7 +1521,7 @@ fn frag_v6_target(
     }
     let src_port = udph.src_port;
     let mapped = match get_or_create_mapping_v6::<FRAG6_ALLOC_PRIMARY, FRAG6_ALLOC_FALLBACK>(
-        cfg, src_ip, src_port, now,
+        cfg, src_ip, src_port, now, false,
     ) {
         Some(p) => p,
         None => return TC_ACT_SHOT,
@@ -1735,7 +1764,7 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
     }
     let now = now_sec();
     let mapped = match get_or_create_mapping_v4::<FRAG_ALLOC_PRIMARY, FRAG_ALLOC_FALLBACK>(
-        cfg, src_ip, src_port, now,
+        cfg, src_ip, src_port, now, false,
     ) {
         Some(p) => p,
         None => return TC_ACT_SHOT,

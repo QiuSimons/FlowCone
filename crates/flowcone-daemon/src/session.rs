@@ -799,7 +799,12 @@ impl SessionManager {
                     break;
                 };
                 if let Some(ev) = ev {
-                    self.schedule4(now.saturating_add(timeout), ev.key, ev.port);
+                    let ev_timeout = if ev.is_short_lived() {
+                        flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                    } else {
+                        timeout
+                    };
+                    self.schedule4(now.saturating_add(ev_timeout), ev.key, ev.port);
                     drained += 1;
                 }
             }
@@ -819,7 +824,12 @@ impl SessionManager {
                     break;
                 };
                 if let Some(ev) = ev {
-                    self.schedule6(now.saturating_add(timeout), ev.key, ev.port);
+                    let ev_timeout = if ev.is_short_lived() {
+                        flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                    } else {
+                        timeout
+                    };
+                    self.schedule6(now.saturating_add(ev_timeout), ev.key, ev.port);
                     drained += 1;
                 }
             }
@@ -846,10 +856,20 @@ impl SessionManager {
             let mut seen = None;
             let ib_matches;
 
+            let item_timeout = match &ob {
+                Ok(val) if val.is_short_lived() => flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC,
+                _ => match self.ib_map4.get(&port, 0) {
+                    Ok(iv) if iv.is_short_lived() => {
+                        flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                    }
+                    _ => timeout,
+                },
+            };
+
             if ob_matches && let Ok(val) = ob {
-                if now.saturating_sub(val.last_seen) <= timeout {
+                if now.saturating_sub(val.last_seen) <= item_timeout {
                     // Outbound active; skip inbound check (RFC 4787).
-                    self.schedule4(val.last_seen.saturating_add(timeout), key, port);
+                    self.schedule4(val.last_seen.saturating_add(item_timeout), key, port);
                     processed4 += 1;
                     continue;
                 }
@@ -868,15 +888,15 @@ impl SessionManager {
             }
             if !ob_matches {
                 if ib_matches {
-                    if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= timeout) {
-                        self.schedule4(t.saturating_add(timeout), key, port);
+                    if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= item_timeout) {
+                        self.schedule4(t.saturating_add(item_timeout), key, port);
                     } else if self.ib_map4.remove(&port).is_ok() {
                         self.release_port4(port);
                         swept4 += 1;
                     }
                 }
             } else {
-                match expiry_step(now, timeout, seen) {
+                match expiry_step(now, item_timeout, seen) {
                     ExpiryStep::Keep { deadline } => {
                         self.schedule4(deadline, key, port);
                     }
@@ -914,10 +934,20 @@ impl SessionManager {
             let mut seen = None;
             let ib_matches;
 
+            let item_timeout = match &ob {
+                Ok(val) if val.is_short_lived() => flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC,
+                _ => match self.ib_map6.get(&port, 0) {
+                    Ok(iv) if iv.is_short_lived() => {
+                        flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                    }
+                    _ => timeout,
+                },
+            };
+
             if ob_matches && let Ok(val) = ob {
-                if now.saturating_sub(val.last_seen) <= timeout {
+                if now.saturating_sub(val.last_seen) <= item_timeout {
                     // Outbound active; skip inbound check (RFC 4787).
-                    self.schedule6(val.last_seen.saturating_add(timeout), key, port);
+                    self.schedule6(val.last_seen.saturating_add(item_timeout), key, port);
                     processed6 += 1;
                     continue;
                 }
@@ -936,15 +966,15 @@ impl SessionManager {
             }
             if !ob_matches {
                 if ib_matches {
-                    if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= timeout) {
-                        self.schedule6(t.saturating_add(timeout), key, port);
+                    if let Some(t) = seen.filter(|t| now.saturating_sub(*t) <= item_timeout) {
+                        self.schedule6(t.saturating_add(item_timeout), key, port);
                     } else if self.ib_map6.remove(&port).is_ok() {
                         self.release_port6(port);
                         swept6 += 1;
                     }
                 }
             } else {
-                match expiry_step(now, timeout, seen) {
+                match expiry_step(now, item_timeout, seen) {
                     ExpiryStep::Keep { deadline } => {
                         self.schedule6(deadline, key, port);
                     }
@@ -989,7 +1019,12 @@ impl SessionManager {
                     .filter(|iv| iv.matches_key(&key))
                     .map(|iv| iv.last_seen())
                     .unwrap_or(0);
-                let deadline = val.last_seen().max(ib_last).saturating_add(timeout);
+                let item_timeout = if val.is_short_lived() {
+                    flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                } else {
+                    timeout
+                };
+                let deadline = val.last_seen().max(ib_last).saturating_add(item_timeout);
                 if entries4.len() < MAX_BINDINGS as usize {
                     entries4.push(Reverse((deadline, key, port)));
                 } else {
@@ -1011,7 +1046,12 @@ impl SessionManager {
                     .filter(|iv| iv.matches_key(&key))
                     .map(|iv| iv.last_seen())
                     .unwrap_or(0);
-                let deadline = val.last_seen().max(ib_last).saturating_add(timeout);
+                let item_timeout = if val.is_short_lived() {
+                    flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                } else {
+                    timeout
+                };
+                let deadline = val.last_seen().max(ib_last).saturating_add(item_timeout);
                 if entries6.len() < MAX_BINDINGS as usize {
                     entries6.push(Reverse((deadline, key, port)));
                 } else {
