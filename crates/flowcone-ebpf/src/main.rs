@@ -66,8 +66,11 @@ static INGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
 static EGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
 #[map]
 static FRAG_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
+const FRAG6_TARGET_INGRESS: u32 = 0;
+const FRAG6_TARGET_EGRESS: u32 = 1;
+
 #[map]
-static FRAG6_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
+static FRAG6_TARGET: ProgramArray = ProgramArray::with_max_entries(2, 0);
 #[map]
 static ICMP_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
 #[map]
@@ -80,8 +83,8 @@ const EGRESS_ALLOC_PRIMARY: usize = 32;
 const EGRESS_ALLOC_FALLBACK: usize = 32;
 const FRAG_ALLOC_PRIMARY: usize = 32;
 const FRAG_ALLOC_FALLBACK: usize = 32;
-const FRAG6_ALLOC_PRIMARY: usize = 1;
-const FRAG6_ALLOC_FALLBACK: usize = 0;
+const FRAG6_ALLOC_PRIMARY: usize = 32;
+const FRAG6_ALLOC_FALLBACK: usize = 32;
 
 #[map]
 static FRAG_IN_V4: LruHashMap<FragKey4, FragValue4> =
@@ -1109,7 +1112,7 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             if nh == 44 {
                 if ipv6_eq(&iph.dst_addr, &cfg.wan_ip6) {
                     unsafe {
-                        FRAG6_TARGET.tail_call(&ctx, 0);
+                        FRAG6_TARGET.tail_call(&ctx, FRAG6_TARGET_INGRESS);
                     }
                 }
                 return TC_ACT_UNSPEC;
@@ -1126,7 +1129,7 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             Ipv6L4::Udp(off) => off,
             Ipv6L4::Fragment => {
                 unsafe {
-                    FRAG6_TARGET.tail_call(&ctx, 0);
+                    FRAG6_TARGET.tail_call(&ctx, FRAG6_TARGET_INGRESS);
                 }
                 return TC_ACT_UNSPEC;
             }
@@ -1298,7 +1301,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         }
         if iph.next_hdr == 44 {
             unsafe {
-                FRAG6_TARGET.tail_call(&ctx, 0);
+                FRAG6_TARGET.tail_call(&ctx, FRAG6_TARGET_EGRESS);
             }
             return TC_ACT_SHOT;
         }
@@ -1307,7 +1310,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
             Ipv6L4::Udp(off) => off,
             Ipv6L4::Fragment => {
                 unsafe {
-                    FRAG6_TARGET.tail_call(&ctx, 0);
+                    FRAG6_TARGET.tail_call(&ctx, FRAG6_TARGET_EGRESS);
                 }
                 return TC_ACT_SHOT;
             }
@@ -1407,14 +1410,28 @@ fn ipv6_fragment_offset(data_end: usize, ip_off: usize, mut nh: u8) -> Option<us
     None
 }
 
-#[inline(always)]
-fn frag_v6_target(
-    ctx: &TcContext,
-    data: usize,
-    data_end: usize,
-    cfg: &GlobalConfig,
-    ip_off: usize,
-) -> i32 {
+#[classifier]
+pub fn flowcone_frag_v6_ingress(ctx: TcContext) -> i32 {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    let cfg = match get_config() {
+        Some(c) => c,
+        None => return TC_ACT_UNSPEC,
+    };
+    if cfg.bypass_mark_mask != 0 {
+        let mark = get_mark(&ctx);
+        if (mark & cfg.bypass_mark_mask) == cfg.bypass_mark_val {
+            return TC_ACT_UNSPEC;
+        }
+    }
+    let l2 = match parse_l2(data, data_end, cfg.l2_len) {
+        Some(v) => v,
+        None => return TC_ACT_UNSPEC,
+    };
+    if l2.proto != ETH_P_IPV6 || cfg.enabled_v6 == 0 {
+        return TC_ACT_UNSPEC;
+    }
+    let ip_off = l2.ip_off;
     if ip_off + 40 > data_end {
         return TC_ACT_UNSPEC;
     }
@@ -1436,7 +1453,9 @@ fn frag_v6_target(
     let offset = frag_field & 0xfff8;
     let more = (frag_field & 1) != 0;
     let id = read_be32(frag_off + 4);
-    let ingress = ipv6_eq(&iph.dst_addr, &cfg.wan_ip6);
+    if !ipv6_eq(&iph.dst_addr, &cfg.wan_ip6) {
+        return TC_ACT_UNSPEC;
+    }
     let key = FragKey6 {
         epoch: cfg.frag_epoch,
         src: iph.src_addr,
@@ -1447,55 +1466,83 @@ fn frag_v6_target(
     };
     let now = now_sec();
 
-    if ingress {
-        if offset != 0 {
-            if let Some(v) = unsafe { FRAG_IN_V6.get(&key) }
-                && now.saturating_sub(v.last_seen) <= FRAG_TIMEOUT_SEC
-            {
-                iph.dst_addr = v.ip;
-                let mark = get_mark(ctx);
-                ctx.skb.set_mark(mark | cfg.flowcone_mark);
-            }
-            return TC_ACT_UNSPEC;
+    if offset != 0 {
+        if let Some(v) = unsafe { FRAG_IN_V6.get(&key) }
+            && now.saturating_sub(v.last_seen) <= FRAG_TIMEOUT_SEC
+        {
+            iph.dst_addr = v.ip;
+            let mark = get_mark(&ctx);
+            ctx.skb.set_mark(mark | cfg.flowcone_mark);
         }
-        let udp_off = frag_off + 8;
-        if udp_off + mem::size_of::<UdpHdr>() > data_end {
-            return TC_ACT_UNSPEC;
-        }
-        let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
-        if udph.check == 0 {
-            return TC_ACT_UNSPEC;
-        }
-        let ext_port = u16::from_be(udph.dst_port);
-        let Some(target) = INBOUND_BINDINGS_V6.get_ptr_mut(&ext_port) else {
-            return TC_ACT_UNSPEC;
-        };
-        let new_ip = unsafe { (*target).ip };
-        let new_port = unsafe { (*target).port };
-        unsafe {
-            if now.wrapping_sub((*target).last_seen) >= LAST_SEEN_INTERVAL_SEC {
-                (*target).last_seen = now;
-            }
-        }
-        let old_ip = iph.dst_addr;
-        let old_port = udph.dst_port;
-        iph.dst_addr = new_ip;
-        udph.dst_port = new_port;
-        if !fixup_csum_v6(ctx, data, udp_off, &old_ip, &new_ip, old_port, new_port) {
-            return TC_ACT_SHOT;
-        }
-        let value = FragValue6 {
-            ip: new_ip,
-            last_seen: now,
-        };
-        if more {
-            let _ = FRAG_IN_V6.insert(&key, &value, BPF_ANY);
-        }
-        let mark = get_mark(ctx);
-        ctx.skb.set_mark(mark | cfg.flowcone_mark);
         return TC_ACT_UNSPEC;
     }
+    let udp_off = frag_off + 8;
+    if udp_off + mem::size_of::<UdpHdr>() > data_end {
+        return TC_ACT_UNSPEC;
+    }
+    let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+    if udph.check == 0 {
+        return TC_ACT_UNSPEC;
+    }
+    let ext_port = u16::from_be(udph.dst_port);
+    let Some(target) = INBOUND_BINDINGS_V6.get_ptr_mut(&ext_port) else {
+        return TC_ACT_UNSPEC;
+    };
+    let new_ip = unsafe { (*target).ip };
+    let new_port = unsafe { (*target).port };
+    unsafe {
+        if now.wrapping_sub((*target).last_seen) >= LAST_SEEN_INTERVAL_SEC {
+            (*target).last_seen = now;
+        }
+    }
+    let old_ip = iph.dst_addr;
+    let old_port = udph.dst_port;
+    iph.dst_addr = new_ip;
+    udph.dst_port = new_port;
+    if !fixup_csum_v6(&ctx, data, udp_off, &old_ip, &new_ip, old_port, new_port) {
+        return TC_ACT_SHOT;
+    }
+    let value = FragValue6 {
+        ip: new_ip,
+        last_seen: now,
+    };
+    if more {
+        let _ = FRAG_IN_V6.insert(&key, &value, BPF_ANY);
+    }
+    let mark = get_mark(&ctx);
+    ctx.skb.set_mark(mark | cfg.flowcone_mark);
+    TC_ACT_UNSPEC
+}
 
+#[classifier]
+pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    let cfg = match get_config() {
+        Some(c) => c,
+        None => return TC_ACT_UNSPEC,
+    };
+    if cfg.bypass_mark_mask != 0 {
+        let mark = get_mark(&ctx);
+        if (mark & cfg.bypass_mark_mask) == cfg.bypass_mark_val {
+            return TC_ACT_UNSPEC;
+        }
+    }
+    let l2 = match parse_l2(data, data_end, cfg.l2_len) {
+        Some(v) => v,
+        None => return TC_ACT_UNSPEC,
+    };
+    if l2.proto != ETH_P_IPV6 || cfg.enabled_v6 == 0 {
+        return TC_ACT_UNSPEC;
+    }
+    let ip_off = l2.ip_off;
+    if ip_off + 40 > data_end {
+        return TC_ACT_UNSPEC;
+    }
+    let iph = unsafe { &mut *(ip_off as *mut Ipv6Hdr) };
+    if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
+        return TC_ACT_UNSPEC;
+    }
     let src_ip = iph.src_addr;
     if ipv6_eq(&src_ip, &cfg.wan_ip6) {
         return TC_ACT_UNSPEC;
@@ -1504,6 +1551,30 @@ fn frag_v6_target(
     if !flowcone_common::is_routable_internal_ipv6(&src_ip, allow_all_internal) {
         return TC_ACT_UNSPEC;
     }
+    let Some(frag_off) = ipv6_fragment_offset(data_end, ip_off, iph.next_hdr) else {
+        return TC_ACT_UNSPEC;
+    };
+    if frag_off + 8 > data_end {
+        return TC_ACT_UNSPEC;
+    }
+    let next_hdr = read_u8(frag_off);
+    if next_hdr != IPPROTO_UDP {
+        return TC_ACT_UNSPEC;
+    }
+    let frag_field = read_be16(frag_off + 2);
+    let offset = frag_field & 0xfff8;
+    let more = (frag_field & 1) != 0;
+    let id = read_be32(frag_off + 4);
+    let key = FragKey6 {
+        epoch: cfg.frag_epoch,
+        src: src_ip,
+        dst: iph.dst_addr,
+        id,
+        proto: next_hdr,
+        _pad: [0; 3],
+    };
+    let now = now_sec();
+
     if offset != 0 {
         let Some(v) = (unsafe { FRAG_OUT_V6.get(&key) }) else {
             return TC_ACT_SHOT;
@@ -1512,7 +1583,7 @@ fn frag_v6_target(
             return TC_ACT_SHOT;
         }
         iph.src_addr = v.ip;
-        let mark = get_mark(ctx);
+        let mark = get_mark(&ctx);
         ctx.skb.set_mark(mark | cfg.flowcone_mark);
         return TC_ACT_UNSPEC;
     }
@@ -1540,7 +1611,7 @@ fn frag_v6_target(
     iph.src_addr = cfg.wan_ip6;
     udph.src_port = mapped;
     if !fixup_csum_v6(
-        ctx,
+        &ctx,
         data,
         udp_off,
         &old_src,
@@ -1557,33 +1628,9 @@ fn frag_v6_target(
     if more {
         let _ = FRAG_OUT_V6.insert(&key, &value, BPF_ANY);
     }
-    let mark = get_mark(ctx);
+    let mark = get_mark(&ctx);
     ctx.skb.set_mark(mark | cfg.flowcone_mark);
     TC_ACT_UNSPEC
-}
-
-#[classifier]
-pub fn flowcone_frag_v6(ctx: TcContext) -> i32 {
-    let data = ctx.data();
-    let data_end = ctx.data_end();
-    let cfg = match get_config() {
-        Some(c) => c,
-        None => return TC_ACT_UNSPEC,
-    };
-    if cfg.bypass_mark_mask != 0 {
-        let mark = get_mark(&ctx);
-        if (mark & cfg.bypass_mark_mask) == cfg.bypass_mark_val {
-            return TC_ACT_UNSPEC;
-        }
-    }
-    let l2 = match parse_l2(data, data_end, cfg.l2_len) {
-        Some(v) => v,
-        None => return TC_ACT_UNSPEC,
-    };
-    if l2.proto != ETH_P_IPV6 || cfg.enabled_v6 == 0 {
-        return TC_ACT_UNSPEC;
-    }
-    frag_v6_target(&ctx, data, data_end, cfg, l2.ip_off)
 }
 
 /// IPv4 fragment NAT handler invoked via FRAG_TARGET.
