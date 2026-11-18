@@ -1519,6 +1519,7 @@ fn frag_v6_target(
     }
     let src_port = udph.src_port;
     let mapped = match get_or_create_mapping_v6::<FRAG6_ALLOC_PRIMARY, FRAG6_ALLOC_FALLBACK>(
+        // Keep as false: dynamic is_short_lived branch exceeds verifier budget in flowcone_frag_v6.
         cfg, src_ip, src_port, now, false,
     ) {
         Some(p) => p,
