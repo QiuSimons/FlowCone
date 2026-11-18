@@ -3,6 +3,7 @@ use flowcone_common::{
     ETH_P_8021AD, ETH_P_8021Q, ETH_P_IP, ETH_P_IPV6, ETH_P_PPPOE, IPPROTO_DSTOPTS,
     IPPROTO_FRAGMENT, IPPROTO_HOPOPTS, IPPROTO_ROUTING, IPPROTO_UDP, PPP_IPV4, PPP_IPV6,
 };
+pub use flowcone_common::{Ipv6L4, L2Info};
 
 #[repr(C, packed)]
 pub struct Ipv4Hdr {
@@ -36,18 +37,36 @@ pub struct UdpHdr {
     pub check: u16,
 }
 
-#[derive(Clone, Copy)]
-pub struct L2Info {
-    pub proto: u16,
-    pub ip_off: usize,
+#[inline(always)]
+pub fn parse_header_at<T>(ptr: usize, data_end: usize) -> Option<*const T> {
+    if ptr + mem::size_of::<T>() > data_end {
+        return None;
+    }
+    Some(ptr as *const T)
 }
 
-#[derive(Clone, Copy)]
-pub enum Ipv6L4 {
-    Udp(usize),
-    Fragment,
-    NonUdp,
-    Unsupported,
+#[inline(always)]
+pub fn parse_header_at_mut<T>(ptr: usize, data_end: usize) -> Option<*mut T> {
+    if ptr + mem::size_of::<T>() > data_end {
+        return None;
+    }
+    Some(ptr as *mut T)
+}
+
+#[inline(always)]
+pub unsafe fn parse_header_ref<'a, T>(ptr: usize, data_end: usize) -> Option<&'a T> {
+    if ptr + mem::size_of::<T>() > data_end {
+        return None;
+    }
+    Some(unsafe { &*(ptr as *const T) })
+}
+
+#[inline(always)]
+pub unsafe fn parse_header_ref_mut<'a, T>(ptr: usize, data_end: usize) -> Option<&'a mut T> {
+    if ptr + mem::size_of::<T>() > data_end {
+        return None;
+    }
+    Some(unsafe { &mut *(ptr as *mut T) })
 }
 
 #[inline(always)]

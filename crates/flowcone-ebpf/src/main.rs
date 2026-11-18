@@ -21,8 +21,10 @@ use flowcone_common::{
 };
 
 pub use parsing::{
-    bypass_special_udp4, ipv6_eq, ipv6_fragment_offset, locate_ipv6_l4, parse_header, read_u8, read_be16, read_be32,
-    parse_header_mut, parse_l2, Ipv4Hdr, Ipv6Hdr, Ipv6L4, UdpHdr,
+    bypass_special_udp4, ipv6_eq, ipv6_fragment_offset, locate_ipv6_l4, parse_header,
+    parse_header_at, parse_header_at_mut, parse_header_mut, parse_header_ref,
+    parse_header_ref_mut, parse_l2, read_be16, read_be32, read_u8, Ipv4Hdr, Ipv6Hdr, Ipv6L4,
+    UdpHdr,
 };
 pub use engine::{
     fixup_csum_v4, fixup_csum_v6, fixup_l3_v4, get_or_create_mapping_v4,
@@ -178,11 +180,9 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
     let ip_off = l2.ip_off;
 
     if l2.proto == ETH_P_IP && cfg.enabled_v4 == 1 {
-        if ip_off + mem::size_of::<Ipv4Hdr>() > data_end {
+        let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(ip_off, data_end) }) else {
             return TC_ACT_UNSPEC;
-        }
-
-        let iph = unsafe { &mut *(ip_off as *mut Ipv4Hdr) };
+        };
         if (iph.ver_ihl >> 4) != 4 {
             return TC_ACT_UNSPEC;
         }
@@ -212,11 +212,9 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             return TC_ACT_UNSPEC;
         }
         let udp_off = ip_off + ihl;
-        if udp_off + mem::size_of::<UdpHdr>() > data_end {
+        let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
             return TC_ACT_UNSPEC;
-        }
-
-        let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+        };
         let ext_port = u16::from_be(udph.dst_port);
         if ext_port < cfg.min_port4 || ext_port > cfg.max_port4 {
             return TC_ACT_UNSPEC;
@@ -257,11 +255,9 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
     } else if l2.proto == ETH_P_IPV6 && cfg.enabled_v6 != 0 {
         let data = ctx.data();
         let data_end = ctx.data_end();
-        if ip_off + mem::size_of::<Ipv6Hdr>() > data_end {
+        let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(ip_off, data_end) }) else {
             return TC_ACT_UNSPEC;
-        }
-
-        let iph = unsafe { &mut *(ip_off as *mut Ipv6Hdr) };
+        };
         if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
             return TC_ACT_UNSPEC;
         }
@@ -302,11 +298,9 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             Ipv6L4::NonUdp | Ipv6L4::Unsupported => return TC_ACT_UNSPEC,
         };
 
-        if udp_off + mem::size_of::<UdpHdr>() > data_end {
+        let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
             return TC_ACT_UNSPEC;
-        }
-
-        let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+        };
         if udph.check == 0 {
             return TC_ACT_UNSPEC;
         }
@@ -376,11 +370,9 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
     let ip_off = l2.ip_off;
 
     if l2.proto == ETH_P_IP && cfg.enabled_v4 == 1 {
-        if ip_off + mem::size_of::<Ipv4Hdr>() > data_end {
+        let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(ip_off, data_end) }) else {
             return TC_ACT_UNSPEC;
-        }
-
-        let iph = unsafe { &mut *(ip_off as *mut Ipv4Hdr) };
+        };
         if (iph.ver_ihl >> 4) != 4 || iph.protocol != IPPROTO_UDP {
             return TC_ACT_UNSPEC;
         }
@@ -403,11 +395,9 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
             return TC_ACT_UNSPEC;
         }
         let udp_off = ip_off + ihl;
-        if udp_off + mem::size_of::<UdpHdr>() > data_end {
+        let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
             return TC_ACT_SHOT;
-        }
-
-        let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+        };
         let src_port = udph.src_port;
 
         if bypass_special_udp4(src_ip, iph.dst_addr, src_port, udph.dst_port) {
@@ -450,11 +440,9 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
     } else if l2.proto == ETH_P_IPV6 && cfg.enabled_v6 != 0 {
         let data = ctx.data();
         let data_end = ctx.data_end();
-        if ip_off + mem::size_of::<Ipv6Hdr>() > data_end {
+        let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(ip_off, data_end) }) else {
             return TC_ACT_UNSPEC;
-        }
-
-        let iph = unsafe { &mut *(ip_off as *mut Ipv6Hdr) };
+        };
         if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
             return TC_ACT_UNSPEC;
         }
@@ -484,11 +472,9 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
             Ipv6L4::NonUdp | Ipv6L4::Unsupported => return TC_ACT_UNSPEC,
         };
 
-        if udp_off + mem::size_of::<UdpHdr>() > data_end {
+        let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
             return TC_ACT_SHOT;
-        }
-
-        let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+        };
         if udph.check == 0 {
             return TC_ACT_SHOT;
         }
@@ -556,10 +542,9 @@ pub fn flowcone_frag_v6_ingress(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let ip_off = l2.ip_off;
-    if ip_off + 40 > data_end {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(ip_off, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let iph = unsafe { &mut *(ip_off as *mut Ipv6Hdr) };
+    };
     if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
         return TC_ACT_UNSPEC;
     }
@@ -601,10 +586,9 @@ pub fn flowcone_frag_v6_ingress(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let udp_off = frag_off + 8;
-    if udp_off + mem::size_of::<UdpHdr>() > data_end {
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+    };
     if udph.check == 0 {
         return TC_ACT_UNSPEC;
     }
@@ -660,10 +644,9 @@ pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let ip_off = l2.ip_off;
-    if ip_off + 40 > data_end {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(ip_off, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let iph = unsafe { &mut *(ip_off as *mut Ipv6Hdr) };
+    };
     if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
         return TC_ACT_UNSPEC;
     }
@@ -712,10 +695,9 @@ pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let udp_off = frag_off + 8;
-    if udp_off + mem::size_of::<UdpHdr>() > data_end {
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
         return TC_ACT_SHOT;
-    }
-    let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+    };
     if udph.check == 0 {
         return TC_ACT_SHOT;
     }
@@ -781,10 +763,9 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let ip_off = l2.ip_off;
-    if ip_off + mem::size_of::<Ipv4Hdr>() > data_end {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(ip_off, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let iph = unsafe { &mut *(ip_off as *mut Ipv4Hdr) };
+    };
     if (iph.ver_ihl >> 4) != 4 || iph.protocol != IPPROTO_UDP {
         return TC_ACT_UNSPEC;
     }
@@ -825,10 +806,9 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
             return TC_ACT_UNSPEC;
         }
         let udp_off = ip_off + ihl;
-        if udp_off + mem::size_of::<UdpHdr>() > data_end {
+        let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
             return TC_ACT_UNSPEC;
-        }
-        let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+        };
         let ext_port = u16::from_be(udph.dst_port);
         let Some(target) = INBOUND_BINDINGS_V4.get_ptr_mut(&ext_port) else {
             return TC_ACT_UNSPEC;
@@ -919,10 +899,9 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let udp_off = ip_off + ihl;
-    if udp_off + mem::size_of::<UdpHdr>() > data_end {
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
         return TC_ACT_SHOT;
-    }
-    let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+    };
     let src_port = udph.src_port;
     if bypass_special_udp4(src_ip, iph.dst_addr, src_port, udph.dst_port) {
         // Cache zero-IP marker to let subsequent fragments bypass NAT.
@@ -1013,10 +992,9 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let ip_off = l2.ip_off;
-    if ip_off + mem::size_of::<Ipv4Hdr>() + 8 > data_end {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(ip_off, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let iph = unsafe { &mut *(ip_off as *mut Ipv4Hdr) };
+    };
     let ihl = (iph.ver_ihl & 0x0f) as usize * 4;
     if (iph.ver_ihl >> 4) != 4 || iph.protocol != IPPROTO_ICMP || ihl != 20 {
         return TC_ACT_UNSPEC;
@@ -1030,16 +1008,17 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let icmp_len = tot_len - 20;
-    let icmph = unsafe { &mut *(icmp_off as *mut [u8; 8]) };
+    let Some(icmph) = (unsafe { parse_header_ref_mut::<[u8; 8]>(icmp_off, data_end) }) else {
+        return TC_ACT_UNSPEC;
+    };
     let ty = icmph[0];
     if ty != 3 && ty != 11 && ty != 12 {
         return TC_ACT_UNSPEC;
     }
     let emb_off = icmp_off + 8;
-    if emb_off + 28 > data_end {
+    let Some(emb) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(emb_off, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let emb = unsafe { &mut *(emb_off as *mut Ipv4Hdr) };
+    };
     if (emb.ver_ihl >> 4) != 4 || emb.protocol != IPPROTO_UDP {
         return TC_ACT_UNSPEC;
     }
@@ -1053,10 +1032,9 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
     if emb_udp + mem::size_of::<UdpHdr>() > icmp_off + icmp_len {
         return TC_ACT_UNSPEC;
     }
-    if emb_udp + mem::size_of::<UdpHdr>() > data_end {
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(emb_udp, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let udph = unsafe { &mut *(emb_udp as *mut UdpHdr) };
+    };
     let ext_port = u16::from_be(udph.src_port);
     let Some(target) = INBOUND_BINDINGS_V4.get_ptr_mut(&ext_port) else {
         return TC_ACT_UNSPEC;
@@ -1230,10 +1208,9 @@ pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let ip_off = l2.ip_off;
-    if ip_off + 96 > data_end {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(ip_off, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let iph = unsafe { &mut *(ip_off as *mut Ipv6Hdr) };
+    };
     if (u32::from_be(iph.ver_tc_fl) >> 28) != 6
         || iph.next_hdr != 58
         || !ipv6_eq(&iph.dst_addr, &cfg.wan_ip6)
@@ -1250,10 +1227,9 @@ pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let emb_off = icmp_off + 8;
-    if emb_off + 48 > data_end {
+    let Some(emb) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(emb_off, data_end) }) else {
         return TC_ACT_UNSPEC;
-    }
-    let emb = unsafe { &mut *(emb_off as *mut Ipv6Hdr) };
+    };
     if (u32::from_be(emb.ver_tc_fl) >> 28) != 6
         || emb.next_hdr != IPPROTO_UDP
         || !ipv6_eq(&emb.src_addr, &cfg.wan_ip6)
@@ -1261,7 +1237,9 @@ pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let udp_off = emb_off + 40;
-    let udph = unsafe { &mut *(udp_off as *mut UdpHdr) };
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
+        return TC_ACT_UNSPEC;
+    };
     let ext_port = u16::from_be(udph.src_port);
     let Some(target) = INBOUND_BINDINGS_V6.get_ptr_mut(&ext_port) else {
         return TC_ACT_UNSPEC;
