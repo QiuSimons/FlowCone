@@ -441,7 +441,7 @@ fn fixup_csum_v6(
 
 #[inline(always)]
 fn is_short_lived_port(dst_port: u16) -> bool {
-    dst_port == 53 || dst_port == 123
+    dst_port == 53
 }
 
 #[inline(always)]
@@ -812,6 +812,11 @@ fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
                 if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
                     (*val).last_seen = now;
                 }
+                if !is_short_lived
+                    && ((*val)._pad & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0)
+                {
+                    (*val)._pad &= !flowcone_common::BINDING_FLAG_SHORT_LIVED;
+                }
                 return Some((*val).port);
             }
             let old_port = u16::from_be((*val).port);
@@ -880,6 +885,11 @@ fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
             if ipv6_eq(&(*val).ip, &cfg.wan_ip6) {
                 if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
                     (*val).last_seen = now;
+                }
+                if !is_short_lived
+                    && ((*val)._pad[0] & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0)
+                {
+                    (*val)._pad[0] &= !flowcone_common::BINDING_FLAG_SHORT_LIVED;
                 }
                 return Some((*val).port);
             }
@@ -1043,12 +1053,6 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             return TC_ACT_UNSPEC;
         }
 
-        if let Some(state) = PORT_FREE_V4.get(ext_port as u32) {
-            if *state & PORT_FREE_BIT != 0 {
-                return TC_ACT_UNSPEC;
-            }
-        }
-
         if let Some(target) = INBOUND_BINDINGS_V4.get_ptr_mut(&ext_port) {
             let new_dst_ip = unsafe { (*target).ip };
             let new_dst_port = unsafe { (*target).port };
@@ -1141,12 +1145,6 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         let ext_port = u16::from_be(udph.dst_port);
         if ext_port < cfg.min_port6 || ext_port > cfg.max_port6 {
             return TC_ACT_UNSPEC;
-        }
-
-        if let Some(state) = PORT_FREE_V6.get(ext_port as u32) {
-            if *state & PORT_FREE_BIT != 0 {
-                return TC_ACT_UNSPEC;
-            }
         }
 
         if let Some(target) = INBOUND_BINDINGS_V6.get_ptr_mut(&ext_port) {
@@ -1764,7 +1762,11 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
     }
     let now = now_sec();
     let mapped = match get_or_create_mapping_v4::<FRAG_ALLOC_PRIMARY, FRAG_ALLOC_FALLBACK>(
-        cfg, src_ip, src_port, now, false,
+        cfg,
+        src_ip,
+        src_port,
+        now,
+        is_short_lived_port(u16::from_be(udph.dst_port)),
     ) {
         Some(p) => p,
         None => return TC_ACT_SHOT,
