@@ -64,6 +64,7 @@ impl BindingValue6 {
 unsafe impl aya::Pod for BindingValue6 {}
 
 /// Session creation notification event.
+/// `key.port` is in network byte order; `port` is allocated in host byte order.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionEvent4 {
@@ -82,6 +83,8 @@ impl SessionEvent4 {
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for SessionEvent4 {}
 
+/// Session creation notification event for IPv6.
+/// `key.port` is in network byte order; `port` is allocated in host byte order.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionEvent6 {
@@ -278,6 +281,34 @@ pub fn port_state_on_release(state: u8) -> (bool, u8) {
 
 /// Default packet mark applied to inbound DNAT-translated packets.
 pub const DEFAULT_FLOWCONE_MARK: u32 = 0x04787000;
+
+pub const IPPROTO_ICMP: u8 = 1;
+pub const IPPROTO_UDP: u8 = 17;
+pub const IPPROTO_HOPOPTS: u8 = 0;
+pub const IPPROTO_ROUTING: u8 = 43;
+pub const IPPROTO_FRAGMENT: u8 = 44;
+pub const IPPROTO_DSTOPTS: u8 = 60;
+pub const IPPROTO_ICMPV6: u8 = 58;
+
+pub const ETH_P_IP: u16 = 0x0800;
+pub const ETH_P_IPV6: u16 = 0x86dd;
+pub const ETH_P_8021Q: u16 = 0x8100;
+pub const ETH_P_8021AD: u16 = 0x88a8;
+pub const ETH_P_PPPOE: u16 = 0x8864;
+pub const PPP_IPV4: u16 = 0x0021;
+pub const PPP_IPV6: u16 = 0x0057;
+
+/// RFC 1624 incremental 16-bit one's complement checksum update.
+#[inline(always)]
+pub fn csum_replace(csum: u16, old: u16, new: u16) -> u16 {
+    let mut sum = (!csum as u32) + (!old as u32) + new as u32;
+    let mut i = 0;
+    while i < 3 {
+        sum = (sum & 0xffff) + (sum >> 16);
+        i += 1;
+    }
+    !(sum as u16)
+}
 
 #[cfg(test)]
 mod tests {
@@ -488,5 +519,18 @@ mod tests {
         let (needs_push, dup_state) = port_state_on_release(PORT_FREE_BIT | PORT_QUEUED_BIT);
         assert!(!needs_push);
         assert_eq!(dup_state, PORT_FREE_BIT | PORT_QUEUED_BIT);
+    }
+
+    #[test]
+    fn test_rfc1624_csum_replace() {
+        // Identity: replacing with same value must yield same checksum
+        let original_csum: u16 = 0x55aa;
+        assert_eq!(csum_replace(original_csum, 0x1234, 0x1234), original_csum);
+
+        // Replacing zero with a value, then reversing it, must yield original checksum
+        let new_csum = csum_replace(original_csum, 0x0000, 0x5678);
+        assert_ne!(new_csum, original_csum);
+        let restored = csum_replace(new_csum, 0x5678, 0x0000);
+        assert_eq!(restored, original_csum);
     }
 }

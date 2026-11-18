@@ -226,11 +226,11 @@ impl DataPlane {
         let frag_target = load_target_map(&mut bpf, "FRAG_TARGET", "flowcone_frag_target")?;
         let mut frag6_target = ProgramArray::try_from(
             bpf.take_map("FRAG6_TARGET")
-                .ok_or_else(|| "map FRAG6_TARGET not found")?,
+                .ok_or("map FRAG6_TARGET not found")?,
         )?;
         let prog_frag6_in: &SchedClassifier = bpf
             .program("flowcone_frag_v6_ingress")
-            .ok_or_else(|| "program flowcone_frag_v6_ingress not found")?
+            .ok_or("program flowcone_frag_v6_ingress not found")?
             .try_into()?;
         let fd_frag6_in = prog_frag6_in
             .fd()
@@ -245,7 +245,7 @@ impl DataPlane {
 
         let prog_frag6_out: &SchedClassifier = bpf
             .program("flowcone_frag_v6_egress")
-            .ok_or_else(|| "program flowcone_frag_v6_egress not found")?
+            .ok_or("program flowcone_frag_v6_egress not found")?
             .try_into()?;
         let fd_frag6_out = prog_frag6_out
             .fd()
@@ -392,5 +392,22 @@ impl DataPlane {
         }
         self.rotate(verbose)?;
         Ok(true)
+    }
+
+    /// Explicitly detaches active ingress and egress classifiers, restoring default network state.
+    pub(crate) fn detach(&mut self) {
+        let (in_name, out_name) = self.disp_names();
+        if let Some(id) = self.ingress.take() {
+            detach_classifier(&mut self.bpf, in_name, id);
+        }
+        if let Some(id) = self.egress.take() {
+            detach_classifier(&mut self.bpf, out_name, id);
+        }
+    }
+}
+
+impl Drop for DataPlane {
+    fn drop(&mut self) {
+        self.detach();
     }
 }
