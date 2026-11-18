@@ -468,8 +468,8 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
                 }
                 return TC_ACT_SHOT;
             }
-            // Unsupported extension headers are passed to standard stack.
-            Ipv6L4::NonUdp | Ipv6L4::Unsupported => return TC_ACT_UNSPEC,
+            Ipv6L4::NonUdp => return TC_ACT_UNSPEC,
+            Ipv6L4::Unsupported => return TC_ACT_SHOT,
         };
 
         let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
