@@ -183,9 +183,18 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(ip_off, data_end) }) else {
             return TC_ACT_UNSPEC;
         };
-        if (iph.ver_ihl >> 4) != 4 {
-            return TC_ACT_UNSPEC;
-        }
+        let udp_off = if iph.ver_ihl == 0x45 {
+            ip_off + 20
+        } else {
+            if (iph.ver_ihl >> 4) != 4 {
+                return TC_ACT_UNSPEC;
+            }
+            let ihl = (iph.ver_ihl & 0x0f) as usize * 4;
+            if ihl < 20 {
+                return TC_ACT_UNSPEC;
+            }
+            ip_off + ihl
+        };
         let proto = iph.protocol;
         if proto != IPPROTO_UDP {
             if proto == IPPROTO_ICMP && iph.dst_addr == cfg.wan_ip4 {
@@ -207,11 +216,6 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
             return TC_ACT_UNSPEC;
         }
 
-        let ihl = (iph.ver_ihl & 0x0f) as usize * 4;
-        if ihl < 20 {
-            return TC_ACT_UNSPEC;
-        }
-        let udp_off = ip_off + ihl;
         let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
             return TC_ACT_UNSPEC;
         };
@@ -373,9 +377,21 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
         let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(ip_off, data_end) }) else {
             return TC_ACT_UNSPEC;
         };
-        if (iph.ver_ihl >> 4) != 4 || iph.protocol != IPPROTO_UDP {
+        if iph.protocol != IPPROTO_UDP {
             return TC_ACT_UNSPEC;
         }
+        let udp_off = if iph.ver_ihl == 0x45 {
+            ip_off + 20
+        } else {
+            if (iph.ver_ihl >> 4) != 4 {
+                return TC_ACT_UNSPEC;
+            }
+            let ihl = (iph.ver_ihl & 0x0f) as usize * 4;
+            if ihl < 20 {
+                return TC_ACT_UNSPEC;
+            }
+            ip_off + ihl
+        };
 
         let src_ip = iph.src_addr;
         if src_ip == cfg.wan_ip4 || !flowcone_common::is_private_ipv4(src_ip) {
@@ -390,11 +406,6 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
             return TC_ACT_SHOT;
         }
 
-        let ihl = (iph.ver_ihl & 0x0f) as usize * 4;
-        if ihl < 20 {
-            return TC_ACT_UNSPEC;
-        }
-        let udp_off = ip_off + ihl;
         let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
             return TC_ACT_SHOT;
         };
