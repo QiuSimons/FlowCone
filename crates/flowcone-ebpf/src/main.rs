@@ -80,7 +80,7 @@ const EGRESS_ALLOC_PRIMARY: usize = 32;
 const EGRESS_ALLOC_FALLBACK: usize = 32;
 const FRAG_ALLOC_PRIMARY: usize = 32;
 const FRAG_ALLOC_FALLBACK: usize = 32;
-const FRAG6_ALLOC_PRIMARY: usize = 2;
+const FRAG6_ALLOC_PRIMARY: usize = 1;
 const FRAG6_ALLOC_FALLBACK: usize = 0;
 
 #[map]
@@ -1373,6 +1373,13 @@ fn read_be32(p: usize) -> u32 {
 /// program can translate.
 #[inline(always)]
 fn ipv6_fragment_offset(data_end: usize, ip_off: usize, mut nh: u8) -> Option<usize> {
+    if nh == IPPROTO_FRAGMENT {
+        let cur = ip_off + 40;
+        if cur + 8 <= data_end {
+            return Some(cur);
+        }
+        return None;
+    }
     let mut cur = ip_off + 40;
     let mut iter = 0;
     while iter < 4 {
@@ -1519,8 +1526,11 @@ fn frag_v6_target(
     }
     let src_port = udph.src_port;
     let mapped = match get_or_create_mapping_v6::<FRAG6_ALLOC_PRIMARY, FRAG6_ALLOC_FALLBACK>(
-        // Keep as false: dynamic is_short_lived branch exceeds verifier budget in flowcone_frag_v6.
-        cfg, src_ip, src_port, now, false,
+        cfg,
+        src_ip,
+        src_port,
+        now,
+        is_short_lived_port(u16::from_be(udph.dst_port)),
     ) {
         Some(p) => p,
         None => return TC_ACT_SHOT,
