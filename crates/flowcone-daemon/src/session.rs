@@ -496,7 +496,11 @@ impl SessionManager {
             let _ = free_state.set(port as u32, &0, 0);
             if let Ok(in_val) = ib_map.get(&port, 0) {
                 let ep_key = in_val.make_key();
-                let _ = ob_map.remove(&ep_key);
+                if let Ok(ob_val) = ob_map.get(&ep_key, 0) {
+                    if u16::from_be(ob_val.port_be()) == port {
+                        let _ = ob_map.remove(&ep_key);
+                    }
+                }
                 let _ = ib_map.remove(&port);
             }
         }
