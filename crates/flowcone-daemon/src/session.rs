@@ -42,7 +42,7 @@ fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
     req[8..12].copy_from_slice(&(1u32).to_ne_bytes()); // nlmsg_seq
     req[16] = family;
     req[17] = 17; // IPPROTO_UDP
-    req[20..24].copy_from_slice(&(1u32 << 7).to_ne_bytes()); // TCP_CLOSE (listening UDP)
+    req[20..24].copy_from_slice(&((1u32 << 1) | (1u32 << 7)).to_ne_bytes()); // TCP_ESTABLISHED | TCP_CLOSE
 
     send(&sock, &req, rustix::net::SendFlags::empty()).ok()?;
 
@@ -71,7 +71,7 @@ fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
             }
             if nlmsg_type == 20 {
                 let payload = &buf[offset + 16..offset + nlmsg_len];
-                if payload.len() >= 72 && payload[1] == 7 {
+                if payload.len() >= 72 && (payload[1] == 1 || payload[1] == 7) {
                     let sport = u16::from_be_bytes([payload[4], payload[5]]);
                     if sport != 0 {
                         ports.push(sport);
@@ -98,9 +98,9 @@ pub fn scan_local_udp_ports(family: u8, procfs_path: &str) -> Option<Vec<u16>> {
     Some(ports)
 }
 
-/// Parse local UDP ports from /proc/net/udp[6]. Only state 07 (unconnected,
-/// i.e. a bound/listening service) is reserved; connected client sockets are
-/// not.
+/// Parse local UDP ports from /proc/net/udp[6]. Both state 07 (unconnected /
+/// listening) and state 01 (connected client sockets) are reserved to prevent
+/// incoming responses to router services from being hijacked by TCX DNAT.
 fn parse_proc_udp_ports(text: &str) -> Vec<u16> {
     let mut out = Vec::new();
     for line in text.lines().skip(1) {
@@ -109,7 +109,7 @@ fn parse_proc_udp_ports(text: &str) -> Vec<u16> {
         let Some(local) = it.next() else { continue };
         let Some(_remote) = it.next() else { continue };
         let Some(state) = it.next() else { continue };
-        if state != "07" {
+        if state != "01" && state != "07" {
             continue;
         }
         let Some((_, port_hex)) = local.rsplit_once(':') else {
@@ -808,13 +808,15 @@ impl SessionManager {
                     break;
                 };
                 if let Some(ev) = ev {
-                    let ev_timeout = if ev.is_short_lived() {
-                        flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
-                    } else {
-                        timeout
-                    };
-                    self.schedule4(now.saturating_add(ev_timeout), ev.key, ev.port);
                     drained += 1;
+                    if ev.port != 0 {
+                        let ev_timeout = if ev.is_short_lived() {
+                            flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                        } else {
+                            timeout
+                        };
+                        self.schedule4(now.saturating_add(ev_timeout), ev.key, ev.port);
+                    }
                 }
             }
         }
@@ -833,13 +835,15 @@ impl SessionManager {
                     break;
                 };
                 if let Some(ev) = ev {
-                    let ev_timeout = if ev.is_short_lived() {
-                        flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
-                    } else {
-                        timeout
-                    };
-                    self.schedule6(now.saturating_add(ev_timeout), ev.key, ev.port);
                     drained += 1;
+                    if ev.port != 0 {
+                        let ev_timeout = if ev.is_short_lived() {
+                            flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                        } else {
+                            timeout
+                        };
+                        self.schedule6(now.saturating_add(ev_timeout), ev.key, ev.port);
+                    }
                 }
             }
         }
@@ -1271,12 +1275,12 @@ mod port_parser_tests {
     }
 
     #[test]
-    fn parses_listening_and_skips_connected() {
+    fn parses_listening_and_connected() {
         let text = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n 0: 00000000:1450 00000000:0000 07 00000000:00000000 00:00000000 00000000  0 0 1 1\n 1: 0100007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000  0 0 1 1\n 2: 0100007F:C000 0100007F:0035 01 00000000:00000000 00:00000000 00000000  0 0 1 1\n";
         let ports = parse_proc_udp_ports(text);
         assert!(ports.contains(&0x1450));
         assert!(ports.contains(&0x35));
-        assert!(!ports.contains(&0xC000));
+        assert!(ports.contains(&0xC000));
     }
 
     #[test]
@@ -1297,10 +1301,19 @@ mod port_parser_tests {
         use std::net::UdpSocket;
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
         let port = socket.local_addr().expect("local addr").port();
+
+        let connected_socket = UdpSocket::bind("127.0.0.1:0").expect("bind connected socket");
+        connected_socket.connect("127.0.0.1:53").expect("connect socket");
+        let conn_port = connected_socket.local_addr().expect("local addr").port();
+
         if let Some(ports) = super::scan_netlink_udp_ports(2) {
             assert!(
                 ports.contains(&port),
                 "netlink should contain bound port {port}, got {ports:?}"
+            );
+            assert!(
+                ports.contains(&conn_port),
+                "netlink should contain connected port {conn_port}, got {ports:?}"
             );
         }
     }

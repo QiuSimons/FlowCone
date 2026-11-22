@@ -48,35 +48,61 @@ fn lock_or_exit<'a, T>(mutex: &'a Mutex<T>, what: &str) -> std::sync::MutexGuard
     }
 }
 
+struct ShutdownState {
+    running: bool,
+    gc_work: bool,
+}
+
 struct ShutdownNotifier {
-    running: Mutex<bool>,
+    state: Mutex<ShutdownState>,
     condvar: Condvar,
 }
 
 impl ShutdownNotifier {
     fn new() -> Self {
         Self {
-            running: Mutex::new(true),
+            state: Mutex::new(ShutdownState {
+                running: true,
+                gc_work: false,
+            }),
             condvar: Condvar::new(),
         }
     }
 
     fn wait_timeout(&self, timeout: Duration) -> bool {
-        let guard = self.running.lock().unwrap();
-        if !*guard {
+        let guard = self.state.lock().unwrap();
+        if !guard.running {
             return false;
         }
         let (guard, _) = self.condvar.wait_timeout(guard, timeout).unwrap();
-        *guard
+        guard.running
+    }
+
+    fn wait_gc_timeout(&self, timeout: Duration) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        if !guard.running {
+            return false;
+        }
+        if !guard.gc_work {
+            let (g, _) = self.condvar.wait_timeout(guard, timeout).unwrap();
+            guard = g;
+        }
+        if !guard.running {
+            return false;
+        }
+        guard.gc_work = false;
+        true
     }
 
     fn notify_shutdown(&self) {
-        let mut guard = self.running.lock().unwrap();
-        *guard = false;
+        let mut guard = self.state.lock().unwrap();
+        guard.running = false;
         self.condvar.notify_all();
     }
 
-    fn notify_active(&self) {
+    fn notify_gc_active(&self) {
+        let mut guard = self.state.lock().unwrap();
+        guard.gc_work = true;
         self.condvar.notify_all();
     }
 }
@@ -687,7 +713,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gc_thread = thread::spawn(move || {
         let mut interval = gc_interval;
         let mut rng_state = get_monotonic_coarse_ns() ^ 0x9e3779b97f4a7c15;
-        while gc_notifier.wait_timeout(interval) {
+        while gc_notifier.wait_gc_timeout(interval) {
             let now = (get_monotonic_coarse_ns() / 1_000_000_000) as u32;
             let (has_more, is_idle) = {
                 let mut mgr = lock_or_exit(&gc_session, "session");
@@ -741,14 +767,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                     let now = (get_monotonic_coarse_ns() / 1_000_000_000) as u32;
-                    let became_active = {
+                    let (became_active, had_events) = {
                         let mut mgr = lock_or_exit(&event_session, "session");
                         let was_idle = mgr.is_idle();
-                        mgr.drain_events(now, event_timeout);
-                        was_idle && !mgr.is_idle()
+                        let drained = mgr.drain_events(now, event_timeout);
+                        (was_idle && !mgr.is_idle(), drained > 0)
                     };
-                    if became_active {
-                        event_notifier.notify_active();
+                    if became_active || had_events {
+                        event_notifier.notify_gc_active();
                     }
                 }
                 Ok(_) => {}

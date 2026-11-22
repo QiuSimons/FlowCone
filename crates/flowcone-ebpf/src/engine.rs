@@ -415,8 +415,18 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
     if ctx.result != 0 {
         Some(ctx.result)
     } else {
-        if ctx.saw_stale != 0 {
+        let flag = PORT_FLAGS.get(0).copied().unwrap_or(0);
+        if flag == 0 {
             let _ = PORT_FLAGS.set(0, &1, 0);
+            push_event_v4(
+                &EndpointKey4 {
+                    ip: 0,
+                    port: 0,
+                    _pad: 0,
+                },
+                0,
+                0,
+            );
         }
         None
     }
@@ -452,8 +462,18 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
     if ctx.result != 0 {
         Some(ctx.result)
     } else {
-        if ctx.saw_stale != 0 {
+        let flag = PORT_FLAGS.get(0).copied().unwrap_or(0);
+        if flag == 0 {
             let _ = PORT_FLAGS.set(0, &1, 0);
+            push_event_v6(
+                &EndpointKey6 {
+                    ip: [0; 16],
+                    port: 0,
+                    _pad: [0; 3],
+                },
+                0,
+                0,
+            );
         }
         None
     }
