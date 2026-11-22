@@ -496,24 +496,31 @@ pub fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
     if let Some(val) = OUTBOUND_BINDINGS_V4.get_ptr_mut(&ep_key) {
         unsafe {
             if (*val).ip == cfg.wan_ip4 {
-                if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
-                    (*val).last_seen = now;
+                let cur_port = u16::from_be((*val).port);
+                if port_is_reserved(&RESERVED_V4, cur_port) {
+                    let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
+                    let _ = INBOUND_BINDINGS_V4.remove(&cur_port);
+                } else {
+                    if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
+                        (*val).last_seen = now;
+                    }
+                    if !is_short_lived
+                        && ((*val)._pad & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0)
+                    {
+                        (*val)._pad &= !flowcone_common::BINDING_FLAG_SHORT_LIVED;
+                    }
+                    return Some((*val).port);
                 }
-                if !is_short_lived
-                    && ((*val)._pad & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0)
+            } else {
+                let old_port = u16::from_be((*val).port);
+                let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
+                if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&old_port)
+                    && (*in_val).ip == src_ip
+                    && (*in_val).port == src_port
                 {
-                    (*val)._pad &= !flowcone_common::BINDING_FLAG_SHORT_LIVED;
+                    let _ = INBOUND_BINDINGS_V4.remove(&old_port);
+                    release_port_v4(old_port);
                 }
-                return Some((*val).port);
-            }
-            let old_port = u16::from_be((*val).port);
-            let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
-            if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&old_port)
-                && (*in_val).ip == src_ip
-                && (*in_val).port == src_port
-            {
-                let _ = INBOUND_BINDINGS_V4.remove(&old_port);
-                release_port_v4(old_port);
             }
         }
     }
@@ -570,24 +577,31 @@ pub fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
     if let Some(val) = OUTBOUND_BINDINGS_V6.get_ptr_mut(&ep_key) {
         unsafe {
             if ipv6_eq(&(*val).ip, &cfg.wan_ip6) {
-                if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
-                    (*val).last_seen = now;
+                let cur_port = u16::from_be((*val).port);
+                if port_is_reserved(&RESERVED_V6, cur_port) {
+                    let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
+                    let _ = INBOUND_BINDINGS_V6.remove(&cur_port);
+                } else {
+                    if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
+                        (*val).last_seen = now;
+                    }
+                    if !is_short_lived
+                        && ((*val)._pad[0] & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0)
+                    {
+                        (*val)._pad[0] &= !flowcone_common::BINDING_FLAG_SHORT_LIVED;
+                    }
+                    return Some((*val).port);
                 }
-                if !is_short_lived
-                    && ((*val)._pad[0] & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0)
+            } else {
+                let old_port = u16::from_be((*val).port);
+                let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
+                if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&old_port)
+                    && ipv6_eq(&(*in_val).ip, &src_ip)
+                    && (*in_val).port == src_port
                 {
-                    (*val)._pad[0] &= !flowcone_common::BINDING_FLAG_SHORT_LIVED;
+                    let _ = INBOUND_BINDINGS_V6.remove(&old_port);
+                    release_port_v6(old_port);
                 }
-                return Some((*val).port);
-            }
-            let old_port = u16::from_be((*val).port);
-            let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
-            if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&old_port)
-                && ipv6_eq(&(*in_val).ip, &src_ip)
-                && (*in_val).port == src_port
-            {
-                let _ = INBOUND_BINDINGS_V6.remove(&old_port);
-                release_port_v6(old_port);
             }
         }
     }

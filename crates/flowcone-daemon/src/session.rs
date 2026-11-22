@@ -479,13 +479,13 @@ impl SessionManager {
         while q.pop(0).is_ok() {}
     }
 
-    fn sync_family_reserved(
+    fn sync_family_reserved<V: ConeBinding>(
         reserved_ports: &mut Vec<u16>,
         current: &[u16],
         reserved_map: &mut Array<MapData, u8>,
         free_state: &mut Array<MapData, u8>,
-        ib_map_contains: impl Fn(u16) -> bool,
-        to_release: &mut Vec<u16>,
+        ob_map: &mut HashMap<MapData, V::Key, V>,
+        ib_map: &mut HashMap<MapData, u16, V>,
     ) -> bool {
         let (added, removed) = reserved_delta(reserved_ports, current);
         if added.is_empty() && removed.is_empty() {
@@ -494,12 +494,14 @@ impl SessionManager {
         for port in added {
             let _ = reserved_map.set(port as u32, &1, 0);
             let _ = free_state.set(port as u32, &0, 0);
+            if let Ok(in_val) = ib_map.get(&port, 0) {
+                let ep_key = in_val.make_key();
+                let _ = ob_map.remove(&ep_key);
+                let _ = ib_map.remove(&port);
+            }
         }
         for port in removed {
             let _ = reserved_map.set(port as u32, &0, 0);
-            if !ib_map_contains(port) {
-                to_release.push(port);
-            }
         }
         *reserved_ports = current.to_vec();
         true
@@ -507,31 +509,30 @@ impl SessionManager {
 
     /// Applies updated local listening UDP ports to reserved maps.
     pub fn apply_reserved_ports(&mut self, ports4: Option<&[u16]>, ports6: Option<&[u16]>) {
-        let mut to_release = Vec::new();
         if let Some(ports) = ports4 {
-            Self::sync_family_reserved(
+            let changed = Self::sync_family_reserved(
                 &mut self.reserved4_ports,
                 ports,
                 &mut self.reserved4,
                 &mut self.free_state4,
-                |p| self.ib_map4.get(&p, 0).is_ok(),
-                &mut to_release,
+                &mut self.ob_map4,
+                &mut self.ib_map4,
             );
-            for p in to_release.drain(..) {
-                self.release_port4(p);
+            if changed {
+                self.rebuild_family4();
             }
         }
         if let Some(ports) = ports6 {
-            Self::sync_family_reserved(
+            let changed = Self::sync_family_reserved(
                 &mut self.reserved6_ports,
                 ports,
                 &mut self.reserved6,
                 &mut self.free_state6,
-                |p| self.ib_map6.get(&p, 0).is_ok(),
-                &mut to_release,
+                &mut self.ob_map6,
+                &mut self.ib_map6,
             );
-            for p in to_release.drain(..) {
-                self.release_port6(p);
+            if changed {
+                self.rebuild_family6();
             }
         }
     }

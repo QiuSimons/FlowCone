@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 /// Interval for periodic TCX tail verification.
 const REATTACH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Interval for periodic local UDP service port reservation scans.
+const RESERVE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+
 macro_rules! take_map {
     ($bpf:expr, $name:literal, $ty:ty) => {
         <$ty>::try_from(
@@ -647,7 +650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if last_reserve_scan.elapsed() >= Duration::from_secs(30) {
+            if last_reserve_scan.elapsed() >= RESERVE_SCAN_INTERVAL {
                 let p4 = session::scan_local_udp_ports(2, "/proc/net/udp");
                 let p6 = session::scan_local_udp_ports(10, "/proc/net/udp6");
                 lock_or_exit(&ip_session, "session")
