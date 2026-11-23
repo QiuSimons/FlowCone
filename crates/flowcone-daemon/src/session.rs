@@ -224,6 +224,7 @@ trait ConeBinding: aya::Pod + Copy {
     fn last_seen(&self) -> u32;
     fn make_key(&self) -> Self::Key;
     fn matches_key(&self, key: &Self::Key) -> bool;
+    fn is_short_lived(&self) -> bool;
 }
 
 impl ConeBinding for BindingValue4 {
@@ -247,6 +248,11 @@ impl ConeBinding for BindingValue4 {
 
     fn matches_key(&self, key: &EndpointKey4) -> bool {
         self.ip == key.ip && self.port == key.port
+    }
+
+    #[inline(always)]
+    fn is_short_lived(&self) -> bool {
+        self.is_short_lived()
     }
 }
 
@@ -272,6 +278,11 @@ impl ConeBinding for BindingValue6 {
     fn matches_key(&self, key: &EndpointKey6) -> bool {
         self.ip == key.ip && self.port == key.port
     }
+
+    #[inline(always)]
+    fn is_short_lived(&self) -> bool {
+        self.is_short_lived()
+    }
 }
 
 /// Full-table reconciliation after a lost queue notification.
@@ -286,7 +297,12 @@ fn sweep_family<V: ConeBinding>(
 ) -> usize {
     expired_buf.clear();
     for (key, val) in ob_map.iter().flatten() {
-        if now.saturating_sub(val.last_seen()) <= timeout {
+        let item_timeout = if val.is_short_lived() {
+            flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+        } else {
+            timeout
+        };
+        if now.saturating_sub(val.last_seen()) <= item_timeout {
             continue;
         }
         let port_host = u16::from_be(val.port_be());
@@ -294,7 +310,7 @@ fn sweep_family<V: ConeBinding>(
             Ok(iv) if iv.matches_key(&key) => iv.last_seen(),
             _ => 0,
         };
-        if now.saturating_sub(ib_last) > timeout {
+        if now.saturating_sub(ib_last) > item_timeout {
             expired_buf.push((key, port_host));
         }
     }
@@ -303,11 +319,16 @@ fn sweep_family<V: ConeBinding>(
     for &(key, port_host) in expired_buf.iter() {
         // Revalidate against datapath refresh.
         if let Ok(cur_val) = ob_map.get(&key, 0) {
+            let item_timeout = if cur_val.is_short_lived() {
+                flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+            } else {
+                timeout
+            };
             let cur_ib_last = match ib_map.get(&port_host, 0) {
                 Ok(iv) if iv.matches_key(&key) => iv.last_seen(),
                 _ => 0,
             };
-            if now.saturating_sub(cur_val.last_seen().max(cur_ib_last)) <= timeout {
+            if now.saturating_sub(cur_val.last_seen().max(cur_ib_last)) <= item_timeout {
                 continue;
             }
         }

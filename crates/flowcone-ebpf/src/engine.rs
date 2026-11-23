@@ -18,12 +18,12 @@ use crate::{
     SESSION_EVENTS_V4, SESSION_EVENTS_V6, UDP_CSUM_OFFSET,
 };
 
-pub const EGRESS_ALLOC_PRIMARY: usize = 4;
-pub const EGRESS_ALLOC_FALLBACK: usize = 4;
-pub const FRAG_ALLOC_PRIMARY: usize = 4;
-pub const FRAG_ALLOC_FALLBACK: usize = 4;
-pub const FRAG6_ALLOC_PRIMARY: usize = 4;
-pub const FRAG6_ALLOC_FALLBACK: usize = 4;
+pub const EGRESS_ALLOC_PRIMARY: usize = 16;
+pub const EGRESS_ALLOC_FALLBACK: usize = 16;
+pub const FRAG_ALLOC_PRIMARY: usize = 16;
+pub const FRAG_ALLOC_FALLBACK: usize = 16;
+pub const FRAG6_ALLOC_PRIMARY: usize = 16;
+pub const FRAG6_ALLOC_FALLBACK: usize = 16;
 
 #[inline(always)]
 pub fn now_sec() -> u32 {
