@@ -191,44 +191,52 @@ pub fn bitmap_clear_bit(map: &Array<u64>, slot: u32, mask: u64) {
 
 #[inline(always)]
 pub fn claim_port_v4(port: u16, in_val: &BindingValue4) -> bool {
+    let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
+    let map = if is_even {
+        &BITMAP_EVEN_V4
+    } else {
+        &BITMAP_ODD_V4
+    };
+
     if port_is_reserved(&RESERVED_V4, port) {
+        bitmap_set_bit(map, slot, mask);
         return false;
     }
     if INBOUND_BINDINGS_V4
         .insert(&port, in_val, BPF_NOEXIST)
         .is_ok()
     {
-        let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
-        let map = if is_even {
-            &BITMAP_EVEN_V4
-        } else {
-            &BITMAP_ODD_V4
-        };
         bitmap_set_bit(map, slot, mask);
         true
     } else {
+        // EEXIST: already active in inbound table. Repair bitmap to occupied.
+        bitmap_set_bit(map, slot, mask);
         false
     }
 }
 
 #[inline(always)]
 pub fn claim_port_v6(port: u16, in_val: &BindingValue6) -> bool {
+    let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
+    let map = if is_even {
+        &BITMAP_EVEN_V6
+    } else {
+        &BITMAP_ODD_V6
+    };
+
     if port_is_reserved(&RESERVED_V6, port) {
+        bitmap_set_bit(map, slot, mask);
         return false;
     }
     if INBOUND_BINDINGS_V6
         .insert(&port, in_val, BPF_NOEXIST)
         .is_ok()
     {
-        let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
-        let map = if is_even {
-            &BITMAP_EVEN_V6
-        } else {
-            &BITMAP_ODD_V6
-        };
         bitmap_set_bit(map, slot, mask);
         true
     } else {
+        // EEXIST: already active in inbound table. Repair bitmap to occupied.
+        bitmap_set_bit(map, slot, mask);
         false
     }
 }
@@ -262,8 +270,23 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
     max: u16,
     in_val: &BindingValue4,
 ) -> Option<u16> {
-    if pref >= min && pref <= max && claim_port_v4(pref, in_val) {
-        return Some(pref);
+    if pref >= min && pref <= max {
+        let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(pref);
+        let map = if is_even {
+            &BITMAP_EVEN_V4
+        } else {
+            &BITMAP_ODD_V4
+        };
+        if !port_is_reserved(&RESERVED_V4, pref)
+            && INBOUND_BINDINGS_V4
+                .insert(&pref, in_val, BPF_NOEXIST)
+                .is_ok()
+        {
+            bitmap_set_bit(map, slot, mask);
+            return Some(pref);
+        } else {
+            bitmap_set_bit(map, slot, mask);
+        }
     }
 
     let pref_even = (pref & 1) == 0;
@@ -278,14 +301,37 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
     let mut i = 0;
     while i < PRIMARY {
         let slot = (start_slot + i as u32) % flowcone_common::PORT_BITMAP_SLOTS;
-        if let Some(p) = primary_map.get_ptr(slot) {
+        if let Some(p) = primary_map.get_ptr_mut(slot) {
             let val = unsafe { *p };
             if val != !0u64 {
                 let free_bit = (!val).trailing_zeros();
                 if free_bit < 64 {
                     let port = flowcone_common::bitmap_coords_to_port(pref_even, slot, free_bit);
-                    if port >= min && port <= max && claim_port_v4(port, in_val) {
-                        return Some(port);
+                    if port >= min && port <= max {
+                        let mask = 1u64 << free_bit;
+                        if !port_is_reserved(&RESERVED_V4, port)
+                            && INBOUND_BINDINGS_V4
+                                .insert(&port, in_val, BPF_NOEXIST)
+                                .is_ok()
+                        {
+                            unsafe {
+                                core::arch::asm!(
+                                    "lock *(u64 *)({p} + 0) |= {mask}",
+                                    p = in(reg) p,
+                                    mask = in(reg) mask,
+                                );
+                            }
+                            return Some(port);
+                        } else {
+                            // Inactive or collision: self-heal dirty bit in-place with existing pointer.
+                            unsafe {
+                                core::arch::asm!(
+                                    "lock *(u64 *)({p} + 0) |= {mask}",
+                                    p = in(reg) p,
+                                    mask = in(reg) mask,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -302,14 +348,36 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
     let mut j = 0;
     while j < FALLBACK {
         let slot = (start_slot + j as u32) % flowcone_common::PORT_BITMAP_SLOTS;
-        if let Some(p) = fallback_map.get_ptr(slot) {
+        if let Some(p) = fallback_map.get_ptr_mut(slot) {
             let val = unsafe { *p };
             if val != !0u64 {
                 let free_bit = (!val).trailing_zeros();
                 if free_bit < 64 {
                     let port = flowcone_common::bitmap_coords_to_port(fallback_even, slot, free_bit);
-                    if port >= min && port <= max && claim_port_v4(port, in_val) {
-                        return Some(port);
+                    if port >= min && port <= max {
+                        let mask = 1u64 << free_bit;
+                        if !port_is_reserved(&RESERVED_V4, port)
+                            && INBOUND_BINDINGS_V4
+                                .insert(&port, in_val, BPF_NOEXIST)
+                                .is_ok()
+                        {
+                            unsafe {
+                                core::arch::asm!(
+                                    "lock *(u64 *)({p} + 0) |= {mask}",
+                                    p = in(reg) p,
+                                    mask = in(reg) mask,
+                                );
+                            }
+                            return Some(port);
+                        } else {
+                            unsafe {
+                                core::arch::asm!(
+                                    "lock *(u64 *)({p} + 0) |= {mask}",
+                                    p = in(reg) p,
+                                    mask = in(reg) mask,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -340,8 +408,23 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
     max: u16,
     in_val: &BindingValue6,
 ) -> Option<u16> {
-    if pref >= min && pref <= max && claim_port_v6(pref, in_val) {
-        return Some(pref);
+    if pref >= min && pref <= max {
+        let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(pref);
+        let map = if is_even {
+            &BITMAP_EVEN_V6
+        } else {
+            &BITMAP_ODD_V6
+        };
+        if !port_is_reserved(&RESERVED_V6, pref)
+            && INBOUND_BINDINGS_V6
+                .insert(&pref, in_val, BPF_NOEXIST)
+                .is_ok()
+        {
+            bitmap_set_bit(map, slot, mask);
+            return Some(pref);
+        } else {
+            bitmap_set_bit(map, slot, mask);
+        }
     }
 
     let pref_even = (pref & 1) == 0;
@@ -356,14 +439,36 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
     let mut i = 0;
     while i < PRIMARY {
         let slot = (start_slot + i as u32) % flowcone_common::PORT_BITMAP_SLOTS;
-        if let Some(p) = primary_map.get_ptr(slot) {
+        if let Some(p) = primary_map.get_ptr_mut(slot) {
             let val = unsafe { *p };
             if val != !0u64 {
                 let free_bit = (!val).trailing_zeros();
                 if free_bit < 64 {
                     let port = flowcone_common::bitmap_coords_to_port(pref_even, slot, free_bit);
-                    if port >= min && port <= max && claim_port_v6(port, in_val) {
-                        return Some(port);
+                    if port >= min && port <= max {
+                        let mask = 1u64 << free_bit;
+                        if !port_is_reserved(&RESERVED_V6, port)
+                            && INBOUND_BINDINGS_V6
+                                .insert(&port, in_val, BPF_NOEXIST)
+                                .is_ok()
+                        {
+                            unsafe {
+                                core::arch::asm!(
+                                    "lock *(u64 *)({p} + 0) |= {mask}",
+                                    p = in(reg) p,
+                                    mask = in(reg) mask,
+                                );
+                            }
+                            return Some(port);
+                        } else {
+                            unsafe {
+                                core::arch::asm!(
+                                    "lock *(u64 *)({p} + 0) |= {mask}",
+                                    p = in(reg) p,
+                                    mask = in(reg) mask,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -380,14 +485,36 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
     let mut j = 0;
     while j < FALLBACK {
         let slot = (start_slot + j as u32) % flowcone_common::PORT_BITMAP_SLOTS;
-        if let Some(p) = fallback_map.get_ptr(slot) {
+        if let Some(p) = fallback_map.get_ptr_mut(slot) {
             let val = unsafe { *p };
             if val != !0u64 {
                 let free_bit = (!val).trailing_zeros();
                 if free_bit < 64 {
                     let port = flowcone_common::bitmap_coords_to_port(fallback_even, slot, free_bit);
-                    if port >= min && port <= max && claim_port_v6(port, in_val) {
-                        return Some(port);
+                    if port >= min && port <= max {
+                        let mask = 1u64 << free_bit;
+                        if !port_is_reserved(&RESERVED_V6, port)
+                            && INBOUND_BINDINGS_V6
+                                .insert(&port, in_val, BPF_NOEXIST)
+                                .is_ok()
+                        {
+                            unsafe {
+                                core::arch::asm!(
+                                    "lock *(u64 *)({p} + 0) |= {mask}",
+                                    p = in(reg) p,
+                                    mask = in(reg) mask,
+                                );
+                            }
+                            return Some(port);
+                        } else {
+                            unsafe {
+                                core::arch::asm!(
+                                    "lock *(u64 *)({p} + 0) |= {mask}",
+                                    p = in(reg) p,
+                                    mask = in(reg) mask,
+                                );
+                            }
+                        }
                     }
                 }
             }

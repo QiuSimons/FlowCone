@@ -506,7 +506,9 @@ impl SessionManager {
             } else {
                 &mut *pool.bitmap_odd
             };
-            if let Ok(val) = map.get(&slot, 0) {
+            if let Ok(val) = map.get(&slot, 0)
+                && (val & mask) == 0
+            {
                 let _ = map.set(slot, &(val | mask), 0);
             }
         }
@@ -631,7 +633,9 @@ impl SessionManager {
         } else {
             &mut *pool.bitmap_odd
         };
-        if let Ok(val) = map.get(&slot, 0) {
+        if let Ok(val) = map.get(&slot, 0)
+            && (val & mask) != 0
+        {
             let _ = map.set(slot, &(val & !mask), 0);
         }
     }
@@ -668,7 +672,9 @@ impl SessionManager {
                 } else {
                     &mut *pool.bitmap_odd
                 };
-                if let Ok(val) = map.get(&slot, 0) {
+                if let Ok(val) = map.get(&slot, 0)
+                    && (val & mask) == 0
+                {
                     let _ = map.set(slot, &(val | mask), 0);
                 }
             }
