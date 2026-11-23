@@ -131,6 +131,7 @@ fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
 
     let mut buf = [0u8; 8192];
     let mut ports = Vec::new();
+    let mut done = false;
     'recv_loop: loop {
         let (n, _) = recv(&sock, &mut buf, rustix::net::RecvFlags::empty()).ok()?;
         if n == 0 {
@@ -150,6 +151,7 @@ fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
             }
             if nlmsg_type == 3 {
                 // NLMSG_DONE: multi-part dump finished normally
+                done = true;
                 break 'recv_loop;
             }
             if nlmsg_type == 20 {
@@ -164,7 +166,7 @@ fn scan_netlink_udp_ports(family: u8) -> Option<Vec<u16>> {
             offset += (nlmsg_len + 3) & !3; // NLMSG_ALIGN
         }
     }
-    if ports.is_empty() { None } else { Some(ports) }
+    if done { Some(ports) } else { None }
 }
 
 /// Parses listening UDP service ports from Netlink INET_DIAG with procfs fallback.
@@ -423,7 +425,11 @@ fn sweep_family<V: ConeBinding>(
                 continue;
             }
         }
-        let _ = ob_map.remove(&key);
+        if let Ok(cur_val) = ob_map.get(&key, 0) {
+            if u16::from_be(cur_val.port_be()) == port_host {
+                let _ = ob_map.remove(&key);
+            }
+        }
         if ib_map
             .get(&port_host, 0)
             .map(|iv| iv.matches_key(&key))

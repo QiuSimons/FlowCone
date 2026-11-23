@@ -600,6 +600,9 @@ pub fn flowcone_frag_v6_ingress(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let ext_port = u16::from_be(udph.dst_port);
+    if ext_port < cfg.min_port6 || ext_port > cfg.max_port6 {
+        return TC_ACT_UNSPEC;
+    }
     if port_is_reserved(&RESERVED_V6, ext_port) {
         return TC_ACT_UNSPEC;
     }
@@ -833,6 +836,9 @@ pub fn flowcone_frag_target(ctx: TcContext) -> i32 {
             return TC_ACT_UNSPEC;
         };
         let ext_port = u16::from_be(udph.dst_port);
+        if ext_port < cfg.min_port4 || ext_port > cfg.max_port4 {
+            return TC_ACT_UNSPEC;
+        }
         if port_is_reserved(&RESERVED_V4, ext_port) {
             return TC_ACT_UNSPEC;
         }
@@ -1060,6 +1066,9 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     };
     let ext_port = u16::from_be(udph.src_port);
+    if ext_port < cfg.min_port4 || ext_port > cfg.max_port4 {
+        return TC_ACT_UNSPEC;
+    }
     if port_is_reserved(&RESERVED_V4, ext_port) {
         return TC_ACT_UNSPEC;
     }
@@ -1274,6 +1283,9 @@ pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     };
     let ext_port = u16::from_be(udph.src_port);
+    if ext_port < cfg.min_port6 || ext_port > cfg.max_port6 {
+        return TC_ACT_UNSPEC;
+    }
     if port_is_reserved(&RESERVED_V6, ext_port) {
         return TC_ACT_UNSPEC;
     }
