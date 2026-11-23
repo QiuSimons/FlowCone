@@ -233,7 +233,6 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
             bitmap_set_bit(map, slot, mask);
             return Some(pref);
         }
-        bitmap_set_bit(map, slot, mask);
     }
 
     let pref_even = (pref & 1) == 0;
@@ -270,14 +269,6 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
                             );
                         }
                         return Some(port);
-                    }
-                    // Mark occupied on collision or invalid range.
-                    unsafe {
-                        core::arch::asm!(
-                            "lock *(u64 *)({p} + 0) |= {mask}",
-                            p = in(reg) p,
-                            mask = in(reg) mask,
-                        );
                     }
                 }
             }
@@ -316,14 +307,6 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
                             );
                         }
                         return Some(port);
-                    }
-                    // Mark occupied on collision or invalid range.
-                    unsafe {
-                        core::arch::asm!(
-                            "lock *(u64 *)({p} + 0) |= {mask}",
-                            p = in(reg) p,
-                            mask = in(reg) mask,
-                        );
                     }
                 }
             }
@@ -369,7 +352,6 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
             bitmap_set_bit(map, slot, mask);
             return Some(pref);
         }
-        bitmap_set_bit(map, slot, mask);
     }
 
     let pref_even = (pref & 1) == 0;
@@ -406,14 +388,6 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
                             );
                         }
                         return Some(port);
-                    }
-                    // Mark occupied on collision or invalid range.
-                    unsafe {
-                        core::arch::asm!(
-                            "lock *(u64 *)({p} + 0) |= {mask}",
-                            p = in(reg) p,
-                            mask = in(reg) mask,
-                        );
                     }
                 }
             }
@@ -452,14 +426,6 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
                             );
                         }
                         return Some(port);
-                    }
-                    // Mark occupied on collision or invalid range.
-                    unsafe {
-                        core::arch::asm!(
-                            "lock *(u64 *)({p} + 0) |= {mask}",
-                            p = in(reg) p,
-                            mask = in(reg) mask,
-                        );
                     }
                 }
             }
