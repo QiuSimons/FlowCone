@@ -377,7 +377,7 @@ fn send_liveness_batch(batch_bytes: &[u8]) -> Result<(), &'static str> {
             }
             return Err("netlink batch rejected by kernel");
         }
-        return Ok(());
+        return Err("unexpected netlink message type, expected NLMSG_ERROR ack");
     }
 
     Err("netlink send/recv failed after retry")

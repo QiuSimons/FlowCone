@@ -485,7 +485,6 @@ impl SessionManager {
         reserved_ports: &mut Vec<u16>,
         current: &[u16],
         reserved_map: &mut Array<MapData, u8>,
-        ob_map: &mut HashMap<MapData, V::Key, V>,
         ib_map: &mut HashMap<MapData, u16, V>,
         pool: &mut FamilyPortPool<'_>,
     ) {
@@ -496,16 +495,7 @@ impl SessionManager {
         for port in added {
             let _ = reserved_map.set(port as u32, &1, 0);
             let _ = pool.free_state.set(port as u32, &0, 0);
-            if let Ok(in_val) = ib_map.get(&port, 0) {
-                let ep_key = in_val.make_key();
-                if ob_map
-                    .get(&ep_key, 0)
-                    .is_ok_and(|ob_val| u16::from_be(ob_val.port_be()) == port)
-                {
-                    let _ = ob_map.remove(&ep_key);
-                }
-                let _ = ib_map.remove(&port);
-            }
+            let _ = ib_map.remove(&port);
         }
         for port in removed {
             let _ = reserved_map.set(port as u32, &0, 0);
@@ -532,7 +522,6 @@ impl SessionManager {
                 &mut self.reserved4_ports,
                 ports,
                 &mut self.reserved4,
-                &mut self.ob_map4,
                 &mut self.ib_map4,
                 &mut pool,
             );
@@ -551,7 +540,6 @@ impl SessionManager {
                 &mut self.reserved6_ports,
                 ports,
                 &mut self.reserved6,
-                &mut self.ob_map6,
                 &mut self.ib_map6,
                 &mut pool,
             );
