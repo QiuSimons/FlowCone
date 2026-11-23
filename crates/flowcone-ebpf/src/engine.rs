@@ -307,31 +307,30 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
                 let free_bit = (!val).trailing_zeros();
                 if free_bit < 64 {
                     let port = flowcone_common::bitmap_coords_to_port(pref_even, slot, free_bit);
-                    if port >= min && port <= max {
-                        let mask = 1u64 << free_bit;
-                        if !port_is_reserved(&RESERVED_V4, port)
-                            && INBOUND_BINDINGS_V4
-                                .insert(&port, in_val, BPF_NOEXIST)
-                                .is_ok()
-                        {
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
-                            return Some(port);
-                        } else {
-                            // Inactive or collision: self-heal dirty bit in-place with existing pointer.
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
+                    let mask = 1u64 << free_bit;
+                    if port >= min
+                        && port <= max
+                        && !port_is_reserved(&RESERVED_V4, port)
+                        && INBOUND_BINDINGS_V4
+                            .insert(&port, in_val, BPF_NOEXIST)
+                            .is_ok()
+                    {
+                        unsafe {
+                            core::arch::asm!(
+                                "lock *(u64 *)({p} + 0) |= {mask}",
+                                p = in(reg) p,
+                                mask = in(reg) mask,
+                            );
                         }
+                        return Some(port);
+                    }
+                    // Out-of-bounds, reserved, or EEXIST collision: self-heal dirty bit in-place.
+                    unsafe {
+                        core::arch::asm!(
+                            "lock *(u64 *)({p} + 0) |= {mask}",
+                            p = in(reg) p,
+                            mask = in(reg) mask,
+                        );
                     }
                 }
             }
@@ -354,30 +353,30 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
                 let free_bit = (!val).trailing_zeros();
                 if free_bit < 64 {
                     let port = flowcone_common::bitmap_coords_to_port(fallback_even, slot, free_bit);
-                    if port >= min && port <= max {
-                        let mask = 1u64 << free_bit;
-                        if !port_is_reserved(&RESERVED_V4, port)
-                            && INBOUND_BINDINGS_V4
-                                .insert(&port, in_val, BPF_NOEXIST)
-                                .is_ok()
-                        {
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
-                            return Some(port);
-                        } else {
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
+                    let mask = 1u64 << free_bit;
+                    if port >= min
+                        && port <= max
+                        && !port_is_reserved(&RESERVED_V4, port)
+                        && INBOUND_BINDINGS_V4
+                            .insert(&port, in_val, BPF_NOEXIST)
+                            .is_ok()
+                    {
+                        unsafe {
+                            core::arch::asm!(
+                                "lock *(u64 *)({p} + 0) |= {mask}",
+                                p = in(reg) p,
+                                mask = in(reg) mask,
+                            );
                         }
+                        return Some(port);
+                    }
+                    // Out-of-bounds, reserved, or EEXIST collision: self-heal dirty bit in-place.
+                    unsafe {
+                        core::arch::asm!(
+                            "lock *(u64 *)({p} + 0) |= {mask}",
+                            p = in(reg) p,
+                            mask = in(reg) mask,
+                        );
                     }
                 }
             }
@@ -445,30 +444,30 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
                 let free_bit = (!val).trailing_zeros();
                 if free_bit < 64 {
                     let port = flowcone_common::bitmap_coords_to_port(pref_even, slot, free_bit);
-                    if port >= min && port <= max {
-                        let mask = 1u64 << free_bit;
-                        if !port_is_reserved(&RESERVED_V6, port)
-                            && INBOUND_BINDINGS_V6
-                                .insert(&port, in_val, BPF_NOEXIST)
-                                .is_ok()
-                        {
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
-                            return Some(port);
-                        } else {
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
+                    let mask = 1u64 << free_bit;
+                    if port >= min
+                        && port <= max
+                        && !port_is_reserved(&RESERVED_V6, port)
+                        && INBOUND_BINDINGS_V6
+                            .insert(&port, in_val, BPF_NOEXIST)
+                            .is_ok()
+                    {
+                        unsafe {
+                            core::arch::asm!(
+                                "lock *(u64 *)({p} + 0) |= {mask}",
+                                p = in(reg) p,
+                                mask = in(reg) mask,
+                            );
                         }
+                        return Some(port);
+                    }
+                    // Out-of-bounds, reserved, or EEXIST collision: self-heal dirty bit in-place.
+                    unsafe {
+                        core::arch::asm!(
+                            "lock *(u64 *)({p} + 0) |= {mask}",
+                            p = in(reg) p,
+                            mask = in(reg) mask,
+                        );
                     }
                 }
             }
@@ -491,30 +490,30 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
                 let free_bit = (!val).trailing_zeros();
                 if free_bit < 64 {
                     let port = flowcone_common::bitmap_coords_to_port(fallback_even, slot, free_bit);
-                    if port >= min && port <= max {
-                        let mask = 1u64 << free_bit;
-                        if !port_is_reserved(&RESERVED_V6, port)
-                            && INBOUND_BINDINGS_V6
-                                .insert(&port, in_val, BPF_NOEXIST)
-                                .is_ok()
-                        {
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
-                            return Some(port);
-                        } else {
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
+                    let mask = 1u64 << free_bit;
+                    if port >= min
+                        && port <= max
+                        && !port_is_reserved(&RESERVED_V6, port)
+                        && INBOUND_BINDINGS_V6
+                            .insert(&port, in_val, BPF_NOEXIST)
+                            .is_ok()
+                    {
+                        unsafe {
+                            core::arch::asm!(
+                                "lock *(u64 *)({p} + 0) |= {mask}",
+                                p = in(reg) p,
+                                mask = in(reg) mask,
+                            );
                         }
+                        return Some(port);
+                    }
+                    // Out-of-bounds, reserved, or EEXIST collision: self-heal dirty bit in-place.
+                    unsafe {
+                        core::arch::asm!(
+                            "lock *(u64 *)({p} + 0) |= {mask}",
+                            p = in(reg) p,
+                            mask = in(reg) mask,
+                        );
                     }
                 }
             }
