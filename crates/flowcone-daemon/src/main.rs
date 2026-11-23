@@ -5,7 +5,7 @@ mod firewall;
 mod netlink;
 mod session;
 
-use aya::maps::{Array, HashMap, MapData, Queue, RingBuf};
+use aya::maps::{Array, HashMap, MapData, RingBuf};
 use aya::{EbpfLoader, VerifierLogLevel};
 use data_plane::DataPlane;
 use flowcone_common::{
@@ -282,14 +282,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         events4: take_map!(bpf, "SESSION_EVENTS_V4", RingBuf<MapData>),
         events6: take_map!(bpf, "SESSION_EVENTS_V6", RingBuf<MapData>),
         gc_flags: take_map!(bpf, "GC_FLAGS", Array<MapData, u32>),
-        free_state4: take_map!(bpf, "PORT_FREE_V4", Array<MapData, u8>),
-        free_state6: take_map!(bpf, "PORT_FREE_V6", Array<MapData, u8>),
         reserved4: take_map!(bpf, "RESERVED_V4", Array<MapData, u8>),
         reserved6: take_map!(bpf, "RESERVED_V6", Array<MapData, u8>),
-        free_even4: take_map!(bpf, "FREE_EVEN_V4", Queue<MapData, u16>),
-        free_odd4: take_map!(bpf, "FREE_ODD_V4", Queue<MapData, u16>),
-        free_even6: take_map!(bpf, "FREE_EVEN_V6", Queue<MapData, u16>),
-        free_odd6: take_map!(bpf, "FREE_ODD_V6", Queue<MapData, u16>),
+        bitmap_even4: take_map!(bpf, "BITMAP_EVEN_V4", Array<MapData, u64>),
+        bitmap_odd4: take_map!(bpf, "BITMAP_ODD_V4", Array<MapData, u64>),
+        bitmap_even6: take_map!(bpf, "BITMAP_EVEN_V6", Array<MapData, u64>),
+        bitmap_odd6: take_map!(bpf, "BITMAP_ODD_V6", Array<MapData, u64>),
         port_flags: take_map!(bpf, "PORT_FLAGS", Array<MapData, u32>),
     })));
     {

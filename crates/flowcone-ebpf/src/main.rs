@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(asm_experimental_arch)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod engine;
@@ -9,15 +10,15 @@ use aya_ebpf::{
     EbpfContext,
     bindings::{__sk_buff, TC_ACT_SHOT, TC_ACT_UNSPEC},
     macros::{classifier, map},
-    maps::{Array, HashMap, LruHashMap, ProgramArray, Queue, RingBuf},
+    maps::{Array, HashMap, LruHashMap, ProgramArray, RingBuf},
     programs::TcContext,
 };
 use core::mem;
 use flowcone_common::{
     BindingValue4, BindingValue6, ETH_P_IP, ETH_P_IPV6, EndpointKey4, EndpointKey6,
     FRAG_MAP_ENTRIES, FragKey4, FragKey6, FragValue4, FragValue6, GlobalConfig, IPPROTO_ICMP,
-    IPPROTO_UDP, MAX_BINDINGS, PORT_QUEUE_ENTRIES, PORT_STATE_ENTRIES, SESSION_EVENT_RINGBUF_BYTES,
-    csum_replace,
+    IPPROTO_UDP, MAX_BINDINGS, PORT_BITMAP_SLOTS, PORT_STATE_ENTRIES,
+    SESSION_EVENT_RINGBUF_BYTES, csum_replace,
 };
 
 pub use engine::{
@@ -128,13 +129,6 @@ pub static SESSION_EVENTS_V6: RingBuf = RingBuf::with_byte_size(SESSION_EVENT_RI
 #[map]
 pub static GC_FLAGS: Array<u32> = Array::with_max_entries(1, 0);
 
-/// Port allocation bitmaps and parity queues.
-#[map]
-pub static PORT_FREE_V4: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
-
-#[map]
-pub static PORT_FREE_V6: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
-
 /// Bitmap of ports reserved for host UDP services.
 #[map]
 pub static RESERVED_V4: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
@@ -142,17 +136,18 @@ pub static RESERVED_V4: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 
 #[map]
 pub static RESERVED_V6: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
 
+/// Lock-free port allocation parity bitmaps (512 * 64 = 32768 ports per parity).
 #[map]
-pub static FREE_EVEN_V4: Queue<u16> = Queue::with_max_entries(PORT_QUEUE_ENTRIES, 0);
+pub static BITMAP_EVEN_V4: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, 0);
 
 #[map]
-pub static FREE_ODD_V4: Queue<u16> = Queue::with_max_entries(PORT_QUEUE_ENTRIES, 0);
+pub static BITMAP_ODD_V4: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, 0);
 
 #[map]
-pub static FREE_EVEN_V6: Queue<u16> = Queue::with_max_entries(PORT_QUEUE_ENTRIES, 0);
+pub static BITMAP_EVEN_V6: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, 0);
 
 #[map]
-pub static FREE_ODD_V6: Queue<u16> = Queue::with_max_entries(PORT_QUEUE_ENTRIES, 0);
+pub static BITMAP_ODD_V6: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, 0);
 
 #[map]
 pub static PORT_FLAGS: Array<u32> = Array::with_max_entries(1, 0);

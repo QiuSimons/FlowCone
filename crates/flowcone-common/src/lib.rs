@@ -275,6 +275,21 @@ pub const FRAG_MAP_ENTRIES: u32 = 4096;
 pub const SESSION_EVENT_RINGBUF_BYTES: u32 = 4194304;
 pub const PORT_STATE_ENTRIES: u32 = 65536;
 pub const PORT_QUEUE_ENTRIES: u32 = 65536;
+pub const PORT_BITMAP_SLOTS: u32 = 512;
+
+#[inline(always)]
+pub fn port_to_bitmap_coords(port: u16) -> (bool, u32, u64) {
+    let is_even = (port & 1) == 0;
+    let idx = (port / 2) as u32;
+    let slot = idx / 64;
+    let bit = idx % 64;
+    (is_even, slot, 1u64 << bit)
+}
+
+#[inline(always)]
+pub fn bitmap_coords_to_port(is_even: bool, slot: u32, bit: u32) -> u16 {
+    ((slot * 64 + bit) * 2 + if is_even { 0 } else { 1 }) as u16
+}
 
 pub const PORT_FREE_BIT: u8 = 1;
 pub const PORT_QUEUED_BIT: u8 = 2;
@@ -793,5 +808,15 @@ mod tests {
         pkt[41] = 0;
         let off = ipv6_fragment_offset_slice(&pkt, 0, IPPROTO_ROUTING);
         assert_eq!(off, Some(48));
+    }
+
+    #[test]
+    fn test_bitmap_coords_roundtrip_all_ports() {
+        for port in 0..=65535u16 {
+            let (is_even, slot, mask) = port_to_bitmap_coords(port);
+            assert!(slot < PORT_BITMAP_SLOTS);
+            let bit = mask.trailing_zeros();
+            assert_eq!(bitmap_coords_to_port(is_even, slot, bit), port);
+        }
     }
 }
