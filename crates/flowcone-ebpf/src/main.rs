@@ -1099,7 +1099,7 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
         u16::from_be_bytes([ob[2], ob[3]]),
         u16::from_be_bytes([nb[2], nb[3]]),
     );
-    emb.check = u16::to_be(ec);
+    emb.check = if ec == 0 { 0xffff } else { u16::to_be(ec) };
 
     // Embedded UDP checksum.
     let new_udp_csum = if old_udp_csum != 0 {

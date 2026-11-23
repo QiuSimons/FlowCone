@@ -478,7 +478,7 @@ pub fn ipv6_fragment_offset_slice(data: &[u8], ip_off: usize, mut nh: u8) -> Opt
             }
             return None;
         }
-        if nh != IPPROTO_HOPOPTS && nh != IPPROTO_DSTOPTS {
+        if nh != IPPROTO_HOPOPTS && nh != IPPROTO_DSTOPTS && nh != IPPROTO_ROUTING {
             return None;
         }
         if cur + 2 > data.len() {
@@ -784,5 +784,14 @@ mod tests {
             Ipv6L4::Udp(off) => assert_eq!(off, 48),
             _ => panic!("expected UDP at offset 48 after Routing header"),
         }
+    }
+
+    #[test]
+    fn test_ipv6_fragment_offset_slice_routing() {
+        let mut pkt = [0u8; 40 + 8 + 8];
+        pkt[40] = IPPROTO_FRAGMENT;
+        pkt[41] = 0;
+        let off = ipv6_fragment_offset_slice(&pkt, 0, IPPROTO_ROUTING);
+        assert_eq!(off, Some(48));
     }
 }

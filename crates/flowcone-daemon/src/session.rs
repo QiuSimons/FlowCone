@@ -495,7 +495,6 @@ impl SessionManager {
         for port in added {
             let _ = reserved_map.set(port as u32, &1, 0);
             let _ = pool.free_state.set(port as u32, &0, 0);
-            let _ = ib_map.remove(&port);
         }
         for port in removed {
             let _ = reserved_map.set(port as u32, &0, 0);
