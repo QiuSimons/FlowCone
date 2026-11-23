@@ -136,18 +136,21 @@ pub static RESERVED_V4: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 
 #[map]
 pub static RESERVED_V6: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
 
+const BPF_F_MMAPABLE: u32 = 0x400;
+
 /// Lock-free port allocation parity bitmaps (512 * 64 = 32768 ports per parity).
+/// BPF_F_MMAPABLE (0x400) enables lock-free atomic bit operations from userspace via mmap.
 #[map]
-pub static BITMAP_EVEN_V4: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, 0);
+pub static BITMAP_EVEN_V4: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, BPF_F_MMAPABLE);
 
 #[map]
-pub static BITMAP_ODD_V4: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, 0);
+pub static BITMAP_ODD_V4: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, BPF_F_MMAPABLE);
 
 #[map]
-pub static BITMAP_EVEN_V6: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, 0);
+pub static BITMAP_EVEN_V6: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, BPF_F_MMAPABLE);
 
 #[map]
-pub static BITMAP_ODD_V6: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, 0);
+pub static BITMAP_ODD_V6: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, BPF_F_MMAPABLE);
 
 #[map]
 pub static PORT_FLAGS: Array<u32> = Array::with_max_entries(1, 0);

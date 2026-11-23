@@ -3,8 +3,125 @@ use flowcone_common::{
     BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FragKey4, FragKey6, FragValue4,
     FragValue6, GlobalConfig, MAX_BINDINGS, SessionEvent4, SessionEvent6,
 };
+use rustix::mm::{MapFlags, ProtFlags};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Mmap-backed atomic bitmap for hardware-level lock-free bit manipulation.
+///
+/// BPF Array maps created with `BPF_F_MMAPABLE` are directly mapped into userspace
+/// virtual memory, allowing single-instruction hardware atomic bit operations
+/// (`fetch_and`, `fetch_or`) that share the exact cacheline with eBPF kernel code.
+pub struct AtomicBitmap {
+    mmap_ptr: *mut AtomicU64,
+    len: usize,
+    array: Array<MapData, u64>,
+}
+
+unsafe impl Send for AtomicBitmap {}
+unsafe impl Sync for AtomicBitmap {}
+
+impl AtomicBitmap {
+    pub fn new(array: Array<MapData, u64>) -> Self {
+        use aya::maps::IterableMap;
+        use std::os::fd::AsFd;
+        let len = flowcone_common::PORT_BITMAP_SLOTS as usize;
+        let byte_len = len * std::mem::size_of::<u64>();
+        let map_data = array.map();
+        let map_fd = map_data.fd();
+        let mmap_ptr = unsafe {
+            match rustix::mm::mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED,
+                map_fd.as_fd(),
+                0,
+            ) {
+                Ok(ptr) => ptr as *mut AtomicU64,
+                Err(e) => {
+                    eprintln!(
+                        "flowcone: warning: failed to mmap BPF bitmap ({:?}), falling back to syscalls",
+                        e
+                    );
+                    std::ptr::null_mut()
+                }
+            }
+        };
+        Self {
+            mmap_ptr,
+            len,
+            array,
+        }
+    }
+
+    #[inline(always)]
+    pub fn fetch_and(&mut self, slot: u32, mask: u64, order: Ordering) -> u64 {
+        if !self.mmap_ptr.is_null() && (slot as usize) < self.len {
+            unsafe {
+                let elem = &*self.mmap_ptr.add(slot as usize);
+                elem.fetch_and(mask, order)
+            }
+        } else if let Ok(val) = self.array.get(&slot, 0) {
+            let _ = self.array.set(slot, &(val & mask), 0);
+            val
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub fn fetch_or(&mut self, slot: u32, mask: u64, order: Ordering) -> u64 {
+        if !self.mmap_ptr.is_null() && (slot as usize) < self.len {
+            unsafe {
+                let elem = &*self.mmap_ptr.add(slot as usize);
+                elem.fetch_or(mask, order)
+            }
+        } else if let Ok(val) = self.array.get(&slot, 0) {
+            let _ = self.array.set(slot, &(val | mask), 0);
+            val
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub fn store(&mut self, slot: u32, val: u64, order: Ordering) {
+        if !self.mmap_ptr.is_null() && (slot as usize) < self.len {
+            unsafe {
+                let elem = &*self.mmap_ptr.add(slot as usize);
+                elem.store(val, order);
+            }
+        } else {
+            let _ = self.array.set(slot, &val, 0);
+        }
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn load(&self, slot: u32, order: Ordering) -> u64 {
+        if !self.mmap_ptr.is_null() && (slot as usize) < self.len {
+            unsafe {
+                let elem = &*self.mmap_ptr.add(slot as usize);
+                elem.load(order)
+            }
+        } else {
+            self.array.get(&slot, 0).unwrap_or(0)
+        }
+    }
+}
+
+impl Drop for AtomicBitmap {
+    fn drop(&mut self) {
+        if !self.mmap_ptr.is_null() {
+            let byte_len = self.len * std::mem::size_of::<u64>();
+            unsafe {
+                let _ = rustix::mm::munmap(self.mmap_ptr as *mut _, byte_len);
+            }
+        }
+    }
+}
 
 type Expiry4 = Reverse<(u32, EndpointKey4, u16)>;
 type Expiry6 = Reverse<(u32, EndpointKey6, u16)>;
@@ -170,10 +287,10 @@ pub struct SessionManager {
     gc_flags: Array<MapData, u32>,
     reserved4: Array<MapData, u8>,
     reserved6: Array<MapData, u8>,
-    bitmap_even4: Array<MapData, u64>,
-    bitmap_odd4: Array<MapData, u64>,
-    bitmap_even6: Array<MapData, u64>,
-    bitmap_odd6: Array<MapData, u64>,
+    bitmap_even4: AtomicBitmap,
+    bitmap_odd4: AtomicBitmap,
+    bitmap_even6: AtomicBitmap,
+    bitmap_odd6: AtomicBitmap,
     port_flags: Array<MapData, u32>,
     pool_enable_v4: bool,
     pool_enable_v6: bool,
@@ -409,8 +526,8 @@ fn expiry_step(now: u32, timeout: u32, seen: Option<u32>) -> ExpiryStep {
 struct FamilyPortPool<'a> {
     min_port: u16,
     max_port: u16,
-    bitmap_even: &'a mut Array<MapData, u64>,
-    bitmap_odd: &'a mut Array<MapData, u64>,
+    bitmap_even: &'a mut AtomicBitmap,
+    bitmap_odd: &'a mut AtomicBitmap,
     reserved_ports: &'a [u16],
 }
 
@@ -454,10 +571,10 @@ impl SessionManager {
             gc_flags,
             reserved4,
             reserved6,
-            bitmap_even4,
-            bitmap_odd4,
-            bitmap_even6,
-            bitmap_odd6,
+            bitmap_even4: AtomicBitmap::new(bitmap_even4),
+            bitmap_odd4: AtomicBitmap::new(bitmap_odd4),
+            bitmap_even6: AtomicBitmap::new(bitmap_even6),
+            bitmap_odd6: AtomicBitmap::new(bitmap_odd6),
             port_flags,
             pool_enable_v4: false,
             pool_enable_v6: false,
@@ -506,11 +623,7 @@ impl SessionManager {
             } else {
                 &mut *pool.bitmap_odd
             };
-            if let Ok(val) = map.get(&slot, 0)
-                && (val & mask) == 0
-            {
-                let _ = map.set(slot, &(val | mask), 0);
-            }
+            map.fetch_or(slot, mask, Ordering::Relaxed);
         }
         for port in removed {
             let _ = reserved_map.set(port as u32, &0, 0);
@@ -585,10 +698,10 @@ impl SessionManager {
         }
 
         for (slot, &val) in even_slots.iter().enumerate() {
-            let _ = pool.bitmap_even.set(slot as u32, &val, 0);
+            pool.bitmap_even.store(slot as u32, val, Ordering::Relaxed);
         }
         for (slot, &val) in odd_slots.iter().enumerate() {
-            let _ = pool.bitmap_odd.set(slot as u32, &val, 0);
+            pool.bitmap_odd.store(slot as u32, val, Ordering::Relaxed);
         }
     }
 
@@ -633,11 +746,7 @@ impl SessionManager {
         } else {
             &mut *pool.bitmap_odd
         };
-        if let Ok(val) = map.get(&slot, 0)
-            && (val & mask) != 0
-        {
-            let _ = map.set(slot, &(val & !mask), 0);
-        }
+        map.fetch_and(slot, !mask, Ordering::Relaxed);
     }
 
     fn release_port4(&mut self, port: u16) {
@@ -672,11 +781,7 @@ impl SessionManager {
                 } else {
                     &mut *pool.bitmap_odd
                 };
-                if let Ok(val) = map.get(&slot, 0)
-                    && (val & mask) == 0
-                {
-                    let _ = map.set(slot, &(val | mask), 0);
-                }
+                map.fetch_or(slot, mask, Ordering::Relaxed);
             }
         }
     }
