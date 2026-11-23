@@ -154,12 +154,14 @@ return view.extend({
 		o.datatype = 'port';
 		o.placeholder = '1024';
 		o.default = '1024';
+		o.retain = true;
 		o.depends('advanced', '1');
 
 		o = s.option(form.Value, 'max_port', _('Max Port'));
 		o.datatype = 'port';
 		o.placeholder = '65535';
 		o.default = '65535';
+		o.retain = true;
 		o.depends('advanced', '1');
 
 		o = s.option(form.Value, 'timeout', _('Timeout (seconds)'));
@@ -172,6 +174,7 @@ return view.extend({
 				return _('Timeout must be between 120 and 604800 seconds (RFC 4787 REQ-5).');
 			return true;
 		};
+		o.retain = true;
 		o.depends('advanced', '1');
 
 		o = s.option(form.Value, 'interval', _('Expiry Scheduler Tick (seconds)'));
@@ -184,17 +187,20 @@ return view.extend({
 				return _('Interval must be between 1 and 3600 seconds.');
 			return true;
 		};
+		o.retain = true;
 		o.depends('advanced', '1');
 
 		o = s.option(form.Flag, 'manage_nft', _('Firewall (fw4) Integration'),
 			_('Automatically insert masquerade bypass and forward rules.'));
 		o.default = o.enabled;
 		o.rmempty = false;
+		o.retain = true;
 		o.depends('advanced', '1');
 
 		o = s.option(form.Value, 'bypass_mark', _('Bypass Fwmark'),
 			_('Optional fwmark for custom policy routing.'));
 		o.placeholder = '0x100/0xff00';
+		o.retain = true;
 		o.depends('advanced', '1');
 
 		return m.render();
