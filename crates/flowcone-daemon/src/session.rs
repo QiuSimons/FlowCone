@@ -822,6 +822,19 @@ impl SessionManager {
                 }
                 if orphan_mask != 0 {
                     map.fetch_and(slot, !orphan_mask, Ordering::Relaxed);
+                    let mut rescue_mask = 0u64;
+                    for bit in 0..64 {
+                        let mask = 1u64 << bit;
+                        if (orphan_mask & mask) != 0 {
+                            let port = flowcone_common::bitmap_coords_to_port(parity, slot, bit);
+                            if ib_map.get(&port, 0).is_ok() {
+                                rescue_mask |= mask;
+                            }
+                        }
+                    }
+                    if rescue_mask != 0 {
+                        map.fetch_or(slot, rescue_mask, Ordering::Relaxed);
+                    }
                 }
             }
         }
