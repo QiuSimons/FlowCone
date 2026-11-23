@@ -190,58 +190,6 @@ pub fn bitmap_clear_bit(map: &Array<u64>, slot: u32, mask: u64) {
 }
 
 #[inline(always)]
-pub fn claim_port_v4(port: u16, in_val: &BindingValue4) -> bool {
-    let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
-    let map = if is_even {
-        &BITMAP_EVEN_V4
-    } else {
-        &BITMAP_ODD_V4
-    };
-
-    if port_is_reserved(&RESERVED_V4, port) {
-        bitmap_set_bit(map, slot, mask);
-        return false;
-    }
-    if INBOUND_BINDINGS_V4
-        .insert(&port, in_val, BPF_NOEXIST)
-        .is_ok()
-    {
-        bitmap_set_bit(map, slot, mask);
-        true
-    } else {
-        // EEXIST: already active in inbound table. Repair bitmap to occupied.
-        bitmap_set_bit(map, slot, mask);
-        false
-    }
-}
-
-#[inline(always)]
-pub fn claim_port_v6(port: u16, in_val: &BindingValue6) -> bool {
-    let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
-    let map = if is_even {
-        &BITMAP_EVEN_V6
-    } else {
-        &BITMAP_ODD_V6
-    };
-
-    if port_is_reserved(&RESERVED_V6, port) {
-        bitmap_set_bit(map, slot, mask);
-        return false;
-    }
-    if INBOUND_BINDINGS_V6
-        .insert(&port, in_val, BPF_NOEXIST)
-        .is_ok()
-    {
-        bitmap_set_bit(map, slot, mask);
-        true
-    } else {
-        // EEXIST: already active in inbound table. Repair bitmap to occupied.
-        bitmap_set_bit(map, slot, mask);
-        false
-    }
-}
-
-#[inline(always)]
 pub fn release_port_v4(port: u16) {
     let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
     let map = if is_even {
@@ -324,7 +272,7 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
                         }
                         return Some(port);
                     }
-                    // Out-of-bounds, reserved, or EEXIST collision: self-heal dirty bit in-place.
+                    // Mark occupied on collision or invalid range.
                     unsafe {
                         core::arch::asm!(
                             "lock *(u64 *)({p} + 0) |= {mask}",
@@ -370,7 +318,7 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
                         }
                         return Some(port);
                     }
-                    // Out-of-bounds, reserved, or EEXIST collision: self-heal dirty bit in-place.
+                    // Mark occupied on collision or invalid range.
                     unsafe {
                         core::arch::asm!(
                             "lock *(u64 *)({p} + 0) |= {mask}",
@@ -461,7 +409,7 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
                         }
                         return Some(port);
                     }
-                    // Out-of-bounds, reserved, or EEXIST collision: self-heal dirty bit in-place.
+                    // Mark occupied on collision or invalid range.
                     unsafe {
                         core::arch::asm!(
                             "lock *(u64 *)({p} + 0) |= {mask}",
@@ -507,7 +455,7 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
                         }
                         return Some(port);
                     }
-                    // Out-of-bounds, reserved, or EEXIST collision: self-heal dirty bit in-place.
+                    // Mark occupied on collision or invalid range.
                     unsafe {
                         core::arch::asm!(
                             "lock *(u64 *)({p} + 0) |= {mask}",

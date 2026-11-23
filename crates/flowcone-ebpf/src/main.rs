@@ -138,8 +138,8 @@ pub static RESERVED_V6: Array<u8> = Array::with_max_entries(PORT_STATE_ENTRIES, 
 
 const BPF_F_MMAPABLE: u32 = 0x400;
 
-/// Lock-free port allocation parity bitmaps (512 * 64 = 32768 ports per parity).
-/// BPF_F_MMAPABLE (0x400) enables lock-free atomic bit operations from userspace via mmap.
+/// Port allocation parity bitmaps (512 * 64 = 32768 ports per parity).
+/// BPF_F_MMAPABLE enables userspace atomic operations via mmap.
 #[map]
 pub static BITMAP_EVEN_V4: Array<u64> = Array::with_max_entries(PORT_BITMAP_SLOTS, BPF_F_MMAPABLE);
 
@@ -1172,7 +1172,7 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
     TC_ACT_UNSPEC
 }
 
-/// TCX dispatchers for zero-gap atomic reload.
+/// TCX dispatchers for atomic reload.
 #[classifier]
 pub fn flowcone_tcx_ingress_a(ctx: TcContext) -> i32 {
     unsafe {

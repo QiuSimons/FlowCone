@@ -8,11 +8,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Mmap-backed atomic bitmap for hardware-level lock-free bit manipulation.
-///
-/// BPF Array maps created with `BPF_F_MMAPABLE` are directly mapped into userspace
-/// virtual memory, allowing single-instruction hardware atomic bit operations
-/// (`fetch_and`, `fetch_or`) that share the exact cacheline with eBPF kernel code.
+/// Userspace atomic view of a BPF_F_MMAPABLE array map.
 pub struct AtomicBitmap {
     mmap_ptr: *mut AtomicU64,
     len: usize,
@@ -185,9 +181,7 @@ pub fn scan_local_udp_ports(family: u8, procfs_path: &str) -> Option<Vec<u16>> {
     Some(ports)
 }
 
-/// Parse local UDP ports from /proc/net/udp[6]. Both state 07 (unconnected /
-/// listening) and state 01 (connected client sockets) are reserved to prevent
-/// incoming responses to router services from being hijacked by TCX DNAT.
+/// Extracts local UDP ports in listening (07) and connected (01) states from procfs.
 fn parse_proc_udp_ports(text: &str) -> Vec<u16> {
     let mut out = Vec::new();
     for line in text.lines().skip(1) {
@@ -370,7 +364,7 @@ impl ConeBinding for BindingValue6 {
     }
 }
 
-/// Full-table reconciliation after a lost queue notification.
+/// Reconciles bindings and sweeps expired entries when ring buffer overflows.
 fn sweep_family<V: ConeBinding>(
     ob_map: &mut HashMap<MapData, V::Key, V>,
     ib_map: &mut HashMap<MapData, u16, V>,
@@ -404,6 +398,18 @@ fn sweep_family<V: ConeBinding>(
     for &(key, port_host) in expired_buf.iter() {
         // Revalidate against datapath refresh.
         if let Ok(cur_val) = ob_map.get(&key, 0) {
+            if u16::from_be(cur_val.port_be()) != port_host {
+                if ib_map
+                    .get(&port_host, 0)
+                    .map(|iv| iv.matches_key(&key))
+                    .unwrap_or(false)
+                    && ib_map.remove(&port_host).is_ok()
+                {
+                    freed_ports.push(port_host);
+                    swept += 1;
+                }
+                continue;
+            }
             let item_timeout = if cur_val.is_short_lived() {
                 flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
             } else {
@@ -598,8 +604,12 @@ impl SessionManager {
             map.fetch_or(slot, mask, Ordering::Relaxed);
             if let Ok(in_val) = ib_map.get(port, 0) {
                 let ep_key = in_val.make_key();
-                let _ = ob_map.remove(&ep_key);
                 let _ = ib_map.remove(port);
+                if let Ok(ob_val) = ob_map.get(&ep_key, 0) {
+                    if u16::from_be(ob_val.port_be()) == *port {
+                        let _ = ob_map.remove(&ep_key);
+                    }
+                }
             }
         }
         for port in &removed {
@@ -607,8 +617,12 @@ impl SessionManager {
             if *port >= pool.min_port && *port <= pool.max_port {
                 if let Ok(in_val) = ib_map.get(port, 0) {
                     let ep_key = in_val.make_key();
-                    let _ = ob_map.remove(&ep_key);
                     let _ = ib_map.remove(port);
+                    if let Ok(ob_val) = ob_map.get(&ep_key, 0) {
+                        if u16::from_be(ob_val.port_be()) == *port {
+                            let _ = ob_map.remove(&ep_key);
+                        }
+                    }
                 }
                 Self::release_family_port(*port, pool);
             }
@@ -790,7 +804,16 @@ impl SessionManager {
             }
         }
 
-        // Atomically prune only orphan occupied bits without touching active or concurrent allocations.
+        for port in pool.reserved_ports {
+            let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(*port);
+            let map = if is_even {
+                &mut *pool.bitmap_even
+            } else {
+                &mut *pool.bitmap_odd
+            };
+            map.fetch_or(slot, mask, Ordering::Relaxed);
+        }
+
         for parity in [true, false] {
             let map = if parity {
                 &mut *pool.bitmap_even
@@ -812,8 +835,6 @@ impl SessionManager {
                             && pool.reserved_ports.binary_search(&port).is_err()
                             && !active_ports.contains(&port)
                         {
-                            // Real-time double-check against ib_map: protect connections established
-                            // concurrently after active_ports snapshot was taken!
                             if ib_map.get(&port, 0).is_err() {
                                 orphan_mask |= mask;
                             }
@@ -936,6 +957,7 @@ impl SessionManager {
 
     pub fn drain_events(&mut self, now: u32, timeout: u32) -> usize {
         let mut drained = 0;
+        let mut need_rebuild = false;
         if self.pool_enable_v4 {
             while drained < GC_QUEUE_DRAIN_MAX {
                 let ev = if let Some(item) = self.events4.next() {
@@ -958,6 +980,8 @@ impl SessionManager {
                             timeout
                         };
                         self.schedule4(now.saturating_add(ev_timeout), ev.key, ev.port);
+                    } else {
+                        need_rebuild = true;
                     }
                 }
             }
@@ -985,9 +1009,14 @@ impl SessionManager {
                             timeout
                         };
                         self.schedule6(now.saturating_add(ev_timeout), ev.key, ev.port);
+                    } else {
+                        need_rebuild = true;
                     }
                 }
             }
+        }
+        if need_rebuild {
+            self.rebuild_port_queues();
         }
         drained
     }
