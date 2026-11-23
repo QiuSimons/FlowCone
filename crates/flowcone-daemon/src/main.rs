@@ -226,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bitmap_even6: take_map!(bpf, "BITMAP_EVEN_V6", Array<MapData, u64>),
         bitmap_odd6: take_map!(bpf, "BITMAP_ODD_V6", Array<MapData, u64>),
         port_flags: take_map!(bpf, "PORT_FLAGS", Array<MapData, u32>),
-    });
+    })?;
 
     session_mgr.configure_port_pool(config.min_port, config.max_port);
     session_mgr.init_port_pool(config.enable_v4, config.enable_v6);

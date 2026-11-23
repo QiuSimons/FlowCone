@@ -16,14 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct AtomicBitmap {
     mmap_ptr: *mut AtomicU64,
     len: usize,
-    array: Array<MapData, u64>,
+    _array: Array<MapData, u64>,
 }
 
 unsafe impl Send for AtomicBitmap {}
 unsafe impl Sync for AtomicBitmap {}
 
 impl AtomicBitmap {
-    pub fn new(array: Array<MapData, u64>) -> Self {
+    pub fn new(array: Array<MapData, u64>) -> Result<Self, String> {
         use aya::maps::IterableMap;
         use std::os::fd::AsFd;
         let len = flowcone_common::PORT_BITMAP_SLOTS as usize;
@@ -31,94 +31,65 @@ impl AtomicBitmap {
         let map_data = array.map();
         let map_fd = map_data.fd();
         let mmap_ptr = unsafe {
-            match rustix::mm::mmap(
+            rustix::mm::mmap(
                 std::ptr::null_mut(),
                 byte_len,
                 ProtFlags::READ | ProtFlags::WRITE,
                 MapFlags::SHARED,
                 map_fd.as_fd(),
                 0,
-            ) {
-                Ok(ptr) => ptr as *mut AtomicU64,
-                Err(e) => {
-                    eprintln!(
-                        "flowcone: warning: failed to mmap BPF bitmap ({:?}), falling back to syscalls",
-                        e
-                    );
-                    std::ptr::null_mut()
-                }
-            }
+            )
+            .map_err(|e| format!("failed to mmap BPF bitmap: {e:?}"))? as *mut AtomicU64
         };
-        Self {
+        Ok(Self {
             mmap_ptr,
             len,
-            array,
+            _array: array,
+        })
+    }
+
+    #[inline(always)]
+    pub fn fetch_and(&self, slot: u32, mask: u64, order: Ordering) -> u64 {
+        debug_assert!((slot as usize) < self.len);
+        unsafe {
+            let elem = &*self.mmap_ptr.add(slot as usize);
+            elem.fetch_and(mask, order)
         }
     }
 
     #[inline(always)]
-    pub fn fetch_and(&mut self, slot: u32, mask: u64, order: Ordering) -> u64 {
-        if !self.mmap_ptr.is_null() && (slot as usize) < self.len {
-            unsafe {
-                let elem = &*self.mmap_ptr.add(slot as usize);
-                elem.fetch_and(mask, order)
-            }
-        } else if let Ok(val) = self.array.get(&slot, 0) {
-            let _ = self.array.set(slot, &(val & mask), 0);
-            val
-        } else {
-            0
+    pub fn fetch_or(&self, slot: u32, mask: u64, order: Ordering) -> u64 {
+        debug_assert!((slot as usize) < self.len);
+        unsafe {
+            let elem = &*self.mmap_ptr.add(slot as usize);
+            elem.fetch_or(mask, order)
         }
     }
 
     #[inline(always)]
-    pub fn fetch_or(&mut self, slot: u32, mask: u64, order: Ordering) -> u64 {
-        if !self.mmap_ptr.is_null() && (slot as usize) < self.len {
-            unsafe {
-                let elem = &*self.mmap_ptr.add(slot as usize);
-                elem.fetch_or(mask, order)
-            }
-        } else if let Ok(val) = self.array.get(&slot, 0) {
-            let _ = self.array.set(slot, &(val | mask), 0);
-            val
-        } else {
-            0
+    pub fn store(&self, slot: u32, val: u64, order: Ordering) {
+        debug_assert!((slot as usize) < self.len);
+        unsafe {
+            let elem = &*self.mmap_ptr.add(slot as usize);
+            elem.store(val, order);
         }
     }
 
     #[inline(always)]
-    pub fn store(&mut self, slot: u32, val: u64, order: Ordering) {
-        if !self.mmap_ptr.is_null() && (slot as usize) < self.len {
-            unsafe {
-                let elem = &*self.mmap_ptr.add(slot as usize);
-                elem.store(val, order);
-            }
-        } else {
-            let _ = self.array.set(slot, &val, 0);
-        }
-    }
-
-    #[inline(always)]
-    #[allow(dead_code)]
     pub fn load(&self, slot: u32, order: Ordering) -> u64 {
-        if !self.mmap_ptr.is_null() && (slot as usize) < self.len {
-            unsafe {
-                let elem = &*self.mmap_ptr.add(slot as usize);
-                elem.load(order)
-            }
-        } else {
-            self.array.get(&slot, 0).unwrap_or(0)
+        debug_assert!((slot as usize) < self.len);
+        unsafe {
+            let elem = &*self.mmap_ptr.add(slot as usize);
+            elem.load(order)
         }
     }
 }
 
 impl Drop for AtomicBitmap {
     fn drop(&mut self) {
-        if !self.mmap_ptr.is_null() {
-            let byte_len = self.len * std::mem::size_of::<u64>();
-            unsafe {
-                let _ = rustix::mm::munmap(self.mmap_ptr as *mut _, byte_len);
-            }
+        let byte_len = self.len * std::mem::size_of::<u64>();
+        unsafe {
+            let _ = rustix::mm::munmap(self.mmap_ptr as *mut _, byte_len);
         }
     }
 }
@@ -532,7 +503,7 @@ struct FamilyPortPool<'a> {
 }
 
 impl SessionManager {
-    pub fn new(maps: SessionMaps) -> Self {
+    pub fn new(maps: SessionMaps) -> Result<Self, String> {
         let SessionMaps {
             config_map,
             active_map,
@@ -555,7 +526,7 @@ impl SessionManager {
             bitmap_odd6,
             port_flags,
         } = maps;
-        Self {
+        Ok(Self {
             config_map,
             active_map,
             ob_map4,
@@ -571,10 +542,10 @@ impl SessionManager {
             gc_flags,
             reserved4,
             reserved6,
-            bitmap_even4: AtomicBitmap::new(bitmap_even4),
-            bitmap_odd4: AtomicBitmap::new(bitmap_odd4),
-            bitmap_even6: AtomicBitmap::new(bitmap_even6),
-            bitmap_odd6: AtomicBitmap::new(bitmap_odd6),
+            bitmap_even4: AtomicBitmap::new(bitmap_even4)?,
+            bitmap_odd4: AtomicBitmap::new(bitmap_odd4)?,
+            bitmap_even6: AtomicBitmap::new(bitmap_even6)?,
+            bitmap_odd6: AtomicBitmap::new(bitmap_odd6)?,
             port_flags,
             pool_enable_v4: false,
             pool_enable_v6: false,
@@ -589,7 +560,7 @@ impl SessionManager {
             reserved4_ports: Vec::new(),
             reserved6_ports: Vec::new(),
             lost_notifications: false,
-        }
+        })
     }
 
     pub fn configure_port_pool(&mut self, min_port: u16, max_port: u16) {
@@ -771,10 +742,12 @@ impl SessionManager {
         Self::release_family_port(port, &mut pool);
     }
 
-    fn rebuild_family_ports(ib_keys: impl Iterator<Item = u16>, pool: &mut FamilyPortPool<'_>) {
-        Self::init_family_pool(pool);
+    fn reconcile_family_ports(ib_keys: impl Iterator<Item = u16>, pool: &mut FamilyPortPool<'_>) {
+        use std::collections::HashSet;
+        let mut active_ports = HashSet::new();
         for key in ib_keys {
             if key >= pool.min_port && key <= pool.max_port {
+                active_ports.insert(key);
                 let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(key);
                 let map = if is_even {
                     &mut *pool.bitmap_even
@@ -782,6 +755,38 @@ impl SessionManager {
                     &mut *pool.bitmap_odd
                 };
                 map.fetch_or(slot, mask, Ordering::Relaxed);
+            }
+        }
+
+        // Atomically prune only orphan occupied bits without touching active or concurrent allocations.
+        for parity in [true, false] {
+            let map = if parity {
+                &mut *pool.bitmap_even
+            } else {
+                &mut *pool.bitmap_odd
+            };
+            for slot in 0..flowcone_common::PORT_BITMAP_SLOTS {
+                let cur = map.load(slot, Ordering::Relaxed);
+                if cur == 0 {
+                    continue;
+                }
+                let mut orphan_mask = 0u64;
+                for bit in 0..64 {
+                    let mask = 1u64 << bit;
+                    if (cur & mask) != 0 {
+                        let port = flowcone_common::bitmap_coords_to_port(parity, slot, bit);
+                        if port >= pool.min_port
+                            && port <= pool.max_port
+                            && pool.reserved_ports.binary_search(&port).is_err()
+                            && !active_ports.contains(&port)
+                        {
+                            orphan_mask |= mask;
+                        }
+                    }
+                }
+                if orphan_mask != 0 {
+                    map.fetch_and(slot, !orphan_mask, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -797,7 +802,7 @@ impl SessionManager {
             bitmap_odd: &mut self.bitmap_odd4,
             reserved_ports: &self.reserved4_ports,
         };
-        Self::rebuild_family_ports(self.ib_map4.keys().flatten(), &mut pool);
+        Self::reconcile_family_ports(self.ib_map4.keys().flatten(), &mut pool);
     }
 
     fn rebuild_family6(&mut self) {
@@ -811,7 +816,7 @@ impl SessionManager {
             bitmap_odd: &mut self.bitmap_odd6,
             reserved_ports: &self.reserved6_ports,
         };
-        Self::rebuild_family_ports(self.ib_map6.keys().flatten(), &mut pool);
+        Self::reconcile_family_ports(self.ib_map6.keys().flatten(), &mut pool);
     }
 
     fn rebuild_port_queues(&mut self) {
