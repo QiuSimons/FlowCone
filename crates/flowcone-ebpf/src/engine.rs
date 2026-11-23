@@ -232,9 +232,8 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
         {
             bitmap_set_bit(map, slot, mask);
             return Some(pref);
-        } else {
-            bitmap_set_bit(map, slot, mask);
         }
+        bitmap_set_bit(map, slot, mask);
     }
 
     let pref_even = (pref & 1) == 0;
@@ -369,9 +368,8 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
         {
             bitmap_set_bit(map, slot, mask);
             return Some(pref);
-        } else {
-            bitmap_set_bit(map, slot, mask);
         }
+        bitmap_set_bit(map, slot, mask);
     }
 
     let pref_even = (pref & 1) == 0;

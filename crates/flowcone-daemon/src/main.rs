@@ -310,16 +310,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tv_nsec: next_wake.subsec_nanos() as i64,
         };
 
-        let mut poll_fds = Vec::with_capacity(5);
-        poll_fds.push(PollFd::new(&sig_read_end, PollFlags::IN));
-        poll_fds.push(PollFd::new(&wake_read_end, PollFlags::IN));
-        poll_fds.push(PollFd::new(&ev4_fd, PollFlags::IN));
-        poll_fds.push(PollFd::new(&ev6_fd, PollFlags::IN));
-        if let Some(ref m) = monitor {
-            poll_fds.push(PollFd::new(m, PollFlags::IN));
-        }
+        use std::os::fd::AsFd;
+        let mon_borrowed = monitor
+            .as_ref()
+            .map(|m| m.as_fd())
+            .unwrap_or(sig_read_end.as_fd());
+        let mut poll_fds = [
+            PollFd::new(&sig_read_end, PollFlags::IN),
+            PollFd::new(&wake_read_end, PollFlags::IN),
+            PollFd::new(&ev4_fd, PollFlags::IN),
+            PollFd::new(&ev6_fd, PollFlags::IN),
+            PollFd::new(
+                &mon_borrowed,
+                if monitor.is_some() {
+                    PollFlags::IN
+                } else {
+                    PollFlags::empty()
+                },
+            ),
+        ];
+        let poll_slice = if monitor.is_some() {
+            &mut poll_fds[..5]
+        } else {
+            &mut poll_fds[..4]
+        };
 
-        match poll(&mut poll_fds, Some(&ts)) {
+        match poll(poll_slice, Some(&ts)) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => {
                 if !RUNNING.load(Ordering::SeqCst) {
@@ -346,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             has_net_event = true;
         }
 
-        if poll_fds.len() > 4 && poll_fds[4].revents().contains(PollFlags::IN) {
+        if monitor.is_some() && poll_fds[4].revents().contains(PollFlags::IN) {
             if let Some(ref m) = monitor {
                 m.drain();
             }
