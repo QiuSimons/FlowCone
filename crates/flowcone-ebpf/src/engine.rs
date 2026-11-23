@@ -469,7 +469,12 @@ pub fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
                 let cur_port = u16::from_be((*val).port);
                 if port_is_reserved(&RESERVED_V4, cur_port) {
                     let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
-                    let _ = INBOUND_BINDINGS_V4.remove(&cur_port);
+                    if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&cur_port)
+                        && (*in_val).ip == src_ip
+                        && (*in_val).port == src_port
+                    {
+                        let _ = INBOUND_BINDINGS_V4.remove(&cur_port);
+                    }
                 } else {
                     if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
                         (*val).last_seen = now;
@@ -550,7 +555,12 @@ pub fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
                 let cur_port = u16::from_be((*val).port);
                 if port_is_reserved(&RESERVED_V6, cur_port) {
                     let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
-                    let _ = INBOUND_BINDINGS_V6.remove(&cur_port);
+                    if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&cur_port)
+                        && ipv6_eq(&(*in_val).ip, &src_ip)
+                        && (*in_val).port == src_port
+                    {
+                        let _ = INBOUND_BINDINGS_V6.remove(&cur_port);
+                    }
                 } else {
                     if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
                         (*val).last_seen = now;
