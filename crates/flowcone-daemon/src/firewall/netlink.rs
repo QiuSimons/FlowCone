@@ -320,8 +320,7 @@ pub(crate) fn refresh_liveness_netlink(
 
 fn send_liveness_batch(batch_bytes: &[u8]) -> Result<(), &'static str> {
     let proto = Protocol::from_raw(
-        std::num::NonZeroU32::new(NETLINK_NETFILTER)
-            .ok_or("invalid netlink netfilter proto")?,
+        std::num::NonZeroU32::new(NETLINK_NETFILTER).ok_or("invalid netlink netfilter proto")?,
     );
     let sock = socket_with(
         AddressFamily::NETLINK,
@@ -343,8 +342,8 @@ fn send_liveness_batch(batch_bytes: &[u8]) -> Result<(), &'static str> {
     send(&sock, batch_bytes, SendFlags::empty()).map_err(|_| "netlink send error")?;
 
     let mut reply_buf = [0u8; 1024];
-    let (n, _) = recv(&sock, &mut reply_buf, RecvFlags::empty())
-        .map_err(|_| "netlink recv error")?;
+    let (n, _) =
+        recv(&sock, &mut reply_buf, RecvFlags::empty()).map_err(|_| "netlink recv error")?;
 
     if n < 20 {
         return Err("netlink reply too short");

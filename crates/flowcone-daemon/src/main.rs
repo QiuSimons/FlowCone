@@ -17,8 +17,8 @@ use session::{SessionManager, SessionMaps};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
@@ -149,7 +149,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("flowcone: interface {} is now ready", config.iface);
                 break;
             }
-            if matches!(poll(&mut wait_fds, Some(&wait_ts)), Ok(n) if n > 0 && wait_fds[0].revents().contains(PollFlags::IN)) {
+            if matches!(poll(&mut wait_fds, Some(&wait_ts)), Ok(n) if n > 0 && wait_fds[0].revents().contains(PollFlags::IN))
+            {
                 break;
             }
         }
@@ -594,6 +595,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         enabled_v6: effective_v6,
                         flowcone_mark: config.flowcone_mark,
                         frag_epoch,
+                        timeout_sec: config.timeout_sec as u32,
                     };
                     let had_flush = flush_v4 || flush_v6;
                     let set_ok = if had_flush {

@@ -189,6 +189,7 @@ pub struct GlobalConfig {
     pub enabled_v6: u32,
     pub flowcone_mark: u32,
     pub frag_epoch: u32,
+    pub timeout_sec: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -686,7 +687,7 @@ mod tests {
 
     #[test]
     fn test_global_config_layout() {
-        assert_eq!(core::mem::size_of::<GlobalConfig>(), 56);
+        assert_eq!(core::mem::size_of::<GlobalConfig>(), 60);
         assert_eq!(core::mem::align_of::<GlobalConfig>(), 4);
     }
 

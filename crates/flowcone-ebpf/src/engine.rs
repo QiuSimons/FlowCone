@@ -555,11 +555,24 @@ pub fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
         unsafe {
             if (*val).ip == cfg.wan_ip4 {
                 let cur_port = u16::from_be((*val).port);
+                let diff = now.wrapping_sub((*val).last_seen);
+                let item_timeout = if (*val)._pad & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0 {
+                    flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                } else {
+                    cfg.timeout_sec
+                };
                 if port_is_reserved(&RESERVED_V4, cur_port) {
                     let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
                     let _ = INBOUND_BINDINGS_V4.remove(&cur_port);
+                    if !port_is_reserved(&RESERVED_V4, cur_port) {
+                        release_port_v4(cur_port);
+                    }
+                } else if diff > item_timeout {
+                    let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
+                    let _ = INBOUND_BINDINGS_V4.remove(&cur_port);
+                    release_port_v4(cur_port);
                 } else {
-                    if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
+                    if diff >= LAST_SEEN_INTERVAL_SEC {
                         (*val).last_seen = now;
                     }
                     if !is_short_lived
@@ -636,11 +649,24 @@ pub fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
         unsafe {
             if ipv6_eq(&(*val).ip, &cfg.wan_ip6) {
                 let cur_port = u16::from_be((*val).port);
+                let diff = now.wrapping_sub((*val).last_seen);
+                let item_timeout = if (*val)._pad[0] & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0 {
+                    flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+                } else {
+                    cfg.timeout_sec
+                };
                 if port_is_reserved(&RESERVED_V6, cur_port) {
                     let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
                     let _ = INBOUND_BINDINGS_V6.remove(&cur_port);
+                    if !port_is_reserved(&RESERVED_V6, cur_port) {
+                        release_port_v6(cur_port);
+                    }
+                } else if diff > item_timeout {
+                    let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
+                    let _ = INBOUND_BINDINGS_V6.remove(&cur_port);
+                    release_port_v6(cur_port);
                 } else {
-                    if now.wrapping_sub((*val).last_seen) >= LAST_SEEN_INTERVAL_SEC {
+                    if diff >= LAST_SEEN_INTERVAL_SEC {
                         (*val).last_seen = now;
                     }
                     if !is_short_lived

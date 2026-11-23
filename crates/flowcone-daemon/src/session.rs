@@ -579,6 +579,7 @@ impl SessionManager {
         reserved_ports: &mut Vec<u16>,
         current: &[u16],
         reserved_map: &mut Array<MapData, u8>,
+        ob_map: &mut HashMap<MapData, V::Key, V>,
         ib_map: &mut HashMap<MapData, u16, V>,
         pool: &mut FamilyPortPool<'_>,
     ) {
@@ -586,20 +587,30 @@ impl SessionManager {
         if added.is_empty() && removed.is_empty() {
             return;
         }
-        for port in added {
-            let _ = reserved_map.set(port as u32, &1, 0);
-            let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
+        for port in &added {
+            let _ = reserved_map.set(*port as u32, &1, 0);
+            let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(*port);
             let map = if is_even {
                 &mut *pool.bitmap_even
             } else {
                 &mut *pool.bitmap_odd
             };
             map.fetch_or(slot, mask, Ordering::Relaxed);
+            if let Ok(in_val) = ib_map.get(port, 0) {
+                let ep_key = in_val.make_key();
+                let _ = ob_map.remove(&ep_key);
+                let _ = ib_map.remove(port);
+            }
         }
-        for port in removed {
-            let _ = reserved_map.set(port as u32, &0, 0);
-            if port >= pool.min_port && port <= pool.max_port && ib_map.get(&port, 0).is_err() {
-                Self::release_family_port(port, pool);
+        for port in &removed {
+            let _ = reserved_map.set(*port as u32, &0, 0);
+            if *port >= pool.min_port && *port <= pool.max_port {
+                if let Ok(in_val) = ib_map.get(port, 0) {
+                    let ep_key = in_val.make_key();
+                    let _ = ob_map.remove(&ep_key);
+                    let _ = ib_map.remove(port);
+                }
+                Self::release_family_port(*port, pool);
             }
         }
         *reserved_ports = current.to_vec();
@@ -607,37 +618,55 @@ impl SessionManager {
 
     /// Applies updated local listening UDP ports to reserved maps.
     pub fn apply_reserved_ports(&mut self, ports4: Option<&[u16]>, ports6: Option<&[u16]>) {
+        let mut dirty4 = false;
+        let mut dirty6 = false;
         if let Some(ports) = ports4 {
-            let mut pool = FamilyPortPool {
-                min_port: self.min_port,
-                max_port: self.max_port,
-                bitmap_even: &mut self.bitmap_even4,
-                bitmap_odd: &mut self.bitmap_odd4,
-                reserved_ports: ports,
-            };
-            Self::sync_family_reserved(
-                &mut self.reserved4_ports,
-                ports,
-                &mut self.reserved4,
-                &mut self.ib_map4,
-                &mut pool,
-            );
+            let (added, removed) = reserved_delta(&self.reserved4_ports, ports);
+            if !added.is_empty() || !removed.is_empty() {
+                dirty4 = true;
+                let mut pool = FamilyPortPool {
+                    min_port: self.min_port,
+                    max_port: self.max_port,
+                    bitmap_even: &mut self.bitmap_even4,
+                    bitmap_odd: &mut self.bitmap_odd4,
+                    reserved_ports: ports,
+                };
+                Self::sync_family_reserved(
+                    &mut self.reserved4_ports,
+                    ports,
+                    &mut self.reserved4,
+                    &mut self.ob_map4,
+                    &mut self.ib_map4,
+                    &mut pool,
+                );
+            }
         }
         if let Some(ports) = ports6 {
-            let mut pool = FamilyPortPool {
-                min_port: self.min_port,
-                max_port: self.max_port,
-                bitmap_even: &mut self.bitmap_even6,
-                bitmap_odd: &mut self.bitmap_odd6,
-                reserved_ports: ports,
-            };
-            Self::sync_family_reserved(
-                &mut self.reserved6_ports,
-                ports,
-                &mut self.reserved6,
-                &mut self.ib_map6,
-                &mut pool,
-            );
+            let (added, removed) = reserved_delta(&self.reserved6_ports, ports);
+            if !added.is_empty() || !removed.is_empty() {
+                dirty6 = true;
+                let mut pool = FamilyPortPool {
+                    min_port: self.min_port,
+                    max_port: self.max_port,
+                    bitmap_even: &mut self.bitmap_even6,
+                    bitmap_odd: &mut self.bitmap_odd6,
+                    reserved_ports: ports,
+                };
+                Self::sync_family_reserved(
+                    &mut self.reserved6_ports,
+                    ports,
+                    &mut self.reserved6,
+                    &mut self.ob_map6,
+                    &mut self.ib_map6,
+                    &mut pool,
+                );
+            }
+        }
+        if dirty4 {
+            self.rebuild_family4();
+        }
+        if dirty6 {
+            self.rebuild_family6();
         }
     }
 
@@ -742,10 +771,13 @@ impl SessionManager {
         Self::release_family_port(port, &mut pool);
     }
 
-    fn reconcile_family_ports(ib_keys: impl Iterator<Item = u16>, pool: &mut FamilyPortPool<'_>) {
+    fn reconcile_family_ports<V: ConeBinding>(
+        ib_map: &HashMap<MapData, u16, V>,
+        pool: &mut FamilyPortPool<'_>,
+    ) {
         use std::collections::HashSet;
         let mut active_ports = HashSet::new();
-        for key in ib_keys {
+        for key in ib_map.keys().flatten() {
             if key >= pool.min_port && key <= pool.max_port {
                 active_ports.insert(key);
                 let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(key);
@@ -780,7 +812,11 @@ impl SessionManager {
                             && pool.reserved_ports.binary_search(&port).is_err()
                             && !active_ports.contains(&port)
                         {
-                            orphan_mask |= mask;
+                            // Real-time double-check against ib_map: protect connections established
+                            // concurrently after active_ports snapshot was taken!
+                            if ib_map.get(&port, 0).is_err() {
+                                orphan_mask |= mask;
+                            }
                         }
                     }
                 }
@@ -802,7 +838,7 @@ impl SessionManager {
             bitmap_odd: &mut self.bitmap_odd4,
             reserved_ports: &self.reserved4_ports,
         };
-        Self::reconcile_family_ports(self.ib_map4.keys().flatten(), &mut pool);
+        Self::reconcile_family_ports(&self.ib_map4, &mut pool);
     }
 
     fn rebuild_family6(&mut self) {
@@ -816,7 +852,7 @@ impl SessionManager {
             bitmap_odd: &mut self.bitmap_odd6,
             reserved_ports: &self.reserved6_ports,
         };
-        Self::reconcile_family_ports(self.ib_map6.keys().flatten(), &mut pool);
+        Self::reconcile_family_ports(&self.ib_map6, &mut pool);
     }
 
     fn rebuild_port_queues(&mut self) {
@@ -1309,6 +1345,12 @@ impl SessionManager {
                 self.freed_ports.clear();
             }
             self.rebuild_heaps(timeout);
+            if self.pool_enable_v4 {
+                self.rebuild_family4();
+            }
+            if self.pool_enable_v6 {
+                self.rebuild_family6();
+            }
         }
 
         self.rebuild_port_queues();
@@ -1334,6 +1376,7 @@ impl SessionManager {
             enabled_v6: 0,
             flowcone_mark: 0,
             frag_epoch: 0,
+            timeout_sec: 0,
         };
         let _ = self.set_config(empty_cfg);
     }

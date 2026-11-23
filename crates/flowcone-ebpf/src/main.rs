@@ -227,11 +227,20 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         }
 
         if let Some(target) = INBOUND_BINDINGS_V4.get_ptr_mut(&ext_port) {
+            let now = now_sec();
+            let diff = now.wrapping_sub(unsafe { (*target).last_seen });
+            let item_timeout = if unsafe { (*target)._pad } & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0 {
+                flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+            } else {
+                cfg.timeout_sec
+            };
+            if diff > item_timeout {
+                return TC_ACT_UNSPEC;
+            }
             let new_dst_ip = unsafe { (*target).ip };
             let new_dst_port = unsafe { (*target).port };
-            let now = now_sec();
             unsafe {
-                if now.wrapping_sub((*target).last_seen) >= LAST_SEEN_INTERVAL_SEC {
+                if diff >= LAST_SEEN_INTERVAL_SEC {
                     (*target).last_seen = now;
                 }
             }
@@ -315,11 +324,20 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
         }
 
         if let Some(target) = INBOUND_BINDINGS_V6.get_ptr_mut(&ext_port) {
+            let now = now_sec();
+            let diff = now.wrapping_sub(unsafe { (*target).last_seen });
+            let item_timeout = if unsafe { (*target)._pad[0] } & flowcone_common::BINDING_FLAG_SHORT_LIVED != 0 {
+                flowcone_common::DEFAULT_SHORT_LIVED_TIMEOUT_SEC
+            } else {
+                cfg.timeout_sec
+            };
+            if diff > item_timeout {
+                return TC_ACT_UNSPEC;
+            }
             let new_dst_ip = unsafe { (*target).ip };
             let new_dst_port = unsafe { (*target).port };
-            let now = now_sec();
             unsafe {
-                if now.wrapping_sub((*target).last_seen) >= LAST_SEEN_INTERVAL_SEC {
+                if diff >= LAST_SEEN_INTERVAL_SEC {
                     (*target).last_seen = now;
                 }
             }
