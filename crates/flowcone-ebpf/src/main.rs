@@ -333,14 +333,13 @@ pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
                     }
                     return TC_ACT_UNSPEC;
                 }
-                Ipv6L4::NonUdp | Ipv6L4::Unsupported => {
-                    if locate_ipv6_nexthdr(data_end, ip_off, nh, IPPROTO_ICMPV6).is_some() {
-                        unsafe {
-                            ICMP6_TARGET.tail_call(&ctx, 0);
-                        }
+                Ipv6L4::Icmp6(_) => {
+                    unsafe {
+                        ICMP6_TARGET.tail_call(&ctx, 0);
                     }
                     return TC_ACT_UNSPEC;
                 }
+                Ipv6L4::NonUdp | Ipv6L4::Unsupported => return TC_ACT_UNSPEC,
             }
         };
 
@@ -530,15 +529,13 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
             match locate_ipv6_l4(data_end, ip_off, iph.next_hdr) {
                 Ipv6L4::Udp(off) => (off, false),
                 Ipv6L4::Fragment => (0, true),
-                Ipv6L4::NonUdp => {
-                    if locate_ipv6_nexthdr(data_end, ip_off, iph.next_hdr, IPPROTO_ICMPV6).is_some()
-                    {
-                        unsafe {
-                            ICMP6_TARGET.tail_call(&ctx, 1);
-                        }
+                Ipv6L4::Icmp6(_) => {
+                    unsafe {
+                        ICMP6_TARGET.tail_call(&ctx, 1);
                     }
                     return TC_ACT_UNSPEC;
                 }
+                Ipv6L4::NonUdp => return TC_ACT_UNSPEC,
                 Ipv6L4::Unsupported => return TC_ACT_SHOT,
             }
         };
@@ -1162,7 +1159,6 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
     if tot_len < ihl + 8 + 28 || icmp_off + 36 > data_end {
         return TC_ACT_UNSPEC;
     }
-    let icmp_len = tot_len.saturating_sub(ihl);
     let Some(icmph) = (unsafe { parse_header_ref_mut::<[u8; 8]>(icmp_off, data_end) }) else {
         return TC_ACT_UNSPEC;
     };
@@ -1182,7 +1178,7 @@ pub fn flowcone_icmp_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let emb_udp = emb_off + emb_ihl;
-    if emb_udp + mem::size_of::<UdpHdr>() > icmp_off + icmp_len
+    if ihl + 8 + emb_ihl + mem::size_of::<UdpHdr>() > tot_len
         || emb_udp + mem::size_of::<UdpHdr>() > data_end
     {
         return TC_ACT_UNSPEC;
@@ -1345,7 +1341,6 @@ pub fn flowcone_icmp_egress_target(ctx: TcContext) -> i32 {
     if tot_len < ihl + 8 + 28 || icmp_off + 36 > data_end {
         return TC_ACT_UNSPEC;
     }
-    let icmp_len = tot_len.saturating_sub(ihl);
     let Some(icmph) = (unsafe { parse_header_ref_mut::<[u8; 8]>(icmp_off, data_end) }) else {
         return TC_ACT_UNSPEC;
     };
@@ -1366,7 +1361,7 @@ pub fn flowcone_icmp_egress_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     let emb_udp = emb_off + emb_ihl;
-    if emb_udp + mem::size_of::<UdpHdr>() > icmp_off + icmp_len
+    if ihl + 8 + emb_ihl + mem::size_of::<UdpHdr>() > tot_len
         || emb_udp + mem::size_of::<UdpHdr>() > data_end
     {
         return TC_ACT_UNSPEC;

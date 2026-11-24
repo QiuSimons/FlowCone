@@ -363,6 +363,7 @@ pub struct L2Info {
 pub enum Ipv6L4 {
     Udp(usize),
     Fragment,
+    Icmp6(usize),
     NonUdp,
     Unsupported,
 }
@@ -454,6 +455,9 @@ pub fn locate_ipv6_l4_slice(data: &[u8], ip_off: usize, mut nh: u8) -> Ipv6L4 {
         if nh == IPPROTO_UDP {
             return Ipv6L4::Udp(cur_off);
         }
+        if nh == IPPROTO_ICMPV6 {
+            return Ipv6L4::Icmp6(cur_off);
+        }
         if nh == IPPROTO_HOPOPTS || nh == IPPROTO_DSTOPTS || nh == IPPROTO_ROUTING {
             if cur_off + 2 > data.len() {
                 return Ipv6L4::NonUdp;
@@ -475,6 +479,8 @@ pub fn locate_ipv6_l4_slice(data: &[u8], ip_off: usize, mut nh: u8) -> Ipv6L4 {
 
     if nh == IPPROTO_UDP {
         Ipv6L4::Udp(cur_off)
+    } else if nh == IPPROTO_ICMPV6 {
+        Ipv6L4::Icmp6(cur_off)
     } else {
         Ipv6L4::Unsupported
     }
