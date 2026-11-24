@@ -36,6 +36,7 @@ pub use parsing::{
 
 pub const BPF_F_PSEUDO_HDR: u64 = 0x10;
 pub const BPF_F_MARK_MANGLED_0: u64 = 0x20;
+pub const BPF_F_IPV6: u64 = 0x80;
 pub const CSUM_FIELD_U16: u64 = 2;
 pub const CSUM_FIELD_U32: u64 = 4;
 pub const IPV4_CSUM_OFFSET: usize = 10;
@@ -98,9 +99,13 @@ pub static WAN_FRAG_ID: Array<u32> = Array::with_max_entries(1, 0);
 pub fn alloc_wan_ip_id() -> u16 {
     if let Some(ptr) = WAN_IP_ID.get_ptr_mut(0) {
         unsafe {
-            let next = (*ptr).wrapping_add(1);
-            *ptr = next;
-            let val = next as u16;
+            let inc: u32 = 1;
+            core::arch::asm!(
+                "lock *(u32 *)({p} + 0) += {inc}",
+                p = in(reg) ptr,
+                inc = in(reg) inc,
+            );
+            let val = (*ptr) as u16;
             if val == 0 { 1 } else { val }
         }
     } else {
@@ -112,9 +117,14 @@ pub fn alloc_wan_ip_id() -> u16 {
 pub fn alloc_wan_frag_id() -> u32 {
     if let Some(ptr) = WAN_FRAG_ID.get_ptr_mut(0) {
         unsafe {
-            let next = (*ptr).wrapping_add(1);
-            *ptr = next;
-            if next == 0 { 1 } else { next }
+            let inc: u32 = 1;
+            core::arch::asm!(
+                "lock *(u32 *)({p} + 0) += {inc}",
+                p = in(reg) ptr,
+                inc = in(reg) inc,
+            );
+            let val = *ptr;
+            if val == 0 { 1 } else { val }
         }
     } else {
         1
@@ -535,8 +545,7 @@ pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
                     }
                     return TC_ACT_UNSPEC;
                 }
-                Ipv6L4::NonUdp => return TC_ACT_UNSPEC,
-                Ipv6L4::Unsupported => return TC_ACT_SHOT,
+                Ipv6L4::NonUdp | Ipv6L4::Unsupported => return TC_ACT_UNSPEC,
             }
         };
         if is_frag {
@@ -656,9 +665,6 @@ pub fn flowcone_frag_v6_ingress(ctx: TcContext) -> i32 {
             let mark = get_mark(&ctx);
             ctx.skb.set_mark(mark | cfg.flowcone_mark);
         }
-        if !more {
-            let _ = FRAG_IN_V6.remove(&key);
-        }
         return TC_ACT_UNSPEC;
     }
     let udp_off = frag_off + 8;
@@ -767,7 +773,7 @@ pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
 
     if offset != 0 {
         let Some(v) = (unsafe { FRAG_OUT_V6.get(&key) }) else {
-            return TC_ACT_UNSPEC;
+            return TC_ACT_SHOT;
         };
         if now.saturating_sub(v.last_seen) > FRAG_TIMEOUT_SEC {
             let _ = FRAG_OUT_V6.remove(&key);
@@ -779,10 +785,7 @@ pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
         iph.src_addr = v.ip;
         let id_ptr = (frag_off + 4) as *mut u32;
         unsafe {
-            *id_ptr = u32::to_be(v.wan_id);
-        }
-        if !more {
-            let _ = FRAG_OUT_V6.remove(&key);
+            core::ptr::write_unaligned(id_ptr, u32::to_be(v.wan_id));
         }
         let mark = get_mark(&ctx);
         ctx.skb.set_mark(mark | cfg.flowcone_mark);
@@ -822,7 +825,7 @@ pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
     let wan_id = alloc_wan_frag_id();
     let id_ptr = (frag_off + 4) as *mut u32;
     unsafe {
-        *id_ptr = u32::to_be(wan_id);
+        core::ptr::write_unaligned(id_ptr, u32::to_be(wan_id));
     }
     iph.src_addr = cfg.wan_ip6;
     udph.src_port = mapped;
@@ -908,9 +911,6 @@ pub fn flowcone_frag_v4_ingress(ctx: TcContext) -> i32 {
             }
             let mark = get_mark(&ctx);
             ctx.skb.set_mark(mark | cfg.flowcone_mark);
-        }
-        if !more {
-            let _ = FRAG_IN_V4.remove(&key);
         }
         return TC_ACT_UNSPEC;
     }
@@ -1022,7 +1022,7 @@ pub fn flowcone_frag_v4_egress(ctx: TcContext) -> i32 {
 
     if offset != 0 {
         let Some(v) = (unsafe { FRAG_OUT_V4.get(&key) }) else {
-            return TC_ACT_UNSPEC;
+            return TC_ACT_SHOT;
         };
         if now.saturating_sub(v.last_seen) > FRAG_TIMEOUT_SEC {
             let _ = FRAG_OUT_V4.remove(&key);
@@ -1044,9 +1044,6 @@ pub fn flowcone_frag_v4_egress(ctx: TcContext) -> i32 {
             .skb
             .l3_csum_replace(l3_csum_off, old_id as u64, new_id as u64, CSUM_FIELD_U16);
 
-        if !more {
-            let _ = FRAG_OUT_V4.remove(&key);
-        }
         let mark = get_mark(&ctx);
         ctx.skb.set_mark(mark | cfg.flowcone_mark);
         return TC_ACT_UNSPEC;
@@ -1639,19 +1636,19 @@ pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
     let icmp_csum_off = icmp_off - data + 2;
     let mut i = 0usize;
     while i < 4 {
-        let oo = u32::from_be_bytes([
+        let oo = u32::from_ne_bytes([
             old_outer_dst[i * 4],
             old_outer_dst[i * 4 + 1],
             old_outer_dst[i * 4 + 2],
             old_outer_dst[i * 4 + 3],
         ]);
-        let no = u32::from_be_bytes([
+        let no = u32::from_ne_bytes([
             new_ip[i * 4],
             new_ip[i * 4 + 1],
             new_ip[i * 4 + 2],
             new_ip[i * 4 + 3],
         ]);
-        let os = u32::from_be_bytes([
+        let os = u32::from_ne_bytes([
             old_ip[i * 4],
             old_ip[i * 4 + 1],
             old_ip[i * 4 + 2],
@@ -1663,7 +1660,7 @@ pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
                 icmp_csum_off,
                 oo as u64,
                 no as u64,
-                BPF_F_PSEUDO_HDR | CSUM_FIELD_U32,
+                BPF_F_PSEUDO_HDR | BPF_F_IPV6 | CSUM_FIELD_U32,
             )
             .is_err()
         {
@@ -1737,6 +1734,10 @@ pub fn flowcone_icmp6_egress_target(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     };
     if (u32::from_be(iph.ver_tc_fl) >> 28) != 6 {
+        return TC_ACT_UNSPEC;
+    }
+    let payload_len = u16::from_be(iph.payload_len) as usize;
+    if payload_len < 56 {
         return TC_ACT_UNSPEC;
     }
     let old_outer_src = iph.src_addr;
@@ -1829,19 +1830,19 @@ pub fn flowcone_icmp6_egress_target(ctx: TcContext) -> i32 {
     let icmp_csum_off = icmp_off - data + 2;
     let mut i = 0usize;
     while i < 4 {
-        let oo = u32::from_be_bytes([
+        let oo = u32::from_ne_bytes([
             old_outer_src[i * 4],
             old_outer_src[i * 4 + 1],
             old_outer_src[i * 4 + 2],
             old_outer_src[i * 4 + 3],
         ]);
-        let no = u32::from_be_bytes([
+        let no = u32::from_ne_bytes([
             cfg.wan_ip6[i * 4],
             cfg.wan_ip6[i * 4 + 1],
             cfg.wan_ip6[i * 4 + 2],
             cfg.wan_ip6[i * 4 + 3],
         ]);
-        let os = u32::from_be_bytes([
+        let os = u32::from_ne_bytes([
             old_emb_dst[i * 4],
             old_emb_dst[i * 4 + 1],
             old_emb_dst[i * 4 + 2],
@@ -1853,7 +1854,7 @@ pub fn flowcone_icmp6_egress_target(ctx: TcContext) -> i32 {
                 icmp_csum_off,
                 oo as u64,
                 no as u64,
-                BPF_F_PSEUDO_HDR | CSUM_FIELD_U32,
+                BPF_F_PSEUDO_HDR | BPF_F_IPV6 | CSUM_FIELD_U32,
             )
             .is_err()
         {

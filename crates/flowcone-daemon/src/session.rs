@@ -1173,7 +1173,7 @@ impl SessionManager {
                         } else {
                             false
                         };
-                        if ob_removed || ib_removed {
+                        if ib_removed || (ob_removed && self.ib_map4.get(&port, 0).is_err()) {
                             self.release_port4(port);
                             swept4 += 1;
                         }
@@ -1302,7 +1302,7 @@ impl SessionManager {
                         } else {
                             false
                         };
-                        if ob_removed || ib_removed {
+                        if ib_removed || (ob_removed && self.ib_map6.get(&port, 0).is_err()) {
                             self.release_port6(port);
                             swept6 += 1;
                         }

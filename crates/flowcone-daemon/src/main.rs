@@ -304,7 +304,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .min(time_to_liveness);
 
         if monitor.is_none() {
-            let has_wan_addr = applied.ip4 != 0 || applied.ip6 != [0u8; 16];
+            let has_wan_addr = (!config.enable_v4 || applied.ip4 != 0)
+                && (!config.enable_v6 || applied.ip6 != [0u8; 16]);
             let fallback_poll = Duration::from_secs(if has_wan_addr { 5 } else { 1 });
             next_wake = next_wake.min(fallback_poll);
         }
@@ -439,7 +440,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let resync = RESYNC_REQUESTED.swap(false, Ordering::Relaxed);
         let reattach_due = applied.present && last_attach_check.elapsed() >= REATTACH_INTERVAL;
-        let has_wan_addr = applied.ip4 != 0 || applied.ip6 != [0u8; 16];
+        let has_wan_addr = (!config.enable_v4 || applied.ip4 != 0)
+            && (!config.enable_v6 || applied.ip6 != [0u8; 16]);
         let needs_probe = has_net_event
             || resync
             || reattach_due
@@ -695,13 +697,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(()) => true,
                         Err(e) => {
                             eprintln!(
-                                "flowcone: re-attach on {} failed: {}; fail-closed (remove nft exemption)",
+                                "flowcone: warning: re-attach on {} failed: {}; will retry on link update",
                                 config.iface, e
                             );
                             if config.manage_nft {
                                 firewall_mgr.remove_rules(config.verbose);
                             }
-                            std::process::exit(1);
+                            false
                         }
                     }
                 } else {

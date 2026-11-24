@@ -347,13 +347,17 @@ pub fn locate_ipv6_nexthdr(
 #[inline(always)]
 pub fn ipv6_fragment_offset(data_end: usize, ip_off: usize, mut nh: u8) -> Option<usize> {
     let mut cur = ip_off + 40;
-    if nh == IPPROTO_FRAGMENT {
-        if cur + 8 <= data_end {
-            return Some(cur);
+    let mut iter = 0;
+    while iter < 4 {
+        if nh == IPPROTO_FRAGMENT {
+            if cur + 8 <= data_end {
+                return Some(cur);
+            }
+            return None;
         }
-        return None;
-    }
-    if nh == IPPROTO_HOPOPTS || nh == IPPROTO_DSTOPTS || nh == IPPROTO_ROUTING {
+        if nh != IPPROTO_HOPOPTS && nh != IPPROTO_DSTOPTS && nh != IPPROTO_ROUTING {
+            return None;
+        }
         if cur + 2 > data_end {
             return None;
         }
@@ -364,30 +368,7 @@ pub fn ipv6_fragment_offset(data_end: usize, ip_off: usize, mut nh: u8) -> Optio
         }
         nh = next;
         cur += len;
-        if nh == IPPROTO_FRAGMENT {
-            if cur + 8 <= data_end {
-                return Some(cur);
-            }
-            return None;
-        }
-        if nh == IPPROTO_HOPOPTS || nh == IPPROTO_DSTOPTS || nh == IPPROTO_ROUTING {
-            if cur + 2 > data_end {
-                return None;
-            }
-            let next2 = read_u8(cur);
-            let len2 = (read_u8(cur + 1) as usize + 1) * 8;
-            if cur + len2 > data_end {
-                return None;
-            }
-            nh = next2;
-            cur += len2;
-            if nh == IPPROTO_FRAGMENT {
-                if cur + 8 <= data_end {
-                    return Some(cur);
-                }
-                return None;
-            }
-        }
+        iter += 1;
     }
     None
 }

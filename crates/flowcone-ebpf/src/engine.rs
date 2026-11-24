@@ -6,7 +6,7 @@ use flowcone_common::{
 
 use crate::parsing::ipv6_eq;
 use crate::{
-    BITMAP_EVEN_V4, BITMAP_EVEN_V6, BITMAP_ODD_V4, BITMAP_ODD_V6, BPF_F_MARK_MANGLED_0,
+    BITMAP_EVEN_V4, BITMAP_EVEN_V6, BITMAP_ODD_V4, BITMAP_ODD_V6, BPF_F_IPV6, BPF_F_MARK_MANGLED_0,
     BPF_F_PSEUDO_HDR, BPF_NOEXIST, CSUM_FIELD_U16, CSUM_FIELD_U32, GC_FLAGS, INBOUND_BINDINGS_V4,
     INBOUND_BINDINGS_V6, IPV4_CSUM_OFFSET, LAST_SEEN_INTERVAL_SEC, OUTBOUND_BINDINGS_V4,
     OUTBOUND_BINDINGS_V6, PORT_FLAGS, RESERVED_V4, RESERVED_V6, SESSION_EVENTS_V4,
@@ -122,13 +122,13 @@ pub fn fixup_csum_v6(
 
     let mut i = 0;
     while i < 4 {
-        let f = u32::from_be_bytes([
+        let f = u32::from_ne_bytes([
             old_ip[i * 4],
             old_ip[i * 4 + 1],
             old_ip[i * 4 + 2],
             old_ip[i * 4 + 3],
         ]);
-        let t = u32::from_be_bytes([
+        let t = u32::from_ne_bytes([
             new_ip[i * 4],
             new_ip[i * 4 + 1],
             new_ip[i * 4 + 2],
@@ -140,7 +140,7 @@ pub fn fixup_csum_v6(
                 l4_off,
                 f as u64,
                 t as u64,
-                BPF_F_PSEUDO_HDR | BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U32,
+                BPF_F_PSEUDO_HDR | BPF_F_IPV6 | BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U32,
             )
             .is_err()
         {
@@ -251,9 +251,11 @@ macro_rules! try_alloc_slot {
                         }
                     }
 
-                    if mask_avail != 0 {
+                    let mut probe = 0;
+                    while probe < 4 && mask_avail != 0 {
                         let free_bit = mask_avail.trailing_zeros();
                         let mask = 1u64 << free_bit;
+                        mask_avail &= !mask;
                         let port = base_port + (free_bit as u16 * 2);
                         if !port_is_reserved($reserved, port)
                             && $inbound.insert(&port, $in_val, BPF_NOEXIST).is_ok()
@@ -266,7 +268,9 @@ macro_rules! try_alloc_slot {
                                 );
                             }
                             allocated = port;
+                            break;
                         }
+                        probe += 1;
                     }
                 }
             }
@@ -430,11 +434,12 @@ pub fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
             } else {
                 let old_port = u16::from_be((*val).port);
                 let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
-                if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&old_port)
-                    && (*in_val).ip == src_ip
-                    && (*in_val).port == src_port
-                {
-                    let _ = INBOUND_BINDINGS_V4.remove(&old_port);
+                if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&old_port) {
+                    if (*in_val).ip == src_ip && (*in_val).port == src_port {
+                        let _ = INBOUND_BINDINGS_V4.remove(&old_port);
+                        release_port_v4(old_port);
+                    }
+                } else {
                     release_port_v4(old_port);
                 }
             }
@@ -519,11 +524,12 @@ pub fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
             } else {
                 let old_port = u16::from_be((*val).port);
                 let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
-                if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&old_port)
-                    && ipv6_eq(&(*in_val).ip, &src_ip)
-                    && (*in_val).port == src_port
-                {
-                    let _ = INBOUND_BINDINGS_V6.remove(&old_port);
+                if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&old_port) {
+                    if ipv6_eq(&(*in_val).ip, &src_ip) && (*in_val).port == src_port {
+                        let _ = INBOUND_BINDINGS_V6.remove(&old_port);
+                        release_port_v6(old_port);
+                    }
+                } else {
                     release_port_v6(old_port);
                 }
             }
