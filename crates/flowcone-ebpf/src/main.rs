@@ -658,12 +658,16 @@ pub fn flowcone_frag_v6_ingress(ctx: TcContext) -> i32 {
     let now = now_sec();
 
     if offset != 0 {
-        if let Some(v) = unsafe { FRAG_IN_V6.get(&key) }
-            && now.saturating_sub(v.last_seen) <= FRAG_TIMEOUT_SEC
-        {
-            iph.dst_addr = v.ip;
-            let mark = get_mark(&ctx);
-            ctx.skb.set_mark(mark | cfg.flowcone_mark);
+        if let Some(v_ptr) = FRAG_IN_V6.get_ptr_mut(&key) {
+            let v = unsafe { *v_ptr };
+            if now.saturating_sub(v.last_seen) <= FRAG_TIMEOUT_SEC {
+                unsafe {
+                    (*v_ptr).last_seen = now;
+                }
+                iph.dst_addr = v.ip;
+                let mark = get_mark(&ctx);
+                ctx.skb.set_mark(mark | cfg.flowcone_mark);
+            }
         }
         return TC_ACT_UNSPEC;
     }
@@ -905,16 +909,20 @@ pub fn flowcone_frag_v4_ingress(ctx: TcContext) -> i32 {
     let now = now_sec();
 
     if offset != 0 {
-        if let Some(v) = unsafe { FRAG_IN_V4.get(&key) }
-            && now.saturating_sub(v.last_seen) <= FRAG_TIMEOUT_SEC
-        {
-            let old = iph.dst_addr;
-            iph.dst_addr = v.ip;
-            if !fixup_l3_v4(&ctx, data, ip_off, old, v.ip) {
-                return TC_ACT_SHOT;
+        if let Some(v_ptr) = FRAG_IN_V4.get_ptr_mut(&key) {
+            let v = unsafe { *v_ptr };
+            if now.saturating_sub(v.last_seen) <= FRAG_TIMEOUT_SEC {
+                unsafe {
+                    (*v_ptr).last_seen = now;
+                }
+                let old = iph.dst_addr;
+                iph.dst_addr = v.ip;
+                if !fixup_l3_v4(&ctx, data, ip_off, old, v.ip) {
+                    return TC_ACT_SHOT;
+                }
+                let mark = get_mark(&ctx);
+                ctx.skb.set_mark(mark | cfg.flowcone_mark);
             }
-            let mark = get_mark(&ctx);
-            ctx.skb.set_mark(mark | cfg.flowcone_mark);
         }
         return TC_ACT_UNSPEC;
     }

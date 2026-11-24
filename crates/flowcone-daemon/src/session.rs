@@ -945,6 +945,7 @@ impl SessionManager {
         clear_map(&mut self.frag_in4);
         clear_map(&mut self.frag_out4);
         self.heap4.clear();
+        while self.events4.next().is_some() {}
         self.init_port_pool(true, false);
     }
 
@@ -956,6 +957,7 @@ impl SessionManager {
         clear_map(&mut self.frag_in6);
         clear_map(&mut self.frag_out6);
         self.heap6.clear();
+        while self.events6.next().is_some() {}
         self.init_port_pool(false, true);
     }
 
