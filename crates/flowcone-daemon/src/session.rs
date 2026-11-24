@@ -777,15 +777,16 @@ impl SessionManager {
         if port < pool.min_port || port > pool.max_port {
             return;
         }
-        if pool.reserved_ports.binary_search(&port).is_ok() {
-            return;
-        }
         let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
         let map = if is_even {
             &mut *pool.bitmap_even
         } else {
             &mut *pool.bitmap_odd
         };
+        if pool.reserved_ports.binary_search(&port).is_ok() {
+            map.fetch_or(slot, mask, Ordering::Relaxed);
+            return;
+        }
         map.fetch_and(slot, !mask, Ordering::Relaxed);
     }
 

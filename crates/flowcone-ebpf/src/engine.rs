@@ -201,6 +201,9 @@ pub fn bitmap_clear_bit(map: &Array<u64>, slot: u32, mask: u64) {
 
 #[inline(always)]
 pub fn release_port_v4(port: u16) {
+    if port_is_reserved(&RESERVED_V4, port) {
+        return;
+    }
     let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
     let map = if is_even {
         &BITMAP_EVEN_V4
@@ -212,6 +215,9 @@ pub fn release_port_v4(port: u16) {
 
 #[inline(always)]
 pub fn release_port_v6(port: u16) {
+    if port_is_reserved(&RESERVED_V6, port) {
+        return;
+    }
     let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(port);
     let map = if is_even {
         &BITMAP_EVEN_V6
@@ -263,16 +269,17 @@ macro_rules! try_alloc_slot {
                         let mask = 1u64 << free_bit;
                         mask_avail &= !mask;
                         let port = base_port + (free_bit as u16 * 2);
+                        unsafe {
+                            core::arch::asm!(
+                                "lock *(u64 *)({p} + 0) |= {mask}",
+                                p = in(reg) p,
+                                mask = in(reg) mask,
+                            );
+                        }
+
                         if !port_is_reserved($reserved, port)
                             && $inbound.insert(&port, $in_val, BPF_NOEXIST).is_ok()
                         {
-                            unsafe {
-                                core::arch::asm!(
-                                    "lock *(u64 *)({p} + 0) |= {mask}",
-                                    p = in(reg) p,
-                                    mask = in(reg) mask,
-                                );
-                            }
                             allocated = port;
                             break;
                         }
@@ -301,11 +308,12 @@ macro_rules! impl_alloc_port {
             if pref >= min && pref <= max {
                 let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(pref);
                 let map = if is_even { &$even_map } else { &$odd_map };
-                if !port_is_reserved(&$reserved_map, pref)
-                    && $inbound_map.insert(&pref, in_val, BPF_NOEXIST).is_ok()
-                {
+                let is_res = port_is_reserved(&$reserved_map, pref);
+                if !is_res && $inbound_map.insert(&pref, in_val, BPF_NOEXIST).is_ok() {
                     bitmap_set_bit(map, slot, mask);
                     return pref;
+                } else if is_res {
+                    bitmap_set_bit(map, slot, mask);
                 }
             }
 
@@ -419,6 +427,9 @@ pub fn get_or_create_mapping_v4<const PRIMARY: usize, const FALLBACK: usize>(
             if (*val).ip == cfg.wan_ip4 {
                 let cur_port = u16::from_be((*val).port);
                 if port_is_reserved(&RESERVED_V4, cur_port) {
+                    let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(cur_port);
+                    let map = if is_even { &BITMAP_EVEN_V4 } else { &BITMAP_ODD_V4 };
+                    bitmap_set_bit(map, slot, mask);
                     let _ = OUTBOUND_BINDINGS_V4.remove(&ep_key);
                     if let Some(in_val) = INBOUND_BINDINGS_V4.get_ptr_mut(&cur_port)
                         && (*in_val).ip == src_ip
@@ -509,6 +520,9 @@ pub fn get_or_create_mapping_v6<const PRIMARY: usize, const FALLBACK: usize>(
             if ipv6_eq(&(*val).ip, &cfg.wan_ip6) {
                 let cur_port = u16::from_be((*val).port);
                 if port_is_reserved(&RESERVED_V6, cur_port) {
+                    let (is_even, slot, mask) = flowcone_common::port_to_bitmap_coords(cur_port);
+                    let map = if is_even { &BITMAP_EVEN_V6 } else { &BITMAP_ODD_V6 };
+                    bitmap_set_bit(map, slot, mask);
                     let _ = OUTBOUND_BINDINGS_V6.remove(&ep_key);
                     if let Some(in_val) = INBOUND_BINDINGS_V6.get_ptr_mut(&cur_port)
                         && ipv6_eq(&(*in_val).ip, &src_ip)
