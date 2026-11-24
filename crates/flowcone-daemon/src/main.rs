@@ -235,8 +235,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     session_mgr.configure_port_pool(config.min_port, config.max_port);
-    session_mgr.init_port_pool(config.enable_v4, config.enable_v6);
     session_mgr.reserve_local_ports();
+    session_mgr.init_port_pool(config.enable_v4, config.enable_v6);
 
     let initial_l2 = netlink::get_iface_l2_len(&config.iface);
     match initial_l2 {
