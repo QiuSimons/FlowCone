@@ -6,8 +6,8 @@ use flowcone_common::{
 
 use crate::parsing::ipv6_eq;
 use crate::{
-    BITMAP_EVEN_V4, BITMAP_EVEN_V6, BITMAP_ODD_V4, BITMAP_ODD_V6, BPF_F_IPV6, BPF_F_MARK_MANGLED_0,
-    BPF_F_PSEUDO_HDR, BPF_NOEXIST, CSUM_FIELD_U16, CSUM_FIELD_U32, GC_FLAGS, INBOUND_BINDINGS_V4,
+    BITMAP_EVEN_V4, BITMAP_EVEN_V6, BITMAP_ODD_V4, BITMAP_ODD_V6, BPF_F_MARK_MANGLED_0,
+    BPF_NOEXIST, CSUM_FIELD_U16, CSUM_FIELD_U32, GC_FLAGS, INBOUND_BINDINGS_V4,
     INBOUND_BINDINGS_V6, IPV4_CSUM_OFFSET, LAST_SEEN_INTERVAL_SEC, OUTBOUND_BINDINGS_V4,
     OUTBOUND_BINDINGS_V6, PORT_FLAGS, RESERVED_V4, RESERVED_V6, SESSION_EVENTS_V4,
     SESSION_EVENTS_V6, UDP_CSUM_OFFSET,
@@ -69,20 +69,26 @@ pub fn fixup_csum_v4(
     new_port: u16,
 ) -> bool {
     let l3_off = ip_off - data + IPV4_CSUM_OFFSET;
+    if ctx
+        .skb
+        .l3_csum_replace(l3_off, old_ip as u64, new_ip as u64, CSUM_FIELD_U32)
+        .is_err()
+    {
+        return false;
+    }
+
     let l4_off = udp_off - data + UDP_CSUM_OFFSET;
 
+    // Note: BPF_F_PSEUDO_HDR is omitted to avoid kernel -EINVAL on VLAN / PPPoE encapsulation (skb->protocol != ETH_P_IP).
+    // BPF_F_MARK_MANGLED_0 preserves 0x0000 UDP checksums (RFC 768 disabled) without corruption, and converts folded 0 to 0xffff.
     ctx.skb
-        .l3_csum_replace(l3_off, old_ip as u64, new_ip as u64, CSUM_FIELD_U32)
+        .l4_csum_replace(
+            l4_off,
+            old_ip as u64,
+            new_ip as u64,
+            BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U32,
+        )
         .is_ok()
-        && ctx
-            .skb
-            .l4_csum_replace(
-                l4_off,
-                old_ip as u64,
-                new_ip as u64,
-                BPF_F_PSEUDO_HDR | BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U32,
-            )
-            .is_ok()
         && (old_port == new_port
             || ctx
                 .skb
@@ -140,7 +146,7 @@ pub fn fixup_csum_v6(
                 l4_off,
                 f as u64,
                 t as u64,
-                BPF_F_PSEUDO_HDR | BPF_F_IPV6 | BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U32,
+                BPF_F_MARK_MANGLED_0 | CSUM_FIELD_U32,
             )
             .is_err()
         {

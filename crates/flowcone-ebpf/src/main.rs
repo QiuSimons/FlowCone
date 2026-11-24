@@ -772,12 +772,16 @@ pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
     let now = now_sec();
 
     if offset != 0 {
-        let Some(v) = (unsafe { FRAG_OUT_V6.get(&key) }) else {
+        let Some(v_ptr) = FRAG_OUT_V6.get_ptr_mut(&key) else {
             return TC_ACT_SHOT;
         };
+        let v = unsafe { *v_ptr };
         if now.saturating_sub(v.last_seen) > FRAG_TIMEOUT_SEC {
             let _ = FRAG_OUT_V6.remove(&key);
             return TC_ACT_SHOT;
+        }
+        unsafe {
+            (*v_ptr).last_seen = now;
         }
         if ipv6_eq(&v.ip, &[0; 16]) {
             return TC_ACT_UNSPEC;
@@ -1021,12 +1025,16 @@ pub fn flowcone_frag_v4_egress(ctx: TcContext) -> i32 {
     let now = now_sec();
 
     if offset != 0 {
-        let Some(v) = (unsafe { FRAG_OUT_V4.get(&key) }) else {
+        let Some(v_ptr) = FRAG_OUT_V4.get_ptr_mut(&key) else {
             return TC_ACT_SHOT;
         };
+        let v = unsafe { *v_ptr };
         if now.saturating_sub(v.last_seen) > FRAG_TIMEOUT_SEC {
             let _ = FRAG_OUT_V4.remove(&key);
             return TC_ACT_SHOT;
+        }
+        unsafe {
+            (*v_ptr).last_seen = now;
         }
         if v.ip == 0 {
             return TC_ACT_UNSPEC;
@@ -1660,7 +1668,7 @@ pub fn flowcone_icmp6_target(ctx: TcContext) -> i32 {
                 icmp_csum_off,
                 oo as u64,
                 no as u64,
-                BPF_F_PSEUDO_HDR | BPF_F_IPV6 | CSUM_FIELD_U32,
+                CSUM_FIELD_U32,
             )
             .is_err()
         {
@@ -1854,7 +1862,7 @@ pub fn flowcone_icmp6_egress_target(ctx: TcContext) -> i32 {
                 icmp_csum_off,
                 oo as u64,
                 no as u64,
-                BPF_F_PSEUDO_HDR | BPF_F_IPV6 | CSUM_FIELD_U32,
+                CSUM_FIELD_U32,
             )
             .is_err()
         {

@@ -867,19 +867,19 @@ impl SessionManager {
                     }
                 }
                 if orphan_mask != 0 {
-                    map.fetch_and(slot, !orphan_mask, Ordering::Relaxed);
-                    let mut rescue_mask = 0u64;
+                    // Pre-verify that no concurrent datapath allocation occurred before clearing.
+                    let mut confirmed_orphan_mask = 0u64;
                     for bit in 0..64 {
                         let mask = 1u64 << bit;
                         if (orphan_mask & mask) != 0 {
                             let port = flowcone_common::bitmap_coords_to_port(parity, slot, bit);
-                            if ib_map.get(&port, 0).is_ok() {
-                                rescue_mask |= mask;
+                            if ib_map.get(&port, 0).is_err() {
+                                confirmed_orphan_mask |= mask;
                             }
                         }
                     }
-                    if rescue_mask != 0 {
-                        map.fetch_or(slot, rescue_mask, Ordering::Relaxed);
+                    if confirmed_orphan_mask != 0 {
+                        map.fetch_and(slot, !confirmed_orphan_mask, Ordering::Relaxed);
                     }
                 }
             }
@@ -945,6 +945,7 @@ impl SessionManager {
         clear_map(&mut self.frag_in4);
         clear_map(&mut self.frag_out4);
         self.heap4.clear();
+        self.init_port_pool(true, false);
     }
 
     pub fn clear_v6_mappings(&mut self) {
@@ -955,6 +956,7 @@ impl SessionManager {
         clear_map(&mut self.frag_in6);
         clear_map(&mut self.frag_out6);
         self.heap6.clear();
+        self.init_port_pool(false, true);
     }
 
     #[inline]
@@ -1128,11 +1130,19 @@ impl SessionManager {
                             if u16::from_be(cur_ob.port) != port {
                                 if let Ok(cur_ib) = self.ib_map4.get(&port, 0)
                                     && cur_ib.matches_key(&key)
-                                    && now.saturating_sub(cur_ib.last_seen) > item_timeout
-                                    && self.ib_map4.remove(&port).is_ok()
                                 {
-                                    self.release_port4(port);
-                                    swept4 += 1;
+                                    if now.saturating_sub(cur_ib.last_seen) > item_timeout {
+                                        if self.ib_map4.remove(&port).is_ok() {
+                                            self.release_port4(port);
+                                            swept4 += 1;
+                                        }
+                                    } else {
+                                        self.schedule4(
+                                            cur_ib.last_seen.saturating_add(item_timeout),
+                                            key,
+                                            port,
+                                        );
+                                    }
                                 }
                                 processed4 += 1;
                                 continue;
@@ -1257,11 +1267,19 @@ impl SessionManager {
                             if u16::from_be(cur_ob.port) != port {
                                 if let Ok(cur_ib) = self.ib_map6.get(&port, 0)
                                     && cur_ib.matches_key(&key)
-                                    && now.saturating_sub(cur_ib.last_seen) > item_timeout
-                                    && self.ib_map6.remove(&port).is_ok()
                                 {
-                                    self.release_port6(port);
-                                    swept6 += 1;
+                                    if now.saturating_sub(cur_ib.last_seen) > item_timeout {
+                                        if self.ib_map6.remove(&port).is_ok() {
+                                            self.release_port6(port);
+                                            swept6 += 1;
+                                        }
+                                    } else {
+                                        self.schedule6(
+                                            cur_ib.last_seen.saturating_add(item_timeout),
+                                            key,
+                                            port,
+                                        );
+                                    }
                                 }
                                 processed6 += 1;
                                 continue;
