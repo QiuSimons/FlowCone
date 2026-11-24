@@ -1,20 +1,16 @@
-use aya_ebpf::{
-    helpers::bpf_ktime_get_coarse_ns,
-    maps::Array,
-    programs::TcContext,
-};
+use aya_ebpf::{helpers::bpf_ktime_get_coarse_ns, maps::Array, programs::TcContext};
 use flowcone_common::{
-    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, GlobalConfig,
-    SessionEvent4, SessionEvent6,
+    BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, GlobalConfig, SessionEvent4,
+    SessionEvent6,
 };
 
 use crate::parsing::ipv6_eq;
 use crate::{
     BITMAP_EVEN_V4, BITMAP_EVEN_V6, BITMAP_ODD_V4, BITMAP_ODD_V6, BPF_F_MARK_MANGLED_0,
-    BPF_F_PSEUDO_HDR, BPF_NOEXIST, CSUM_FIELD_U16, CSUM_FIELD_U32, GC_FLAGS,
-    INBOUND_BINDINGS_V4, INBOUND_BINDINGS_V6, IPV4_CSUM_OFFSET, LAST_SEEN_INTERVAL_SEC,
-    OUTBOUND_BINDINGS_V4, OUTBOUND_BINDINGS_V6, PORT_FLAGS, RESERVED_V4, RESERVED_V6,
-    SESSION_EVENTS_V4, SESSION_EVENTS_V6, UDP_CSUM_OFFSET,
+    BPF_F_PSEUDO_HDR, BPF_NOEXIST, CSUM_FIELD_U16, CSUM_FIELD_U32, GC_FLAGS, INBOUND_BINDINGS_V4,
+    INBOUND_BINDINGS_V6, IPV4_CSUM_OFFSET, LAST_SEEN_INTERVAL_SEC, OUTBOUND_BINDINGS_V4,
+    OUTBOUND_BINDINGS_V6, PORT_FLAGS, RESERVED_V4, RESERVED_V6, SESSION_EVENTS_V4,
+    SESSION_EVENTS_V6, UDP_CSUM_OFFSET,
 };
 
 pub const EGRESS_ALLOC_PRIMARY: usize = 4;
@@ -124,12 +120,20 @@ pub fn fixup_csum_v6(
 ) -> bool {
     let l4_off = udp_off - data + UDP_CSUM_OFFSET;
 
-    let p_old = old_ip.as_ptr() as *const u32;
-    let p_new = new_ip.as_ptr() as *const u32;
     let mut i = 0;
     while i < 4 {
-        let f = unsafe { core::ptr::read_unaligned(p_old.add(i)) };
-        let t = unsafe { core::ptr::read_unaligned(p_new.add(i)) };
+        let f = u32::from_be_bytes([
+            old_ip[i * 4],
+            old_ip[i * 4 + 1],
+            old_ip[i * 4 + 2],
+            old_ip[i * 4 + 3],
+        ]);
+        let t = u32::from_be_bytes([
+            new_ip[i * 4],
+            new_ip[i * 4 + 1],
+            new_ip[i * 4 + 2],
+            new_ip[i * 4 + 3],
+        ]);
         if ctx
             .skb
             .l4_csum_replace(
@@ -250,10 +254,13 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
         if let Some(p) = primary_map.get_ptr_mut(slot) {
             let val = unsafe { *p };
             if val != !0u64 {
-                let free_bit = (!val).trailing_zeros();
-                if free_bit < 64 {
-                    let port = flowcone_common::bitmap_coords_to_port(pref_even, slot, free_bit);
+                let mut mask_avail = !val;
+                let mut probe = 0;
+                while probe < 64 && mask_avail != 0 {
+                    let free_bit = mask_avail.trailing_zeros();
                     let mask = 1u64 << free_bit;
+                    mask_avail &= !mask;
+                    let port = flowcone_common::bitmap_coords_to_port(pref_even, slot, free_bit);
                     if port >= min
                         && port <= max
                         && !port_is_reserved(&RESERVED_V4, port)
@@ -270,6 +277,7 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
                         }
                         return Some(port);
                     }
+                    probe += 1;
                 }
             }
         }
@@ -288,10 +296,14 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
         if let Some(p) = fallback_map.get_ptr_mut(slot) {
             let val = unsafe { *p };
             if val != !0u64 {
-                let free_bit = (!val).trailing_zeros();
-                if free_bit < 64 {
-                    let port = flowcone_common::bitmap_coords_to_port(fallback_even, slot, free_bit);
+                let mut mask_avail = !val;
+                let mut probe = 0;
+                while probe < 64 && mask_avail != 0 {
+                    let free_bit = mask_avail.trailing_zeros();
                     let mask = 1u64 << free_bit;
+                    mask_avail &= !mask;
+                    let port =
+                        flowcone_common::bitmap_coords_to_port(fallback_even, slot, free_bit);
                     if port >= min
                         && port <= max
                         && !port_is_reserved(&RESERVED_V4, port)
@@ -308,6 +320,7 @@ pub fn alloc_port_v4<const PRIMARY: usize, const FALLBACK: usize>(
                         }
                         return Some(port);
                     }
+                    probe += 1;
                 }
             }
         }
@@ -369,10 +382,13 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
         if let Some(p) = primary_map.get_ptr_mut(slot) {
             let val = unsafe { *p };
             if val != !0u64 {
-                let free_bit = (!val).trailing_zeros();
-                if free_bit < 64 {
-                    let port = flowcone_common::bitmap_coords_to_port(pref_even, slot, free_bit);
+                let mut mask_avail = !val;
+                let mut probe = 0;
+                while probe < 64 && mask_avail != 0 {
+                    let free_bit = mask_avail.trailing_zeros();
                     let mask = 1u64 << free_bit;
+                    mask_avail &= !mask;
+                    let port = flowcone_common::bitmap_coords_to_port(pref_even, slot, free_bit);
                     if port >= min
                         && port <= max
                         && !port_is_reserved(&RESERVED_V6, port)
@@ -389,6 +405,7 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
                         }
                         return Some(port);
                     }
+                    probe += 1;
                 }
             }
         }
@@ -407,10 +424,14 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
         if let Some(p) = fallback_map.get_ptr_mut(slot) {
             let val = unsafe { *p };
             if val != !0u64 {
-                let free_bit = (!val).trailing_zeros();
-                if free_bit < 64 {
-                    let port = flowcone_common::bitmap_coords_to_port(fallback_even, slot, free_bit);
+                let mut mask_avail = !val;
+                let mut probe = 0;
+                while probe < 64 && mask_avail != 0 {
+                    let free_bit = mask_avail.trailing_zeros();
                     let mask = 1u64 << free_bit;
+                    mask_avail &= !mask;
+                    let port =
+                        flowcone_common::bitmap_coords_to_port(fallback_even, slot, free_bit);
                     if port >= min
                         && port <= max
                         && !port_is_reserved(&RESERVED_V6, port)
@@ -427,6 +448,7 @@ pub fn alloc_port_v6<const PRIMARY: usize, const FALLBACK: usize>(
                         }
                         return Some(port);
                     }
+                    probe += 1;
                 }
             }
         }

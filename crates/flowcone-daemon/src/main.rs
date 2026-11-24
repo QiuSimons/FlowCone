@@ -1,3 +1,8 @@
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!(
+    "FlowCone requires a 64-bit architecture (e.g. x86_64, aarch64, mips64, riscv64) for lock-free 64-bit atomic bitmaps shared with eBPF."
+);
+
 mod btf;
 mod config;
 mod data_plane;
@@ -318,8 +323,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut poll_fds = [
             PollFd::new(&sig_read_end, PollFlags::IN),
             PollFd::new(&wake_read_end, PollFlags::IN),
-            PollFd::new(&ev4_fd, PollFlags::IN),
-            PollFd::new(&ev6_fd, PollFlags::IN),
+            PollFd::new(
+                &ev4_fd,
+                if config.enable_v4 {
+                    PollFlags::IN
+                } else {
+                    PollFlags::empty()
+                },
+            ),
+            PollFd::new(
+                &ev6_fd,
+                if config.enable_v6 {
+                    PollFlags::IN
+                } else {
+                    PollFlags::empty()
+                },
+            ),
             PollFd::new(
                 &mon_borrowed,
                 if monitor.is_some() {
@@ -354,10 +373,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if poll_fds[1].revents().contains(PollFlags::IN) {
             let mut buf = [0u8; 32];
+            let mut eof = false;
             while let Ok(n) = rustix::io::read(&wake_read_end, &mut buf) {
                 if n == 0 {
+                    eof = true;
                     break;
                 }
+            }
+            if eof {
+                eprintln!("flowcone: wake pipe closed, exiting reactor");
+                break;
             }
             has_net_event = true;
         }

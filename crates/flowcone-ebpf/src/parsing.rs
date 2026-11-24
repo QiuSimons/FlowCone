@@ -61,7 +61,8 @@ pub fn parse_header_at_mut<T>(ptr: usize, data_end: usize) -> Option<*mut T> {
 /// up to `data_end`.
 #[inline(always)]
 pub unsafe fn parse_header_ref<'a, T>(ptr: usize, data_end: usize) -> Option<&'a T> {
-    if ptr + mem::size_of::<T>() > data_end {
+    let size = mem::size_of::<T>();
+    if ptr > usize::MAX - size || ptr + size > data_end {
         return None;
     }
     Some(unsafe { &*(ptr as *const T) })
@@ -75,7 +76,8 @@ pub unsafe fn parse_header_ref<'a, T>(ptr: usize, data_end: usize) -> Option<&'a
 /// up to `data_end`.
 #[inline(always)]
 pub unsafe fn parse_header_ref_mut<'a, T>(ptr: usize, data_end: usize) -> Option<&'a mut T> {
-    if ptr + mem::size_of::<T>() > data_end {
+    let size = mem::size_of::<T>();
+    if ptr > usize::MAX - size || ptr + size > data_end {
         return None;
     }
     Some(unsafe { &mut *(ptr as *mut T) })
@@ -83,11 +85,9 @@ pub unsafe fn parse_header_ref_mut<'a, T>(ptr: usize, data_end: usize) -> Option
 
 #[inline(always)]
 pub fn parse_header<T>(data_start: usize, data_end: usize, offset: usize) -> Option<*const T> {
-    if offset > usize::MAX - mem::size_of::<T>() {
-        return None;
-    }
-    let target = data_start + offset;
-    if target + mem::size_of::<T>() > data_end {
+    let size = mem::size_of::<T>();
+    let target = data_start.checked_add(offset)?;
+    if target > usize::MAX - size || target + size > data_end {
         return None;
     }
     Some(target as *const T)
@@ -95,11 +95,9 @@ pub fn parse_header<T>(data_start: usize, data_end: usize, offset: usize) -> Opt
 
 #[inline(always)]
 pub fn parse_header_mut<T>(data_start: usize, data_end: usize, offset: usize) -> Option<*mut T> {
-    if offset > usize::MAX - mem::size_of::<T>() {
-        return None;
-    }
-    let target = data_start + offset;
-    if target + mem::size_of::<T>() > data_end {
+    let size = mem::size_of::<T>();
+    let target = data_start.checked_add(offset)?;
+    if target > usize::MAX - size || target + size > data_end {
         return None;
     }
     Some(target as *mut T)
@@ -162,6 +160,7 @@ pub fn is_link_local_v6(addr: &[u8; 16]) -> bool {
 #[inline(always)]
 pub fn bypass_special_udp4(src: u32, dst: u32, sport: u16, dport: u16) -> bool {
     src == 0
+        || is_multicast_or_broadcast_v4(src)
         || sport == DHCP_SERVER_PORT_BE
         || sport == DHCP_CLIENT_PORT_BE
         || dport == DHCP_SERVER_PORT_BE
@@ -171,11 +170,12 @@ pub fn bypass_special_udp4(src: u32, dst: u32, sport: u16, dport: u16) -> bool {
 }
 
 #[inline(always)]
-pub fn bypass_special_udp6(dst: &[u8; 16], sport: u16, dport: u16) -> bool {
+pub fn bypass_special_udp6(src: &[u8; 16], dst: &[u8; 16], sport: u16, dport: u16) -> bool {
     sport == DHCPV6_CLIENT_PORT_BE
         || sport == DHCPV6_SERVER_PORT_BE
         || dport == DHCPV6_CLIENT_PORT_BE
         || dport == DHCPV6_SERVER_PORT_BE
+        || is_multicast_v6(src)
         || is_multicast_v6(dst)
         || is_link_local_v6(dst)
 }
@@ -302,6 +302,39 @@ pub fn locate_ipv6_l4(data_end: usize, ip_off: usize, mut nh: u8) -> Ipv6L4 {
     } else {
         Ipv6L4::Unsupported
     }
+}
+
+/// Walk IPv6 extension headers to locate a target next-header protocol.
+#[inline(always)]
+pub fn locate_ipv6_nexthdr(
+    data_end: usize,
+    ip_off: usize,
+    mut nh: u8,
+    target: u8,
+) -> Option<usize> {
+    let mut cur_off = ip_off + 40;
+    let mut iter = 0;
+    while iter < 4 {
+        if nh == target {
+            return Some(cur_off);
+        }
+        if nh == IPPROTO_HOPOPTS || nh == IPPROTO_DSTOPTS || nh == IPPROTO_ROUTING {
+            if cur_off + 2 > data_end {
+                return None;
+            }
+            let next = read_u8(cur_off);
+            let ext_len = (read_u8(cur_off + 1) as usize + 1) * 8;
+            if cur_off + ext_len > data_end {
+                return None;
+            }
+            nh = next;
+            cur_off += ext_len;
+        } else {
+            return None;
+        }
+        iter += 1;
+    }
+    if nh == target { Some(cur_off) } else { None }
 }
 
 /// Walk Hop-by-Hop / Destination Options headers until the fragment header.
