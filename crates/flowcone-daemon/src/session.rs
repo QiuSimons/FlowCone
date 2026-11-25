@@ -689,7 +689,7 @@ impl SessionManager {
         }
     }
 
-    /// Synchronizes reserved local UDP service ports from Netlink or /proc/net/udp[6].
+    /// Synchronizes reserved local UDP service ports from Netlink or `/proc/net/udp[6]`.
     pub fn reserve_local_ports(&mut self) {
         let p4 = scan_local_udp_ports(2, "/proc/net/udp");
         let p6 = scan_local_udp_ports(10, "/proc/net/udp6");
