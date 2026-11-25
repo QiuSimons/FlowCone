@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=flowcone
 PKG_VERSION:=0.1.10
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 # Detect local workspace root before download rules so local builds never trigger git fetch.
 FLOWCONE_LOCAL_DIR := $(strip \
