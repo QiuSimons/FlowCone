@@ -83,7 +83,8 @@ pub fn pull_up_to(ctx: &TcContext, data: &mut usize, data_end: &mut usize, max_n
     } else {
         max_need
     };
-    if pull > 0 && ctx.skb.pull_data(pull as u32).is_ok() {
+    if pull > 0 {
+        let _ = ctx.skb.pull_data(pull as u32);
         *data = ctx.data();
         *data_end = ctx.data_end();
     }
@@ -117,14 +118,16 @@ pub unsafe fn parse_header_ref_mut<'a, T>(ptr: usize, data_end: usize) -> Option
     Some(unsafe { &mut *(ptr as *mut T) })
 }
 
-/// Compare two IPv6 addresses without alignment assumptions.
+/// Compare two IPv6 addresses without alignment assumptions or short-circuit
+/// branches.
 #[inline(always)]
 pub fn ipv6_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
     let p_a = a.as_ptr() as *const u64;
     let p_b = b.as_ptr() as *const u64;
     unsafe {
-        core::ptr::read_unaligned(p_a) == core::ptr::read_unaligned(p_b)
-            && core::ptr::read_unaligned(p_a.add(1)) == core::ptr::read_unaligned(p_b.add(1))
+        ((core::ptr::read_unaligned(p_a) ^ core::ptr::read_unaligned(p_b))
+            | (core::ptr::read_unaligned(p_a.add(1)) ^ core::ptr::read_unaligned(p_b.add(1))))
+            == 0
     }
 }
 

@@ -27,7 +27,7 @@ use flowcone_common::{
 use engine::{
     fixup_csum_v4, fixup_csum_v6, fixup_l3_id_v4, fixup_l3_v4, get_or_create_mapping_v4,
     get_or_create_mapping_v6, ipv6_addr_diff, is_short_lived_port, lookup_inbound_v4,
-    lookup_inbound_v6, now_sec, port_reserved_state,
+    lookup_inbound_v6, lookup_outbound_v4, lookup_outbound_v6, now_sec, port_reserved_state,
 };
 use parsing::{
     FragExtHdr, Ipv4Hdr, Ipv6Hdr, Ipv6L4, L2Info, UdpHdr, bypass_special_udp4, bypass_special_udp6,
@@ -52,6 +52,14 @@ pub const LAST_SEEN_INTERVAL_SEC: u32 = 1;
 
 pub const TARGET_INGRESS: u32 = 0;
 pub const TARGET_EGRESS: u32 = 1;
+
+pub const TARGET_DISPATCH: u32 = 0;
+pub const TARGET_FAMILY_V4: u32 = 1;
+pub const TARGET_FAMILY_V6: u32 = 2;
+
+pub const TARGET_ALLOC_V4: u32 = 0;
+pub const TARGET_ALLOC_V6: u32 = 1;
+pub const TARGET_FRAG_EGRESS_ALLOC: u32 = 2;
 
 #[unsafe(link_section = "license")]
 #[used]
@@ -90,15 +98,20 @@ pub fn get_config() -> Option<&'static GlobalConfig> {
     CONFIG.get(active)
 }
 
-/// Tail-call targets for TC dispatchers.
+/// Tail-call targets for TC dispatchers. Slots `[0, 1, 2]` correspond to
+/// `[TARGET_DISPATCH, TARGET_FAMILY_V4, TARGET_FAMILY_V6]`.
 #[map]
-pub static INGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
+pub static INGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(3, 0);
 #[map]
-pub static EGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(1, 0);
+pub static EGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(3, 0);
+/// Slow-path outbound port allocation tail-call targets `[TARGET_ALLOC_V4,
+/// TARGET_ALLOC_V6]`.
+#[map]
+pub static EGRESS_ALLOC_TARGET: ProgramArray = ProgramArray::with_max_entries(2, 0);
 #[map]
 pub static FRAG_TARGET: ProgramArray = ProgramArray::with_max_entries(2, 0);
 #[map]
-pub static FRAG6_TARGET: ProgramArray = ProgramArray::with_max_entries(2, 0);
+pub static FRAG6_TARGET: ProgramArray = ProgramArray::with_max_entries(3, 0);
 #[map]
 pub static ICMP_TARGET: ProgramArray = ProgramArray::with_max_entries(2, 0);
 #[map]
@@ -108,7 +121,10 @@ pub static ICMP6_TARGET: ProgramArray = ProgramArray::with_max_entries(2, 0);
 pub static WAN_IP_ID: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 pub static WAN_FRAG_ID: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0);
-
+/// Per-CPU handoff (`ip_rel | (udp_rel << 16) | (frag_rel << 32)`) across
+/// egress allocation tail calls.
+#[map]
+pub static EGRESS_SCRATCH: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[inline(always)]
 pub fn alloc_wan_ip_id() -> u16 {
     let cpu = unsafe { bpf_get_smp_processor_id() };
@@ -349,7 +365,7 @@ fn init_frag_value6(ip: &[u8; 16], wan_id: u32, now: u32) -> FragValue6 {
     }
 }
 
-#[inline(never)]
+#[inline(always)]
 fn ingress_v4(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     let mut data = ctx.data();
     let mut data_end = ctx.data_end();
@@ -430,7 +446,7 @@ fn ingress_v4(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     TC_ACT_UNSPEC
 }
 
-#[inline(never)]
+#[inline(always)]
 fn ingress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     let mut data = ctx.data();
     let mut data_end = ctx.data_end();
@@ -510,21 +526,186 @@ fn ingress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     TC_ACT_UNSPEC
 }
 
-#[classifier]
-pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
-    let Some((cfg, l2)) = prepare_packet(&ctx) else {
+#[inline(always)]
+fn dispatch_tcx(ctx: &TcContext, targets: &'static ProgramArray) -> i32 {
+    let Some((cfg, l2)) = prepare_packet(ctx) else {
         return TC_ACT_UNSPEC;
     };
     if l2.proto == ETH_P_IP && cfg.enabled_v4 != 0 {
-        return ingress_v4(&ctx, cfg, l2.ip_rel);
-    }
-    if l2.proto == ETH_P_IPV6 && cfg.enabled_v6 != 0 {
-        return ingress_v6(&ctx, cfg, l2.ip_rel);
+        unsafe {
+            targets.tail_call(ctx, TARGET_FAMILY_V4);
+        }
+    } else if l2.proto == ETH_P_IPV6 && cfg.enabled_v6 != 0 {
+        unsafe {
+            targets.tail_call(ctx, TARGET_FAMILY_V6);
+        }
     }
     TC_ACT_UNSPEC
 }
 
-#[inline(never)]
+#[inline(always)]
+fn run_family<F>(ctx: &TcContext, expected_proto: u16, is_v6: bool, handler: F) -> i32
+where
+    F: FnOnce(&TcContext, &GlobalConfig, usize) -> i32,
+{
+    let Some((cfg, l2)) = prepare_packet(ctx) else {
+        return TC_ACT_UNSPEC;
+    };
+    let enabled = if is_v6 {
+        cfg.enabled_v6
+    } else {
+        cfg.enabled_v4
+    };
+    if l2.proto == expected_proto && enabled != 0 {
+        return handler(ctx, cfg, l2.ip_rel);
+    }
+    TC_ACT_UNSPEC
+}
+
+#[classifier]
+pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
+    dispatch_tcx(&ctx, &INGRESS_TARGET)
+}
+
+#[classifier]
+pub fn flowcone_ingress_v4(ctx: TcContext) -> i32 {
+    run_family(&ctx, ETH_P_IP, false, ingress_v4)
+}
+
+#[classifier]
+pub fn flowcone_ingress_v6(ctx: TcContext) -> i32 {
+    run_family(&ctx, ETH_P_IPV6, true, ingress_v6)
+}
+
+#[inline(always)]
+fn pack_scratch_offsets(ip_rel: usize, udp_rel: usize, frag_rel: usize) -> u64 {
+    ((ip_rel as u64) & 0xfff)
+        | (((udp_rel as u64) & 0xfff) << 16)
+        | (((frag_rel as u64) & 0xfff) << 32)
+}
+
+#[inline(always)]
+fn tail_call_scratch(
+    ctx: &TcContext,
+    targets: &'static ProgramArray,
+    target: u32,
+    ip_rel: usize,
+    udp_rel: usize,
+    frag_rel: usize,
+) -> i32 {
+    if let Some(p) = EGRESS_SCRATCH.get_ptr_mut(0) {
+        unsafe {
+            *p = pack_scratch_offsets(ip_rel, udp_rel, frag_rel);
+        }
+    } else {
+        return TC_ACT_SHOT;
+    }
+    unsafe {
+        targets.tail_call(ctx, target);
+    }
+    TC_ACT_SHOT
+}
+
+#[inline(always)]
+fn tail_call_egress_alloc(ctx: &TcContext, ip_rel: usize, udp_rel: usize, target: u32) -> i32 {
+    tail_call_scratch(ctx, &EGRESS_ALLOC_TARGET, target, ip_rel, udp_rel, 0)
+}
+
+#[inline(always)]
+fn prepare_scratch_alloc(
+    ctx: &TcContext,
+    min_ip_hdr: usize,
+) -> Option<(&'static GlobalConfig, usize, usize, usize, usize, usize)> {
+    let cfg = get_config()?;
+    let packed = *EGRESS_SCRATCH.get(0)?;
+    let ip_rel = (packed & 0xfff) as usize;
+    let udp_rel = ((packed >> 16) & 0xfff) as usize;
+    let frag_rel = ((packed >> 32) & 0xfff) as usize;
+    if udp_rel < ip_rel + min_ip_hdr {
+        return None;
+    }
+    let mut data = ctx.data();
+    let mut data_end = ctx.data_end();
+    if !ensure_linear(ctx, &mut data, &mut data_end, udp_rel + 8) {
+        return None;
+    }
+    Some((cfg, data, data_end, ip_rel, udp_rel, frag_rel))
+}
+
+#[inline(always)]
+fn prepare_egress_alloc(
+    ctx: &TcContext,
+    min_ip_hdr: usize,
+) -> Option<(&'static GlobalConfig, usize, usize, usize, usize)> {
+    let (cfg, data, data_end, ip_rel, udp_rel, _) = prepare_scratch_alloc(ctx, min_ip_hdr)?;
+    Some((cfg, data, data_end, ip_rel, udp_rel))
+}
+
+#[inline(always)]
+fn rewrite_egress_v4(
+    ctx: &TcContext,
+    cfg: &GlobalConfig,
+    data: usize,
+    data_end: usize,
+    ip_rel: usize,
+    udp_rel: usize,
+    mapped_port: u16,
+) -> i32 {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(data + ip_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let old_src_ip = iph.src_addr;
+    let src_port = udph.src_port;
+    let new_src_ip = cfg.wan_ip4;
+    iph.src_addr = new_src_ip;
+    udph.src_port = mapped_port;
+
+    if !fixup_csum_v4(
+        ctx,
+        ip_rel,
+        udp_rel,
+        old_src_ip,
+        new_src_ip,
+        src_port,
+        mapped_port,
+    ) {
+        return TC_ACT_SHOT;
+    }
+    TC_ACT_UNSPEC
+}
+
+#[inline(always)]
+fn rewrite_egress_v6(
+    ctx: &TcContext,
+    cfg: &GlobalConfig,
+    data: usize,
+    data_end: usize,
+    ip_rel: usize,
+    udp_rel: usize,
+    mapped_port: u16,
+) -> i32 {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(data + ip_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let mut src_addr = [0u8; 16];
+    copy_ipv6(&mut src_addr, &iph.src_addr);
+    let src_port = udph.src_port;
+    copy_ipv6(&mut iph.src_addr, &cfg.wan_ip6);
+    udph.src_port = mapped_port;
+
+    if !fixup_csum_v6(ctx, udp_rel, &src_addr, &cfg.wan_ip6, src_port, mapped_port) {
+        return TC_ACT_SHOT;
+    }
+    TC_ACT_UNSPEC
+}
+
+#[inline(always)]
 fn egress_v4(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     let mut data = ctx.data();
     let mut data_end = ctx.data_end();
@@ -559,12 +740,10 @@ fn egress_v4(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     if !ensure_linear(ctx, &mut data, &mut data_end, udp_rel + 8) {
         return TC_ACT_SHOT;
     }
-    let ip_off = data + ip_rel;
-    let udp_off = data + udp_rel;
-    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(ip_off, data_end) }) else {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(data + ip_rel, data_end) }) else {
         return TC_ACT_SHOT;
     };
-    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
         return TC_ACT_SHOT;
     };
     let src_port = udph.src_port;
@@ -573,37 +752,14 @@ fn egress_v4(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
         return TC_ACT_UNSPEC;
     }
 
-    let mapped_port = match get_or_create_mapping_v4(
-        cfg,
-        src_ip,
-        src_port,
-        now_sec(),
-        is_short_lived_port(u16::from_be(udph.dst_port)),
-    ) {
-        Some(p) => p,
-        None => return TC_ACT_SHOT,
-    };
-
-    let old_src_ip = iph.src_addr;
-    let new_src_ip = cfg.wan_ip4;
-    iph.src_addr = new_src_ip;
-    udph.src_port = mapped_port;
-
-    if !fixup_csum_v4(
-        ctx,
-        ip_rel,
-        udp_rel,
-        old_src_ip,
-        new_src_ip,
-        src_port,
-        mapped_port,
-    ) {
-        return TC_ACT_SHOT;
+    let short_lived = is_short_lived_port(u16::from_be(udph.dst_port));
+    if let Some(mapped_port) = lookup_outbound_v4(cfg, src_ip, src_port, now_sec(), short_lived) {
+        return rewrite_egress_v4(ctx, cfg, data, data_end, ip_rel, udp_rel, mapped_port);
     }
-    TC_ACT_UNSPEC
+    tail_call_egress_alloc(ctx, ip_rel, udp_rel, TARGET_ALLOC_V4)
 }
 
-#[inline(never)]
+#[inline(always)]
 fn egress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     let mut data = ctx.data();
     let mut data_end = ctx.data_end();
@@ -637,12 +793,10 @@ fn egress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     if !ensure_linear(ctx, &mut data, &mut data_end, udp_rel + 8) {
         return TC_ACT_SHOT;
     }
-    let ip_off = data + ip_rel;
-    let udp_off = data + udp_rel;
-    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(ip_off, data_end) }) else {
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(data + ip_rel, data_end) }) else {
         return TC_ACT_SHOT;
     };
-    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
         return TC_ACT_SHOT;
     };
 
@@ -656,38 +810,85 @@ fn egress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
         return TC_ACT_UNSPEC;
     }
 
-    let mapped_port = match get_or_create_mapping_v6(
-        cfg,
-        src_addr,
-        src_port,
-        now_sec(),
-        is_short_lived_port(u16::from_be(udph.dst_port)),
-    ) {
-        Some(p) => p,
-        None => return TC_ACT_SHOT,
-    };
-
-    copy_ipv6(&mut iph.src_addr, &cfg.wan_ip6);
-    udph.src_port = mapped_port;
-
-    if !fixup_csum_v6(ctx, udp_rel, &src_addr, &cfg.wan_ip6, src_port, mapped_port) {
-        return TC_ACT_SHOT;
+    let short_lived = is_short_lived_port(u16::from_be(udph.dst_port));
+    if let Some(mapped_port) = lookup_outbound_v6(cfg, src_addr, src_port, now_sec(), short_lived) {
+        return rewrite_egress_v6(ctx, cfg, data, data_end, ip_rel, udp_rel, mapped_port);
     }
-    TC_ACT_UNSPEC
+    tail_call_egress_alloc(ctx, ip_rel, udp_rel, TARGET_ALLOC_V6)
 }
 
 #[classifier]
 pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
-    let Some((cfg, l2)) = prepare_packet(&ctx) else {
-        return TC_ACT_UNSPEC;
+    dispatch_tcx(&ctx, &EGRESS_TARGET)
+}
+
+#[classifier]
+pub fn flowcone_egress_v4(ctx: TcContext) -> i32 {
+    run_family(&ctx, ETH_P_IP, false, egress_v4)
+}
+
+#[classifier]
+pub fn flowcone_egress_v6(ctx: TcContext) -> i32 {
+    run_family(&ctx, ETH_P_IPV6, true, egress_v6)
+}
+
+#[classifier]
+pub fn flowcone_egress_alloc_v4(ctx: TcContext) -> i32 {
+    let Some((cfg, data, data_end, ip_rel, udp_rel)) = prepare_egress_alloc(&ctx, 20) else {
+        return TC_ACT_SHOT;
     };
-    if l2.proto == ETH_P_IP && cfg.enabled_v4 != 0 {
-        return egress_v4(&ctx, cfg, l2.ip_rel);
+    if cfg.enabled_v4 == 0 {
+        return TC_ACT_UNSPEC;
     }
-    if l2.proto == ETH_P_IPV6 && cfg.enabled_v6 != 0 {
-        return egress_v6(&ctx, cfg, l2.ip_rel);
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv4Hdr>(data + ip_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let mapped_port = get_or_create_mapping_v4(
+        cfg,
+        iph.src_addr,
+        udph.src_port,
+        now_sec(),
+        is_short_lived_port(u16::from_be(udph.dst_port)),
+    );
+    if mapped_port == 0 {
+        // fw4 skips masquerade for RFC1918 sources on this path, so passing the
+        // packet through would leak it un-NATed; drop instead.
+        return TC_ACT_SHOT;
     }
-    TC_ACT_UNSPEC
+    rewrite_egress_v4(&ctx, cfg, data, data_end, ip_rel, udp_rel, mapped_port)
+}
+
+#[classifier]
+pub fn flowcone_egress_alloc_v6(ctx: TcContext) -> i32 {
+    let Some((cfg, data, data_end, ip_rel, udp_rel)) = prepare_egress_alloc(&ctx, 40) else {
+        return TC_ACT_SHOT;
+    };
+    if cfg.enabled_v6 == 0 {
+        return TC_ACT_UNSPEC;
+    }
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(data + ip_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let mut src_addr = [0u8; 16];
+    copy_ipv6(&mut src_addr, &iph.src_addr);
+    let mapped_port = get_or_create_mapping_v6(
+        cfg,
+        src_addr,
+        udph.src_port,
+        now_sec(),
+        is_short_lived_port(u16::from_be(udph.dst_port)),
+    );
+    if mapped_port == 0 {
+        // Same as v4: do not let an un-NATed private source reach the WAN.
+        return TC_ACT_SHOT;
+    }
+    rewrite_egress_v6(&ctx, cfg, data, data_end, ip_rel, udp_rel, mapped_port)
 }
 
 #[classifier]
@@ -834,21 +1035,84 @@ fn insert_frag_out_v6(cfg: &GlobalConfig, src: &[u8; 16], dst: &[u8; 16], id_wan
     let _ = FRAG_OUT_V6.insert(&key, &value, BPF_ANY);
 }
 
-#[inline(always)]
+#[inline(never)]
+fn rewrite_frag_v6_egress_first(
+    ctx: &TcContext,
+    cfg: &GlobalConfig,
+    offsets: u64,
+    mapped: u16,
+    now: u32,
+) -> i32 {
+    let ip_rel = core::hint::black_box((offsets & 0xfff) as usize) & 0xfff;
+    let udp_rel = core::hint::black_box(((offsets >> 16) & 0xfff) as usize) & 0xfff;
+    let frag_rel = core::hint::black_box(((offsets >> 32) & 0xfff) as usize) & 0xfff;
+    let wan_id = alloc_wan_frag_id();
+
+    // Load original source IP via constant-size bpf_skb_load_bytes so LLVM
+    // keeps a single 16-byte stack slot instead of spilling 16 separate byte
+    // loads across header rewrites.
+    let Ok(src_ip) = ctx.load::<[u8; 16]>(ip_rel + 8) else {
+        return TC_ACT_SHOT;
+    };
+
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(data + ip_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    copy_ipv6(&mut iph.src_addr, &cfg.wan_ip6);
+
+    let Some(fh) = (unsafe { parse_header_ref_mut::<FragExtHdr>(data + frag_rel, data_end) })
+    else {
+        return TC_ACT_SHOT;
+    };
+    let id = u32::from_be_bytes(fh.id);
+    let more = (u16::from_be(fh.frag_off) & 1) != 0;
+    fh.id = u32::to_be(wan_id).to_ne_bytes();
+
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let old_sport = udph.src_port;
+    udph.src_port = mapped;
+
+    if !fixup_csum_v6(ctx, udp_rel, &src_ip, &cfg.wan_ip6, old_sport, mapped) {
+        return TC_ACT_SHOT;
+    }
+    if more {
+        // Defer loading untouched dst_addr until after fixup_csum_v6 to avoid
+        // holding two 16-byte addresses across checksum helpers.
+        let Ok(dst_ip) = ctx.load::<[u8; 16]>(ip_rel + 24) else {
+            return TC_ACT_SHOT;
+        };
+        let id_wan = ((id as u64) << 32) | (wan_id as u64);
+        insert_frag_out_v6(cfg, &src_ip, &dst_ip, id_wan, now);
+    }
+    TC_ACT_UNSPEC
+}
+
+const FRAG_FIRST_UNSPEC: u64 = 0;
+const FRAG_FIRST_SHOT: u64 = 1;
+const FRAG_FIRST_HIT: u64 = 2;
+
+/// Returns `FRAG_FIRST_UNSPEC`, `FRAG_FIRST_SHOT`, or `(udp_rel << 32) |
+/// (mapped << 16) | FRAG_FIRST_HIT` so `rewrite_frag_v6_egress_first` runs
+/// sequentially after this stack frame pops.
+#[inline(never)]
 fn frag_v6_egress_first(
     ctx: &TcContext,
     cfg: &GlobalConfig,
     ip_rel: usize,
     frag_rel: usize,
-) -> i32 {
+) -> u64 {
     let mut data = ctx.data();
     let mut data_end = ctx.data_end();
     let Some(iph_ro) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(data + ip_rel, data_end) }) else {
-        return TC_ACT_SHOT;
+        return FRAG_FIRST_SHOT;
     };
     let Some(fh_ro) = (unsafe { parse_header_ref_mut::<FragExtHdr>(data + frag_rel, data_end) })
     else {
-        return TC_ACT_SHOT;
+        return FRAG_FIRST_SHOT;
     };
     let payload_len = u16::from_be(iph_ro.payload_len) as usize;
     let next_hdr = fh_ro.next_hdr;
@@ -866,65 +1130,81 @@ fn frag_v6_egress_first(
         if more {
             insert_frag_bypass_v6(cfg, &src_ip, &dst_ip, id, now);
         }
-        return TC_ACT_UNSPEC;
+        return FRAG_FIRST_UNSPEC;
     };
     if payload_len < (udp_rel - ip_rel - 40) + 8 {
-        return TC_ACT_UNSPEC;
+        return FRAG_FIRST_UNSPEC;
     }
     if !ensure_linear(ctx, &mut data, &mut data_end, udp_rel + 8) {
-        return TC_ACT_SHOT;
+        return FRAG_FIRST_SHOT;
     }
-    let ip_off = data + ip_rel;
-    let udp_off = data + udp_rel;
-    let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(ip_off, data_end) }) else {
-        return TC_ACT_SHOT;
-    };
-    let Some(fh) = (unsafe { parse_header_ref_mut::<FragExtHdr>(data + frag_rel, data_end) })
-    else {
-        return TC_ACT_SHOT;
-    };
-    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(udp_off, data_end) }) else {
-        return TC_ACT_SHOT;
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
+        return FRAG_FIRST_SHOT;
     };
     let src_port = udph.src_port;
     if bypass_special_udp6(&src_ip, &dst_ip, src_port, udph.dst_port) || udph.check == 0 {
         if more {
             insert_frag_bypass_v6(cfg, &src_ip, &dst_ip, id, now);
         }
-        return TC_ACT_UNSPEC;
+        return FRAG_FIRST_UNSPEC;
     }
-    let mapped = match get_or_create_mapping_v6(
-        cfg,
-        src_ip,
-        src_port,
-        now,
-        is_short_lived_port(u16::from_be(udph.dst_port)),
-    ) {
-        Some(p) => p,
-        None => return TC_ACT_SHOT,
+    let short_lived = is_short_lived_port(u16::from_be(udph.dst_port));
+    if let Some(mapped) = lookup_outbound_v6(cfg, src_ip, src_port, now, short_lived) {
+        return ((udp_rel as u64) << 32) | ((mapped as u64) << 16) | FRAG_FIRST_HIT;
+    }
+    let _ = tail_call_scratch(
+        ctx,
+        &FRAG6_TARGET,
+        TARGET_FRAG_EGRESS_ALLOC,
+        ip_rel,
+        udp_rel,
+        frag_rel,
+    );
+    FRAG_FIRST_SHOT
+}
+
+#[classifier]
+pub fn flowcone_frag_v6_egress_alloc(ctx: TcContext) -> i32 {
+    let Some((cfg, data, data_end, ip_rel, udp_rel, frag_rel)) = prepare_scratch_alloc(&ctx, 40)
+    else {
+        return TC_ACT_SHOT;
     };
-    let old_sport = udph.src_port;
-    let wan_id = alloc_wan_frag_id();
-    fh.id = u32::to_be(wan_id).to_ne_bytes();
-    copy_ipv6(&mut iph.src_addr, &cfg.wan_ip6);
-    udph.src_port = mapped;
-    if !fixup_csum_v6(ctx, udp_rel, &src_ip, &cfg.wan_ip6, old_sport, mapped) {
+    if cfg.enabled_v6 == 0 || frag_rel < ip_rel + 40 || udp_rel < frag_rel + 8 {
         return TC_ACT_SHOT;
     }
-    if more {
-        let id_wan = ((id as u64) << 32) | (wan_id as u64);
-        insert_frag_out_v6(cfg, &src_ip, &dst_ip, id_wan, now);
+    let Ok(src_ip) = ctx.load::<[u8; 16]>(ip_rel + 8) else {
+        return TC_ACT_SHOT;
+    };
+    let Some(udph) = (unsafe { parse_header_ref_mut::<UdpHdr>(data + udp_rel, data_end) }) else {
+        return TC_ACT_SHOT;
+    };
+    let now = now_sec();
+    let mapped = get_or_create_mapping_v6(
+        cfg,
+        src_ip,
+        udph.src_port,
+        now,
+        is_short_lived_port(u16::from_be(udph.dst_port)),
+    );
+    if mapped == 0 {
+        return TC_ACT_SHOT;
     }
-    TC_ACT_UNSPEC
+    rewrite_frag_v6_egress_first(
+        &ctx,
+        cfg,
+        pack_scratch_offsets(ip_rel, udp_rel, frag_rel),
+        mapped,
+        now,
+    )
 }
 
 #[inline(never)]
 fn frag_v6_egress_cont(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize, frag_rel: usize) -> i32 {
-    let mut data = ctx.data();
-    let mut data_end = ctx.data_end();
-    if !ensure_linear(ctx, &mut data, &mut data_end, frag_rel + 8) {
+    if !ensure_linear(ctx, &mut ctx.data(), &mut ctx.data_end(), frag_rel + 8) {
         return TC_ACT_SHOT;
     }
+    let data = ctx.data();
+    let data_end = ctx.data_end();
     let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(data + ip_rel, data_end) }) else {
         return TC_ACT_SHOT;
     };
@@ -1014,7 +1294,18 @@ pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
     }
     let offset = u16::from_be(fh.frag_off) & 0xfff8;
     if offset == 0 {
-        return frag_v6_egress_first(&ctx, cfg, ip_rel, frag_rel);
+        let res = frag_v6_egress_first(&ctx, cfg, ip_rel, frag_rel);
+        return match res & 0xff {
+            FRAG_FIRST_UNSPEC => TC_ACT_UNSPEC,
+            FRAG_FIRST_HIT => rewrite_frag_v6_egress_first(
+                &ctx,
+                cfg,
+                pack_scratch_offsets(ip_rel, (res >> 32) as usize, frag_rel),
+                ((res >> 16) & 0xffff) as u16,
+                now_sec(),
+            ),
+            _ => TC_ACT_SHOT,
+        };
     }
     frag_v6_egress_cont(&ctx, cfg, ip_rel, frag_rel)
 }
@@ -1223,16 +1514,16 @@ pub fn flowcone_frag_v4_egress(ctx: TcContext) -> i32 {
         let _ = FRAG_OUT_V4.insert(&key, &value, BPF_ANY);
         return TC_ACT_UNSPEC;
     }
-    let mapped = match get_or_create_mapping_v4(
+    let mapped = get_or_create_mapping_v4(
         cfg,
         src_ip,
         src_port,
         now,
         is_short_lived_port(u16::from_be(udph.dst_port)),
-    ) {
-        Some(p) => p,
-        None => return TC_ACT_SHOT,
-    };
+    );
+    if mapped == 0 {
+        return TC_ACT_SHOT;
+    }
     let old_sport = udph.src_port;
     let wan_id = alloc_wan_ip_id();
     let new_id = u16::to_be(wan_id);
@@ -1624,7 +1915,7 @@ pub fn flowcone_icmp_egress_target(ctx: TcContext) -> i32 {
 #[classifier]
 pub fn flowcone_tcx_ingress_a(ctx: TcContext) -> i32 {
     unsafe {
-        INGRESS_TARGET.tail_call(&ctx, 0);
+        INGRESS_TARGET.tail_call(&ctx, TARGET_DISPATCH);
     }
     TC_ACT_UNSPEC
 }
@@ -1632,7 +1923,7 @@ pub fn flowcone_tcx_ingress_a(ctx: TcContext) -> i32 {
 #[classifier]
 pub fn flowcone_tcx_ingress_b(ctx: TcContext) -> i32 {
     unsafe {
-        INGRESS_TARGET.tail_call(&ctx, 0);
+        INGRESS_TARGET.tail_call(&ctx, TARGET_DISPATCH);
     }
     TC_ACT_UNSPEC
 }
@@ -1641,7 +1932,7 @@ pub fn flowcone_tcx_ingress_b(ctx: TcContext) -> i32 {
 #[classifier]
 pub fn flowcone_tcx_egress_a(ctx: TcContext) -> i32 {
     unsafe {
-        EGRESS_TARGET.tail_call(&ctx, 0);
+        EGRESS_TARGET.tail_call(&ctx, TARGET_DISPATCH);
     }
     TC_ACT_UNSPEC
 }
@@ -1649,7 +1940,7 @@ pub fn flowcone_tcx_egress_a(ctx: TcContext) -> i32 {
 #[classifier]
 pub fn flowcone_tcx_egress_b(ctx: TcContext) -> i32 {
     unsafe {
-        EGRESS_TARGET.tail_call(&ctx, 0);
+        EGRESS_TARGET.tail_call(&ctx, TARGET_DISPATCH);
     }
     TC_ACT_UNSPEC
 }

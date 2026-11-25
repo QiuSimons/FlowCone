@@ -380,6 +380,32 @@ fn reserved_delta(previous: &[u16], current: &[u16]) -> (Vec<u16>, Vec<u16>) {
     (added, removed)
 }
 
+enum FamilyBitmap {
+    Active(AtomicBitmap),
+    /// Keeps disabled-family BPF map FDs alive while eBPF programs load and
+    /// execute.
+    Disabled {
+        _array: Array<MapData, u64>,
+    },
+}
+
+impl FamilyBitmap {
+    fn new(array: Array<MapData, u64>, enabled: bool) -> Result<Self, String> {
+        if enabled {
+            AtomicBitmap::new(array).map(Self::Active)
+        } else {
+            Ok(Self::Disabled { _array: array })
+        }
+    }
+
+    fn as_mut(&mut self) -> Option<&mut AtomicBitmap> {
+        match self {
+            Self::Active(bitmap) => Some(bitmap),
+            Self::Disabled { .. } => None,
+        }
+    }
+}
+
 pub struct SessionManager {
     config_map: Array<MapData, GlobalConfig>,
     active_map: Array<MapData, u32>,
@@ -396,10 +422,10 @@ pub struct SessionManager {
     gc_flags: Array<MapData, u32>,
     reserved4: Array<MapData, u16>,
     reserved6: Array<MapData, u16>,
-    bitmap_even4: Option<AtomicBitmap>,
-    bitmap_odd4: Option<AtomicBitmap>,
-    bitmap_even6: Option<AtomicBitmap>,
-    bitmap_odd6: Option<AtomicBitmap>,
+    bitmap_even4: FamilyBitmap,
+    bitmap_odd4: FamilyBitmap,
+    bitmap_even6: FamilyBitmap,
+    bitmap_odd6: FamilyBitmap,
     port_flags: Array<MapData, u32>,
     pool_enable_v4: bool,
     pool_enable_v6: bool,
@@ -707,18 +733,10 @@ impl SessionManager {
             gc_flags,
             reserved4,
             reserved6,
-            bitmap_even4: enable_v4
-                .then(|| AtomicBitmap::new(bitmap_even4))
-                .transpose()?,
-            bitmap_odd4: enable_v4
-                .then(|| AtomicBitmap::new(bitmap_odd4))
-                .transpose()?,
-            bitmap_even6: enable_v6
-                .then(|| AtomicBitmap::new(bitmap_even6))
-                .transpose()?,
-            bitmap_odd6: enable_v6
-                .then(|| AtomicBitmap::new(bitmap_odd6))
-                .transpose()?,
+            bitmap_even4: FamilyBitmap::new(bitmap_even4, enable_v4)?,
+            bitmap_odd4: FamilyBitmap::new(bitmap_odd4, enable_v4)?,
+            bitmap_even6: FamilyBitmap::new(bitmap_even6, enable_v6)?,
+            bitmap_odd6: FamilyBitmap::new(bitmap_odd6, enable_v6)?,
             port_flags,
             pool_enable_v4: enable_v4,
             pool_enable_v6: enable_v6,
@@ -791,7 +809,7 @@ impl SessionManager {
     pub fn apply_reserved_ports(&mut self, ports4: Option<&[u16]>, ports6: Option<&[u16]>) {
         if self.pool_enable_v4
             && let Some(ports) = ports4
-            && let (Some(even), Some(odd)) = (&mut self.bitmap_even4, &mut self.bitmap_odd4)
+            && let (Some(even), Some(odd)) = (self.bitmap_even4.as_mut(), self.bitmap_odd4.as_mut())
         {
             let mut pool = FamilyPortPool {
                 min_port: self.min_port,
@@ -810,7 +828,7 @@ impl SessionManager {
         }
         if self.pool_enable_v6
             && let Some(ports) = ports6
-            && let (Some(even), Some(odd)) = (&mut self.bitmap_even6, &mut self.bitmap_odd6)
+            && let (Some(even), Some(odd)) = (self.bitmap_even6.as_mut(), self.bitmap_odd6.as_mut())
         {
             let mut pool = FamilyPortPool {
                 min_port: self.min_port,
@@ -890,7 +908,7 @@ impl SessionManager {
         if !self.pool_enable_v4 || !self.pool_ready() {
             return;
         }
-        if let (Some(even), Some(odd)) = (&mut self.bitmap_even4, &mut self.bitmap_odd4) {
+        if let (Some(even), Some(odd)) = (self.bitmap_even4.as_mut(), self.bitmap_odd4.as_mut()) {
             let mut pool = FamilyPortPool {
                 min_port: self.min_port,
                 max_port: self.max_port,
@@ -906,7 +924,7 @@ impl SessionManager {
         if !self.pool_enable_v6 || !self.pool_ready() {
             return;
         }
-        if let (Some(even), Some(odd)) = (&mut self.bitmap_even6, &mut self.bitmap_odd6) {
+        if let (Some(even), Some(odd)) = (self.bitmap_even6.as_mut(), self.bitmap_odd6.as_mut()) {
             let mut pool = FamilyPortPool {
                 min_port: self.min_port,
                 max_port: self.max_port,
@@ -936,7 +954,7 @@ impl SessionManager {
     }
 
     fn release_port4(&mut self, port: u16) {
-        if let (Some(even), Some(odd)) = (&mut self.bitmap_even4, &mut self.bitmap_odd4) {
+        if let (Some(even), Some(odd)) = (self.bitmap_even4.as_mut(), self.bitmap_odd4.as_mut()) {
             let mut pool = FamilyPortPool {
                 min_port: self.min_port,
                 max_port: self.max_port,
@@ -949,7 +967,7 @@ impl SessionManager {
     }
 
     fn release_port6(&mut self, port: u16) {
-        if let (Some(even), Some(odd)) = (&mut self.bitmap_even6, &mut self.bitmap_odd6) {
+        if let (Some(even), Some(odd)) = (self.bitmap_even6.as_mut(), self.bitmap_odd6.as_mut()) {
             let mut pool = FamilyPortPool {
                 min_port: self.min_port,
                 max_port: self.max_port,
@@ -1039,7 +1057,7 @@ impl SessionManager {
         if !self.pool_enable_v4 || !self.pool_ready() {
             return;
         }
-        if let (Some(even), Some(odd)) = (&mut self.bitmap_even4, &mut self.bitmap_odd4) {
+        if let (Some(even), Some(odd)) = (self.bitmap_even4.as_mut(), self.bitmap_odd4.as_mut()) {
             let mut pool = FamilyPortPool {
                 min_port: self.min_port,
                 max_port: self.max_port,
@@ -1055,7 +1073,7 @@ impl SessionManager {
         if !self.pool_enable_v6 || !self.pool_ready() {
             return;
         }
-        if let (Some(even), Some(odd)) = (&mut self.bitmap_even6, &mut self.bitmap_odd6) {
+        if let (Some(even), Some(odd)) = (self.bitmap_even6.as_mut(), self.bitmap_odd6.as_mut()) {
             let mut pool = FamilyPortPool {
                 min_port: self.min_port,
                 max_port: self.max_port,
@@ -1353,7 +1371,7 @@ impl SessionManager {
         let mut backlog6 = false;
 
         if self.pool_enable_v4
-            && let (Some(even), Some(odd)) = (&mut self.bitmap_even4, &mut self.bitmap_odd4)
+            && let (Some(even), Some(odd)) = (self.bitmap_even4.as_mut(), self.bitmap_odd4.as_mut())
         {
             let mut state = FamilyGcState {
                 ob_map: &mut self.ob_map4,
@@ -1372,7 +1390,7 @@ impl SessionManager {
         }
 
         if self.pool_enable_v6
-            && let (Some(even), Some(odd)) = (&mut self.bitmap_even6, &mut self.bitmap_odd6)
+            && let (Some(even), Some(odd)) = (self.bitmap_even6.as_mut(), self.bitmap_odd6.as_mut())
         {
             let mut state = FamilyGcState {
                 ob_map: &mut self.ob_map6,
