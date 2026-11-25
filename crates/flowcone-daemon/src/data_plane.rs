@@ -304,7 +304,8 @@ impl DataPlane {
         Ok(data_plane)
     }
 
-    /// Attaches the active dispatcher pair atomically (detaches ingress if egress fails).
+    /// Attaches the active dispatcher pair atomically (detaches ingress if
+    /// egress fails).
     pub(crate) fn attach(
         &mut self,
         force_new: bool,

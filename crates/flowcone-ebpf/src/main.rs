@@ -1,7 +1,8 @@
 #![no_std]
 #![no_main]
 #![feature(asm_experimental_arch)]
-// `#[classifier]` expands to a `pub extern "C" fn(*mut __sk_buff)` wrapper that calls `TcContext::from_ptr`.
+// `#[classifier]` expands to a `pub extern "C" fn(*mut __sk_buff)` wrapper that
+// calls `TcContext::from_ptr`.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod engine;
@@ -78,7 +79,8 @@ fn prepare_packet(ctx: &TcContext) -> Option<(&'static GlobalConfig, L2Info)> {
     }
     let mut data = ctx.data();
     let mut data_end = ctx.data_end();
-    // Linearize up to L2 + VLAN/PPPoE headers without comparing pointers via subtraction.
+    // Linearize up to L2 + VLAN/PPPoE headers without comparing pointers via
+    // subtraction.
     let min_l2 = if cfg.l2_len == 14 { 32 } else { 2 };
     pull_up_to(ctx, &mut data, &mut data_end, min_l2);
     let l2 = unsafe { parse_l2(data, data_end, cfg.l2_len) }?;
@@ -193,7 +195,8 @@ pub static SESSION_EVENTS_V6: RingBuf = RingBuf::with_byte_size(SESSION_EVENT_RI
 #[map]
 pub static GC_FLAGS: Array<u32> = Array::with_max_entries(1, 0);
 
-/// Reservation epoch state array (`bit 0` = reserved, bits `1..=15` = epoch) for host UDP ports.
+/// Reservation epoch state array (`bit 0` = reserved, bits `1..=15` = epoch)
+/// for host UDP ports.
 #[map]
 pub static RESERVED_V4: Array<u16> = Array::with_max_entries(PORT_STATE_ENTRIES, 0);
 
@@ -285,7 +288,8 @@ fn locate_ipv6_udp_and_validate(
         return None;
     }
 
-    // Pull extension header chain up to 256 bytes linearly if the packet is paged.
+    // Pull extension header chain up to 256 bytes linearly if the packet is
+    // paged.
     pull_up_to(ctx, data, data_end, ip_rel + 256);
     match unsafe { locate_ipv6_l4(*data, *data_end, ip_rel, nh) } {
         Ipv6L4::Udp(udp_rel) => Some((udp_rel - ip_rel, payload_len)),
@@ -342,7 +346,8 @@ fn make_frag_key6(epoch: u32, src: &[u8; 16], dst: &[u8; 16], id: u32) -> FragKe
         copy_ipv6(&mut (*p).src, src);
         copy_ipv6(&mut (*p).dst, dst);
         (*p).id = id;
-        // Write `proto` + `_pad` as one aligned 32-bit word so LLVM does not emit a 3-byte memset.
+        // Write `proto` + `_pad` as one aligned 32-bit word so LLVM does not
+        // emit a 3-byte memset.
         (core::ptr::addr_of_mut!((*p).proto) as *mut u32).write(u32::from_ne_bytes([
             IPPROTO_UDP,
             0,
@@ -385,7 +390,8 @@ fn ingress_v4(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
         }
         return TC_ACT_UNSPEC;
     }
-    // Check fragmentation before tot_len < ihl + 8 so 1..=7-byte trailing fragments still tail-call.
+    // Check fragmentation before tot_len < ihl + 8 so 1..=7-byte trailing
+    // fragments still tail-call.
     if (frag_off & 0x3fff) != 0 {
         unsafe {
             FRAG_TARGET.tail_call(ctx, TARGET_INGRESS);
@@ -725,7 +731,8 @@ fn egress_v4(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     if src_ip == cfg.wan_ip4 || !flowcone_common::is_private_ipv4(src_ip) {
         return TC_ACT_UNSPEC;
     }
-    // Check fragmentation before tot_len < ihl + 8 so 1..=7-byte trailing fragments never leak LAN IP.
+    // Check fragmentation before tot_len < ihl + 8 so 1..=7-byte trailing
+    // fragments never leak LAN IP.
     if (frag_off & 0x3fff) != 0 {
         unsafe {
             FRAG_TARGET.tail_call(ctx, TARGET_EGRESS);
@@ -944,7 +951,8 @@ pub fn flowcone_frag_v6_ingress(ctx: TcContext) -> i32 {
                     (*v_ptr).last_seen = now;
                 }
                 let mark = get_mark(&ctx);
-                // Use skb.store with BPF_F_RECOMPUTE_CSUM so CHECKSUM_COMPLETE skb->csum stays valid.
+                // Use skb.store with BPF_F_RECOMPUTE_CSUM so CHECKSUM_COMPLETE
+                // skb->csum stays valid.
                 if ctx
                     .skb
                     .store(ip_rel + 24, &v.ip, BPF_F_RECOMPUTE_CSUM as u64)
@@ -2216,7 +2224,8 @@ pub fn flowcone_icmp6_egress_target(ctx: TcContext) -> i32 {
     }
     let mut old_emb_dst = [0u8; 16];
     copy_ipv6(&mut old_emb_dst, &emb_ro.dst_addr);
-    // Embedded source is the remote peer (must be global unicast 2000::/3, never ULA/LL/MC/loopback).
+    // Embedded source is the remote peer (must be global unicast 2000::/3,
+    // never ULA/LL/MC/loopback).
     if !flowcone_common::is_routable_internal_ipv6(&old_emb_dst, allow_all_internal)
         || (emb_ro.src_addr[0] & 0xe0) != 0x20
     {

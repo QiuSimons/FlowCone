@@ -50,8 +50,8 @@ unsafe fn atomic_load_u32(ptr: *const u32) -> u32 {
     unsafe { core::ptr::read_volatile(ptr) }
 }
 
-/// 32-bit BPF `cmpxchg32_32` (`BPF_ATOMIC | BPF_W | BPF_CMPXCHG`), providing atomic
-/// compare-and-swap and full barrier semantics across CPUs.
+/// 32-bit BPF `cmpxchg32_32` (`BPF_ATOMIC | BPF_W | BPF_CMPXCHG`), providing
+/// atomic compare-and-swap and full barrier semantics across CPUs.
 #[inline(always)]
 unsafe fn atomic_cmpxchg_u32(ptr: *mut u32, expected: u32, new_val: u32) -> u32 {
     let mut prev = expected;
@@ -106,7 +106,8 @@ fn push_port_exhausted_v4() {
     if let Some(mut entry) = SESSION_EVENTS_V4.reserve::<SessionEvent4>(0) {
         let p = entry.as_mut_ptr();
         unsafe {
-            // Non-zero flags sentinel on port=0 prevents LLVM from coalescing writes into memset.
+            // Non-zero flags sentinel on port=0 prevents LLVM from coalescing
+            // writes into memset.
             p.cast::<u64>().write_volatile(0);
             p.cast::<u32>()
                 .add(2)
@@ -224,8 +225,9 @@ pub fn fixup_l3_id_v4(ctx: &TcContext, ip_rel: usize, old_id: u16, new_id: u16) 
         .is_ok()
 }
 
-/// Fix up IPv6 UDP checksum using `bpf_csum_diff` + `BPF_F_IPV6` so `CHECKSUM_COMPLETE`
-/// `skb->csum` is preserved (IPv6 has no L3 header checksum).
+/// Fix up IPv6 UDP checksum using `bpf_csum_diff` + `BPF_F_IPV6` so
+/// `CHECKSUM_COMPLETE` `skb->csum` is preserved (IPv6 has no L3 header
+/// checksum).
 #[inline(always)]
 pub fn fixup_csum_v6(
     ctx: &TcContext,

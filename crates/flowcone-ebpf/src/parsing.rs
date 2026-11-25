@@ -45,11 +45,12 @@ pub struct UdpHdr {
     pub check: u16,
 }
 
-/// Ensures at least `need` bytes from `data` are linearly accessible in `ctx.skb`,
-/// pulling paged data if necessary and refreshing `data`/`data_end`.
+/// Ensures at least `need` bytes from `data` are linearly accessible in
+/// `ctx.skb`, pulling paged data if necessary and refreshing `data`/`data_end`.
 ///
-/// Uses direct `data + need <= data_end` comparison instead of `data_end - data`
-/// so the Linux eBPF verifier tracks packet bounds without pointer subtraction.
+/// Uses direct `data + need <= data_end` comparison instead of `data_end -
+/// data` so the Linux eBPF verifier tracks packet bounds without pointer
+/// subtraction.
 ///
 /// Any packet references derived from the old `data` pointer are invalidated if
 /// `pull_data` runs and must be re-acquired afterwards.
@@ -90,7 +91,8 @@ pub fn pull_up_to(ctx: &TcContext, data: &mut usize, data_end: &mut usize, max_n
     }
 }
 
-/// Copy a 16-byte IPv6 address using two 64-bit word moves so LLVM never emits `memmove`.
+/// Copy a 16-byte IPv6 address using two 64-bit word moves so LLVM never emits
+/// `memmove`.
 #[inline(always)]
 pub fn copy_ipv6(dst: &mut [u8; 16], src: &[u8; 16]) {
     let s = src.as_ptr() as *const u64;
