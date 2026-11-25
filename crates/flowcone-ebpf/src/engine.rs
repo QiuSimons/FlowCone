@@ -340,8 +340,9 @@ macro_rules! impl_alloc_port {
                         bitmap_set_bit(map, slot, mask);
                         return ((res_state as u32) << 16) | (pref as u32);
                     }
+                } else {
+                    bitmap_set_bit(map, slot, mask);
                 }
-                bitmap_set_bit(map, slot, mask);
             }
 
             let pref_even = (pref & 1) == 0;
