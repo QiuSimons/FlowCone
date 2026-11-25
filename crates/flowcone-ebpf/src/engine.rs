@@ -817,8 +817,8 @@ macro_rules! impl_get_or_create_mapping {
                         return 0;
                     }
 
-                    is_res = old_ip_match
-                        && flowcone_common::reserved_state_is_reserved(old_res_state);
+                    is_res =
+                        old_ip_match && flowcone_common::reserved_state_is_reserved(old_res_state);
                     if is_res {
                         let (is_even, slot, mask) =
                             flowcone_common::port_to_bitmap_coords(old_port);
@@ -871,10 +871,8 @@ macro_rules! impl_get_or_create_mapping {
                 }
 
                 let m_port = u16::to_be(alloc);
-                let new_meta = flowcone_common::pack_binding_meta(
-                    is_short_lived,
-                    (alloc_packed >> 16) as u16,
-                );
+                let new_meta =
+                    flowcone_common::pack_binding_meta(is_short_lived, (alloc_packed >> 16) as u16);
                 let pm_ptr = <$val_ty as BindingOps>::port_meta_ptr(stale_val);
                 <$val_ty as BindingOps>::write_ip(stale_val, wan_ip);
                 unsafe {
