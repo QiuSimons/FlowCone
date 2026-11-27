@@ -54,9 +54,8 @@ pub const LAST_SEEN_INTERVAL_SEC: u32 = 1;
 pub const TARGET_INGRESS: u32 = 0;
 pub const TARGET_EGRESS: u32 = 1;
 
-pub const TARGET_DISPATCH: u32 = 0;
-pub const TARGET_FAMILY_V4: u32 = 1;
-pub const TARGET_FAMILY_V6: u32 = 2;
+pub const TARGET_FAMILY_V4: u32 = 0;
+pub const TARGET_FAMILY_V6: u32 = 1;
 
 pub const TARGET_ALLOC_V4: u32 = 0;
 pub const TARGET_ALLOC_V6: u32 = 1;
@@ -72,8 +71,8 @@ fn get_mark(ctx: &TcContext) -> u32 {
 }
 
 #[inline(always)]
-fn prepare_packet(ctx: &TcContext) -> Option<(&'static GlobalConfig, L2Info)> {
-    let cfg = get_config()?;
+fn prepare_packet_slot(ctx: &TcContext) -> Option<(u32, &'static GlobalConfig, L2Info)> {
+    let (active, cfg) = get_config_slot()?;
     if cfg.bypass_mark_mask != 0 && (get_mark(ctx) & cfg.bypass_mark_mask) == cfg.bypass_mark_val {
         return None;
     }
@@ -84,6 +83,12 @@ fn prepare_packet(ctx: &TcContext) -> Option<(&'static GlobalConfig, L2Info)> {
     let min_l2 = if cfg.l2_len == 14 { 32 } else { 2 };
     pull_up_to(ctx, &mut data, &mut data_end, min_l2);
     let l2 = unsafe { parse_l2(data, data_end, cfg.l2_len) }?;
+    Some((active, cfg, l2))
+}
+
+#[inline(always)]
+fn prepare_packet(ctx: &TcContext) -> Option<(&'static GlobalConfig, L2Info)> {
+    let (_, cfg, l2) = prepare_packet_slot(ctx)?;
     Some((cfg, l2))
 }
 
@@ -95,17 +100,27 @@ pub static CONFIG: Array<GlobalConfig> = Array::with_max_entries(2, 0);
 pub static ACTIVE_CONFIG: Array<u32> = Array::with_max_entries(1, 0);
 
 #[inline(always)]
-pub fn get_config() -> Option<&'static GlobalConfig> {
+pub fn get_config_slot() -> Option<(u32, &'static GlobalConfig)> {
     let active = *ACTIVE_CONFIG.get(0)? & 1;
-    CONFIG.get(active)
+    Some((active, CONFIG.get(active)?))
 }
 
-/// Tail-call targets for TC dispatchers. Slots `[0, 1, 2]` correspond to
-/// `[TARGET_DISPATCH, TARGET_FAMILY_V4, TARGET_FAMILY_V6]`.
+#[inline(always)]
+pub fn get_config() -> Option<&'static GlobalConfig> {
+    Some(get_config_slot()?.1)
+}
+
+/// Tail-call targets for TC dispatchers `[TARGET_FAMILY_V4, TARGET_FAMILY_V6]`.
 #[map]
-pub static INGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(3, 0);
+pub static INGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(2, 0);
 #[map]
-pub static EGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(3, 0);
+pub static EGRESS_TARGET: ProgramArray = ProgramArray::with_max_entries(2, 0);
+/// Per-CPU L2 dispatch handoff `(active_cfg << 16) | ip_rel` from A/B
+/// dispatcher to family handler so L2 headers are parsed once per packet.
+#[map]
+pub static INGRESS_L2_SCRATCH: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0);
+#[map]
+pub static EGRESS_L2_SCRATCH: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0);
 /// Slow-path outbound port allocation tail-call targets `[TARGET_ALLOC_V4,
 /// TARGET_ALLOC_V6]`.
 #[map]
@@ -272,7 +287,7 @@ fn locate_ipv6_udp_and_validate(
     let payload_len = u16::from_be(iph.payload_len) as usize;
     let nh = iph.next_hdr;
     if nh == IPPROTO_UDP {
-        return Some((40, payload_len));
+        return Some((ip_rel + 40, payload_len));
     }
     if nh == IPPROTO_ICMPV6 {
         unsafe {
@@ -291,7 +306,7 @@ fn locate_ipv6_udp_and_validate(
     // paged.
     pull_up_to(ctx, data, data_end, ip_rel + 256);
     match unsafe { locate_ipv6_l4(*data, *data_end, ip_rel, nh) } {
-        Ipv6L4::Udp(udp_rel) => Some((udp_rel - ip_rel, payload_len)),
+        Ipv6L4::Udp(udp_rel) => Some((udp_rel, payload_len)),
         Ipv6L4::Fragment => {
             unsafe {
                 FRAG6_TARGET.tail_call(ctx, frag_target_idx);
@@ -452,6 +467,17 @@ fn ingress_v4(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
 }
 
 #[inline(always)]
+fn ipv6_payload_len_ok(
+    ctx: &TcContext,
+    ip_rel: usize,
+    raw_payload_len: usize,
+    min_len: usize,
+) -> bool {
+    raw_payload_len >= min_len
+        || (raw_payload_len == 0 && (ctx.len() as usize) > ip_rel + 40 + 65535)
+}
+
+#[inline(always)]
 fn ingress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     let mut data = ctx.data();
     let mut data_end = ctx.data_end();
@@ -464,7 +490,7 @@ fn ingress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     if (u32::from_be(iph_ro.ver_tc_fl) >> 28) != 6 || !ipv6_eq(&iph_ro.dst_addr, &cfg.wan_ip6) {
         return TC_ACT_UNSPEC;
     }
-    let Some((udp_from_ip, payload_len)) = locate_ipv6_udp_and_validate(
+    let Some((udp_rel, payload_len)) = locate_ipv6_udp_and_validate(
         ctx,
         &mut data,
         &mut data_end,
@@ -474,10 +500,14 @@ fn ingress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     ) else {
         return TC_ACT_UNSPEC;
     };
-    if payload_len < (udp_from_ip - 40) + 8 {
+    if !ipv6_payload_len_ok(
+        ctx,
+        ip_rel,
+        payload_len,
+        udp_rel.saturating_sub(ip_rel + 40) + 8,
+    ) {
         return TC_ACT_UNSPEC;
     }
-    let udp_rel = ip_rel + udp_from_ip;
     if !ensure_linear(ctx, &mut data, &mut data_end, udp_rel + 8) {
         return TC_ACT_UNSPEC;
     }
@@ -533,28 +563,46 @@ fn ingress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
 }
 
 #[inline(always)]
-fn dispatch_tcx(ctx: &TcContext, targets: &'static ProgramArray) -> i32 {
-    let Some((cfg, l2)) = prepare_packet(ctx) else {
+fn dispatch_tcx(
+    ctx: &TcContext,
+    targets: &'static ProgramArray,
+    scratch: &'static PerCpuArray<u32>,
+) -> i32 {
+    let Some((active, cfg, l2)) = prepare_packet_slot(ctx) else {
         return TC_ACT_UNSPEC;
     };
-    if l2.proto == ETH_P_IP && cfg.enabled_v4 != 0 {
-        unsafe {
-            targets.tail_call(ctx, TARGET_FAMILY_V4);
-        }
+    let target = if l2.proto == ETH_P_IP && cfg.enabled_v4 != 0 {
+        TARGET_FAMILY_V4
     } else if l2.proto == ETH_P_IPV6 && cfg.enabled_v6 != 0 {
+        TARGET_FAMILY_V6
+    } else {
+        return TC_ACT_UNSPEC;
+    };
+    if let Some(p) = scratch.get_ptr_mut(0) {
         unsafe {
-            targets.tail_call(ctx, TARGET_FAMILY_V6);
+            *p = (active << 16) | ((l2.ip_rel as u32) & 0x3f);
+            targets.tail_call(ctx, target);
         }
     }
     TC_ACT_UNSPEC
 }
 
 #[inline(always)]
-fn run_family<F>(ctx: &TcContext, expected_proto: u16, is_v6: bool, handler: F) -> i32
+fn run_family<F>(
+    ctx: &TcContext,
+    scratch: &'static PerCpuArray<u32>,
+    is_v6: bool,
+    handler: F,
+) -> i32
 where
     F: FnOnce(&TcContext, &GlobalConfig, usize) -> i32,
 {
-    let Some((cfg, l2)) = prepare_packet(ctx) else {
+    let Some(&packed) = scratch.get(0) else {
+        return TC_ACT_UNSPEC;
+    };
+    let active = (packed >> 16) & 1;
+    let ip_rel = (packed & 0x3f) as usize;
+    let Some(cfg) = CONFIG.get(active) else {
         return TC_ACT_UNSPEC;
     };
     let enabled = if is_v6 {
@@ -562,25 +610,20 @@ where
     } else {
         cfg.enabled_v4
     };
-    if l2.proto == expected_proto && enabled != 0 {
-        return handler(ctx, cfg, l2.ip_rel);
+    if enabled != 0 {
+        return handler(ctx, cfg, ip_rel);
     }
     TC_ACT_UNSPEC
 }
 
 #[classifier]
-pub fn flowcone_tcx_ingress(ctx: TcContext) -> i32 {
-    dispatch_tcx(&ctx, &INGRESS_TARGET)
-}
-
-#[classifier]
 pub fn flowcone_ingress_v4(ctx: TcContext) -> i32 {
-    run_family(&ctx, ETH_P_IP, false, ingress_v4)
+    run_family(&ctx, &INGRESS_L2_SCRATCH, false, ingress_v4)
 }
 
 #[classifier]
 pub fn flowcone_ingress_v6(ctx: TcContext) -> i32 {
-    run_family(&ctx, ETH_P_IPV6, true, ingress_v6)
+    run_family(&ctx, &INGRESS_L2_SCRATCH, true, ingress_v6)
 }
 
 #[inline(always)]
@@ -783,7 +826,7 @@ fn egress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     if !flowcone_common::is_routable_internal_ipv6(&iph_ro.src_addr, allow_all_internal) {
         return TC_ACT_UNSPEC;
     }
-    let Some((udp_from_ip, payload_len)) = locate_ipv6_udp_and_validate(
+    let Some((udp_rel, payload_len)) = locate_ipv6_udp_and_validate(
         ctx,
         &mut data,
         &mut data_end,
@@ -793,10 +836,14 @@ fn egress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     ) else {
         return TC_ACT_UNSPEC;
     };
-    if payload_len < (udp_from_ip - 40) + 8 {
+    if !ipv6_payload_len_ok(
+        ctx,
+        ip_rel,
+        payload_len,
+        udp_rel.saturating_sub(ip_rel + 40) + 8,
+    ) {
         return TC_ACT_UNSPEC;
     }
-    let udp_rel = ip_rel + udp_from_ip;
     if !ensure_linear(ctx, &mut data, &mut data_end, udp_rel + 8) {
         return TC_ACT_SHOT;
     }
@@ -825,18 +872,13 @@ fn egress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
 }
 
 #[classifier]
-pub fn flowcone_tcx_egress(ctx: TcContext) -> i32 {
-    dispatch_tcx(&ctx, &EGRESS_TARGET)
-}
-
-#[classifier]
 pub fn flowcone_egress_v4(ctx: TcContext) -> i32 {
-    run_family(&ctx, ETH_P_IP, false, egress_v4)
+    run_family(&ctx, &EGRESS_L2_SCRATCH, false, egress_v4)
 }
 
 #[classifier]
 pub fn flowcone_egress_v6(ctx: TcContext) -> i32 {
-    run_family(&ctx, ETH_P_IPV6, true, egress_v6)
+    run_family(&ctx, &EGRESS_L2_SCRATCH, true, egress_v6)
 }
 
 #[classifier]
@@ -1922,35 +1964,23 @@ pub fn flowcone_icmp_egress_target(ctx: TcContext) -> i32 {
 /// Primary A/B TCX ingress dispatcher.
 #[classifier]
 pub fn flowcone_tcx_ingress_a(ctx: TcContext) -> i32 {
-    unsafe {
-        INGRESS_TARGET.tail_call(&ctx, TARGET_DISPATCH);
-    }
-    TC_ACT_UNSPEC
+    dispatch_tcx(&ctx, &INGRESS_TARGET, &INGRESS_L2_SCRATCH)
 }
 
 #[classifier]
 pub fn flowcone_tcx_ingress_b(ctx: TcContext) -> i32 {
-    unsafe {
-        INGRESS_TARGET.tail_call(&ctx, TARGET_DISPATCH);
-    }
-    TC_ACT_UNSPEC
+    dispatch_tcx(&ctx, &INGRESS_TARGET, &INGRESS_L2_SCRATCH)
 }
 
 /// Primary A/B TCX egress dispatcher.
 #[classifier]
 pub fn flowcone_tcx_egress_a(ctx: TcContext) -> i32 {
-    unsafe {
-        EGRESS_TARGET.tail_call(&ctx, TARGET_DISPATCH);
-    }
-    TC_ACT_UNSPEC
+    dispatch_tcx(&ctx, &EGRESS_TARGET, &EGRESS_L2_SCRATCH)
 }
 
 #[classifier]
 pub fn flowcone_tcx_egress_b(ctx: TcContext) -> i32 {
-    unsafe {
-        EGRESS_TARGET.tail_call(&ctx, TARGET_DISPATCH);
-    }
-    TC_ACT_UNSPEC
+    dispatch_tcx(&ctx, &EGRESS_TARGET, &EGRESS_L2_SCRATCH)
 }
 
 #[panic_handler]

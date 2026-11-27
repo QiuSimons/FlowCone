@@ -27,6 +27,7 @@ pub(crate) struct FirewallConfig<'a> {
 pub(crate) struct FirewallManager {
     generic_tables: Vec<GenericTable>,
     last_layer: u8,
+    liveness_nl: netlink::NetlinkLivenessClient,
 }
 
 impl FirewallManager {
@@ -34,6 +35,7 @@ impl FirewallManager {
         Self {
             generic_tables: Vec::new(),
             last_layer: u8::MAX,
+            liveness_nl: netlink::NetlinkLivenessClient::new(),
         }
     }
 
@@ -197,16 +199,33 @@ impl FirewallManager {
     }
 
     pub(crate) fn refresh_liveness(
-        &self,
+        &mut self,
         enable_v4: bool,
         enable_v6: bool,
         is_v6_masq: bool,
         verbose: bool,
     ) -> bool {
         match self.last_layer {
-            1 | 2 => refresh_fw4_liveness(enable_v4, enable_v6, is_v6_masq, verbose),
-            3 => refresh_generic_liveness(&self.generic_tables, is_v6_masq, verbose),
-            4 => refresh_standalone_liveness(enable_v4, enable_v6, is_v6_masq, verbose),
+            1 | 2 => refresh_fw4_liveness(
+                &mut self.liveness_nl,
+                enable_v4,
+                enable_v6,
+                is_v6_masq,
+                verbose,
+            ),
+            3 => refresh_generic_liveness(
+                &mut self.liveness_nl,
+                &self.generic_tables,
+                is_v6_masq,
+                verbose,
+            ),
+            4 => refresh_standalone_liveness(
+                &mut self.liveness_nl,
+                enable_v4,
+                enable_v6,
+                is_v6_masq,
+                verbose,
+            ),
             _ => false,
         }
     }

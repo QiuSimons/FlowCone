@@ -21,7 +21,7 @@ const EEXIST_ERR: i32 = -17;
 
 #[inline(always)]
 pub fn now_sec() -> u32 {
-    (unsafe { bpf_ktime_get_coarse_ns() } / 1_000_000_000) as u32
+    flowcone_common::monotonic_ns_to_sec(unsafe { bpf_ktime_get_coarse_ns() })
 }
 
 #[inline(always)]

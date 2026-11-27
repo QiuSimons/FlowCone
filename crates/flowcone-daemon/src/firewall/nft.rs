@@ -2,7 +2,7 @@
 //! systems without fw4.
 
 use super::FirewallConfig;
-use super::netlink::{LivenessRefreshSpec, nfproto_for_family, refresh_liveness_netlink};
+use super::netlink::{LivenessRefreshSpec, NetlinkLivenessClient, nfproto_for_family};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
@@ -437,6 +437,7 @@ pub(crate) fn generic_liveness_supported(tables: &[GenericTable]) -> bool {
 /// fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh_table_liveness(
+    nl: &mut NetlinkLivenessClient,
     family: &str,
     table: &str,
     src_v4: bool,
@@ -459,7 +460,7 @@ pub(crate) fn refresh_table_liveness(
             fwd_v6,
             is_v6_masq,
         };
-        match refresh_liveness_netlink(&spec) {
+        match nl.refresh(&spec) {
             Ok(()) => return true,
             Err(e) if verbose => eprintln!(
                 "flowcone: netlink liveness refresh failed for {} {} ({}), falling back to CLI",
@@ -485,6 +486,7 @@ pub(crate) fn refresh_table_liveness(
 }
 
 pub(crate) fn refresh_generic_liveness(
+    nl: &mut NetlinkLivenessClient,
     tables: &[GenericTable],
     is_v6_masq: bool,
     verbose: bool,
@@ -495,7 +497,7 @@ pub(crate) fn refresh_generic_liveness(
     let mut all_ok = true;
     for t in tables {
         all_ok &= refresh_table_liveness(
-            &t.family, &t.table, t.src_v4, t.fwd_v4, t.src_v6, t.fwd_v6, is_v6_masq, verbose,
+            nl, &t.family, &t.table, t.src_v4, t.fwd_v4, t.src_v6, t.fwd_v6, is_v6_masq, verbose,
         );
     }
     all_ok
@@ -555,6 +557,7 @@ pub(crate) fn cleanup_obsolete_generic_sets(
 }
 
 pub(crate) fn refresh_standalone_liveness(
+    nl: &mut NetlinkLivenessClient,
     enable_v4: bool,
     enable_v6: bool,
     is_v6_masq: bool,
@@ -564,7 +567,7 @@ pub(crate) fn refresh_standalone_liveness(
         return false;
     }
     refresh_table_liveness(
-        "inet", "flowcone", enable_v4, enable_v4, enable_v6, enable_v6, is_v6_masq, verbose,
+        nl, "inet", "flowcone", enable_v4, enable_v4, enable_v6, enable_v6, is_v6_masq, verbose,
     )
 }
 

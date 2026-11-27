@@ -130,6 +130,8 @@ const NLMSG_HDRLEN: usize = 16;
 pub struct LocalUdpScanner {
     sock: Option<OwnedFd>,
     buf: Vec<u8>,
+    ports4: Vec<u16>,
+    ports6: Vec<u16>,
     seq: u32,
     disabled_v4: bool,
     disabled_v6: bool,
@@ -146,6 +148,8 @@ impl LocalUdpScanner {
         Self {
             sock: None,
             buf: vec![0u8; 32768],
+            ports4: Vec::new(),
+            ports6: Vec::new(),
             seq: 0,
             disabled_v4: false,
             disabled_v6: false,
@@ -205,18 +209,21 @@ impl LocalUdpScanner {
         self.sock.as_ref()
     }
 
-    /// Queries listening and connected UDP ports via `NETLINK_INET_DIAG`.
-    pub fn scan_netlink_udp_ports(&mut self, family: u8) -> Option<Vec<u16>> {
+    /// Queries listening and connected UDP ports via `NETLINK_INET_DIAG` into `out`.
+    pub fn scan_netlink_udp_ports_into(&mut self, family: u8, out: &mut Vec<u16>) -> bool {
         use rustix::io::Errno;
         use rustix::net::{SendFlags, send};
 
+        out.clear();
         if self.is_disabled(family) {
-            return None;
+            return false;
         }
         let seq = self.seq.wrapping_add(1).max(1);
         self.seq = seq;
 
-        let sock = self.ensure_socket()?;
+        let Some(sock) = self.ensure_socket() else {
+            return false;
+        };
 
         // 72-byte netlink dump request: 16-byte nlmsghdr + 56-byte
         // inet_diag_req_v2.
@@ -235,21 +242,22 @@ impl LocalUdpScanner {
                 Err(Errno::INTR) => continue,
                 Err(_) => {
                     self.sock = None;
-                    return None;
+                    return false;
                 }
             }
         }
 
-        let mut ports = Vec::new();
         let mut done = false;
         'recv_loop: loop {
-            let sock = self.sock.as_ref()?;
+            let Some(sock) = self.sock.as_ref() else {
+                return false;
+            };
             let Ok(n) = crate::netlink::recv_netlink_msg(sock, &mut self.buf, RecvFlags::empty())
             else {
                 // Drop socket after interrupted/timed-out dump so stale frames
                 // cannot leak into the next call.
                 self.sock = None;
-                return None;
+                return false;
             };
             if n == 0 {
                 break;
@@ -284,10 +292,10 @@ impl LocalUdpScanner {
                                 ) {
                                     self.mark_disabled(family);
                                 }
-                                return None;
+                                return false;
                             }
                         } else {
-                            return None;
+                            return false;
                         }
                     } else if nlmsg_type == NLMSG_DONE {
                         done = true;
@@ -297,7 +305,7 @@ impl LocalUdpScanner {
                         if payload.len() >= 72 && (payload[1] == 1 || payload[1] == 7) {
                             let sport = u16::from_be_bytes([payload[4], payload[5]]);
                             if sport != 0 {
-                                ports.push(sport);
+                                out.push(sport);
                             }
                         }
                     }
@@ -306,29 +314,43 @@ impl LocalUdpScanner {
             }
         }
 
-        if done { Some(ports) } else { None }
+        done
+    }
+
+    #[cfg(test)]
+    pub fn scan_netlink_udp_ports(&mut self, family: u8) -> Option<Vec<u16>> {
+        let mut ports = Vec::new();
+        self.scan_netlink_udp_ports_into(family, &mut ports)
+            .then_some(ports)
     }
 
     /// Parses local UDP service ports from `NETLINK_INET_DIAG` with procfs
-    /// fallback.
-    pub fn scan_local_udp_ports(&mut self, family: u8, procfs_path: &str) -> Option<Vec<u16>> {
-        if let Some(mut ports) = self.scan_netlink_udp_ports(family) {
-            ports.sort_unstable();
-            ports.dedup();
-            return Some(ports);
+    /// fallback into `out`.
+    pub fn scan_local_udp_ports_into(
+        &mut self,
+        family: u8,
+        procfs_path: &str,
+        out: &mut Vec<u16>,
+    ) -> bool {
+        if self.scan_netlink_udp_ports_into(family, out) {
+            out.sort_unstable();
+            out.dedup();
+            return true;
         }
-        let text = std::fs::read_to_string(procfs_path).ok()?;
-        let mut ports = parse_proc_udp_ports(&text);
-        ports.sort_unstable();
-        ports.dedup();
-        Some(ports)
+        let Ok(text) = std::fs::read_to_string(procfs_path) else {
+            return false;
+        };
+        parse_proc_udp_ports_into(&text, out);
+        out.sort_unstable();
+        out.dedup();
+        true
     }
 }
 
 /// Extracts local UDP ports in listening (07) and connected (01) states from
 /// procfs.
-fn parse_proc_udp_ports(text: &str) -> Vec<u16> {
-    let mut out = Vec::new();
+fn parse_proc_udp_ports_into(text: &str, out: &mut Vec<u16>) {
+    out.clear();
     for line in text.lines().skip(1) {
         let mut it = line.split_whitespace();
         let _sl = it.next();
@@ -347,6 +369,12 @@ fn parse_proc_udp_ports(text: &str) -> Vec<u16> {
             out.push(port);
         }
     }
+}
+
+#[cfg(test)]
+fn parse_proc_udp_ports(text: &str) -> Vec<u16> {
+    let mut out = Vec::new();
+    parse_proc_udp_ports_into(text, &mut out);
     out
 }
 
@@ -857,17 +885,18 @@ impl SessionManager {
 
     /// Synchronizes reserved local UDP service ports using a reusable scanner.
     pub fn reserve_local_ports(&mut self, scanner: &mut LocalUdpScanner) {
-        let p4 = if self.pool_enable_v4 {
-            scanner.scan_local_udp_ports(AF_INET, "/proc/net/udp")
-        } else {
-            None
-        };
-        let p6 = if self.pool_enable_v6 {
-            scanner.scan_local_udp_ports(AF_INET6, "/proc/net/udp6")
-        } else {
-            None
-        };
-        self.apply_reserved_ports(p4.as_deref(), p6.as_deref());
+        let mut ports4 = std::mem::take(&mut scanner.ports4);
+        let mut ports6 = std::mem::take(&mut scanner.ports6);
+        let has_p4 = self.pool_enable_v4
+            && scanner.scan_local_udp_ports_into(AF_INET, "/proc/net/udp", &mut ports4);
+        let has_p6 = self.pool_enable_v6
+            && scanner.scan_local_udp_ports_into(AF_INET6, "/proc/net/udp6", &mut ports6);
+        self.apply_reserved_ports(
+            has_p4.then_some(ports4.as_slice()),
+            has_p6.then_some(ports6.as_slice()),
+        );
+        scanner.ports4 = ports4;
+        scanner.ports6 = ports6;
     }
 
     fn init_family_pool(pool: &mut FamilyPortPool<'_>) {

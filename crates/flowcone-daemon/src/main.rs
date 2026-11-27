@@ -37,11 +37,12 @@ const SIGHUP: i32 = 1;
 /// Interval for periodic TCX tail verification.
 const REATTACH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Interval for periodic local UDP service port reservation scans.
 const RESERVE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Interval for liveness set timeout refreshes.
 const LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Coalesces periodic 5s maintenance timers within a single wakeup window.
+const PERIODIC_COALESCE_SLACK: Duration = Duration::from_millis(500);
 
 /// Backoff before retrying transient firewall/attach failures.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -86,6 +87,10 @@ fn setup_signals(sig_write: OwnedFd, wake_write: OwnedFd) {
 fn get_monotonic_coarse_ns() -> u64 {
     let ts = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicCoarse);
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+fn get_monotonic_coarse_sec() -> u32 {
+    flowcone_common::monotonic_ns_to_sec(get_monotonic_coarse_ns())
 }
 
 pub fn resolve_effective_v6(enable_v6: bool, wan_ip6: [u8; 16], has_masq: bool) -> u32 {
@@ -182,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
     )?;
 
-    let monitor = match netlink::EventMonitor::new() {
+    let mut monitor = match netlink::EventMonitor::new() {
         Ok(monitor) => Some(monitor),
         Err(e) => {
             eprintln!(
@@ -235,14 +240,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(n) = poll(wait_slice, Some(&wait_ts))
                 && n > 0
             {
-                if wait_slice[0].revents().contains(PollFlags::IN) {
-                    break;
-                }
-                if let Some(ref m) = monitor
+                let sig_ready = wait_slice[0].revents().contains(PollFlags::IN);
+                let mon_ready = monitor.is_some()
                     && wait_slice[1]
                         .revents()
-                        .intersects(PollFlags::IN | PollFlags::ERR)
-                {
+                        .intersects(PollFlags::IN | PollFlags::ERR);
+                if sig_ready {
+                    break;
+                }
+                if mon_ready && let Some(ref mut m) = monitor {
                     let _ = m.drain_relevant(0, &config.iface);
                 }
             }
@@ -254,7 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !RUNNING.load(Ordering::Relaxed) {
         return Ok(());
     }
-    if let Some(ref m) = monitor {
+    if let Some(ref mut m) = monitor {
         let _ = m.drain_relevant(0, &config.iface);
     }
 
@@ -431,63 +437,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tv_nsec: next_wake.subsec_nanos() as i64,
         };
 
-        let (ev4_fd, ev6_fd) = session_mgr.event_fds();
-        let mon_borrowed = monitor
-            .as_ref()
-            .map(|m| m.as_fd())
-            .unwrap_or(sig_read_end.as_fd());
-        let mut poll_fds = [
-            PollFd::new(&sig_read_end, PollFlags::IN),
-            PollFd::new(&wake_read_end, PollFlags::IN),
-            PollFd::new(
-                &ev4_fd,
-                if config.enable_v4 {
-                    PollFlags::IN
-                } else {
-                    PollFlags::empty()
-                },
-            ),
-            PollFd::new(
-                &ev6_fd,
-                if config.enable_v6 {
-                    PollFlags::IN
-                } else {
-                    PollFlags::empty()
-                },
-            ),
-            PollFd::new(
-                &mon_borrowed,
-                if monitor.is_some() {
-                    PollFlags::IN | PollFlags::ERR
-                } else {
-                    PollFlags::empty()
-                },
-            ),
-        ];
-        let poll_slice = if monitor.is_some() {
-            &mut poll_fds[..5]
-        } else {
-            &mut poll_fds[..4]
-        };
+        let (sig_ready, wake_ready, ev4_ready, ev6_ready, mon_ready) = {
+            let (ev4_fd, ev6_fd) = session_mgr.event_fds();
+            let mon_borrowed = monitor
+                .as_ref()
+                .map(|m| m.as_fd())
+                .unwrap_or(sig_read_end.as_fd());
+            let mut poll_fds = [
+                PollFd::new(&sig_read_end, PollFlags::IN),
+                PollFd::new(&wake_read_end, PollFlags::IN),
+                PollFd::new(
+                    &ev4_fd,
+                    if config.enable_v4 {
+                        PollFlags::IN
+                    } else {
+                        PollFlags::empty()
+                    },
+                ),
+                PollFd::new(
+                    &ev6_fd,
+                    if config.enable_v6 {
+                        PollFlags::IN
+                    } else {
+                        PollFlags::empty()
+                    },
+                ),
+                PollFd::new(
+                    &mon_borrowed,
+                    if monitor.is_some() {
+                        PollFlags::IN | PollFlags::ERR
+                    } else {
+                        PollFlags::empty()
+                    },
+                ),
+            ];
+            let poll_slice = if monitor.is_some() {
+                &mut poll_fds[..5]
+            } else {
+                &mut poll_fds[..4]
+            };
 
-        match poll(poll_slice, Some(&ts)) {
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => {
-                if !RUNNING.load(Ordering::SeqCst) {
+            match poll(poll_slice, Some(&ts)) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => {
+                    if !RUNNING.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("flowcone: poll error: {:?}", e);
                     break;
                 }
             }
-            Err(e) => {
-                eprintln!("flowcone: poll error: {:?}", e);
-                break;
-            }
-        }
 
-        if poll_fds[0].revents().contains(PollFlags::IN) || !RUNNING.load(Ordering::SeqCst) {
+            (
+                poll_fds[0].revents().contains(PollFlags::IN),
+                poll_fds[1].revents().contains(PollFlags::IN),
+                poll_fds[2].revents().contains(PollFlags::IN),
+                poll_fds[3].revents().contains(PollFlags::IN),
+                monitor.is_some()
+                    && poll_fds[4]
+                        .revents()
+                        .intersects(PollFlags::IN | PollFlags::ERR),
+            )
+        };
+
+        if sig_ready || !RUNNING.load(Ordering::SeqCst) {
             break;
         }
 
-        if poll_fds[1].revents().contains(PollFlags::IN) {
+        if wake_ready {
             let mut buf = [0u8; 32];
             let mut eof = false;
             while let Ok(n) = rustix::io::read(&wake_read_end, &mut buf) {
@@ -503,19 +522,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             has_net_event = true;
         }
 
-        if let Some(ref m) = monitor
-            && poll_fds[4]
-                .revents()
-                .intersects(PollFlags::IN | PollFlags::ERR)
+        if mon_ready
+            && let Some(ref mut m) = monitor
             && m.drain_relevant(applied.ifindex, &config.iface)
         {
             has_net_event = true;
         }
 
-        let ev4_ready = poll_fds[2].revents().contains(PollFlags::IN);
-        let ev6_ready = poll_fds[3].revents().contains(PollFlags::IN);
         if ev4_ready || ev6_ready {
-            let now_sec = (get_monotonic_coarse_ns() / 1_000_000_000) as u32;
+            let now_sec = get_monotonic_coarse_sec();
             let was_idle = session_mgr.is_idle();
             let drained = session_mgr.drain_events(now_sec, config.timeout_sec as u32);
             if ((was_idle && !session_mgr.is_idle()) || drained > 0)
@@ -526,7 +541,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if last_gc_run.elapsed() >= gc_interval {
-            let now_sec = (get_monotonic_coarse_ns() / 1_000_000_000) as u32;
+            let now_sec = get_monotonic_coarse_sec();
             let (v4_swept, v6_swept, backlog) =
                 session_mgr.gc_tick(now_sec, config.timeout_sec as u32);
             if config.verbose && (v4_swept > 0 || v6_swept > 0) {
@@ -548,7 +563,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_gc_run = Instant::now();
         }
 
-        if last_reserve_scan.elapsed() >= RESERVE_SCAN_INTERVAL {
+        let liveness_active = config.manage_nft
+            && applied.liveness
+            && (applied.v4_enabled || applied.effective_v6 != 0);
+        let reserve_elapsed = last_reserve_scan.elapsed();
+        let liveness_elapsed = last_liveness_refresh.elapsed();
+        let reserve_due = reserve_elapsed >= RESERVE_SCAN_INTERVAL
+            || (liveness_active
+                && liveness_elapsed >= LIVENESS_REFRESH_INTERVAL
+                && reserve_elapsed + PERIODIC_COALESCE_SLACK >= RESERVE_SCAN_INTERVAL);
+        if reserve_due {
             session_mgr.reserve_local_ports(&mut udp_scanner);
             last_reserve_scan = Instant::now();
         }
@@ -928,7 +952,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if config.manage_nft
             && applied.liveness
             && (applied.v4_enabled || applied.effective_v6 != 0)
-            && last_liveness_refresh.elapsed() >= LIVENESS_REFRESH_INTERVAL
+            && (last_liveness_refresh.elapsed() >= LIVENESS_REFRESH_INTERVAL
+                || (reserve_due
+                    && last_liveness_refresh.elapsed() + PERIODIC_COALESCE_SLACK
+                        >= LIVENESS_REFRESH_INTERVAL))
         {
             if !firewall_mgr.refresh_liveness(
                 applied.v4_enabled,

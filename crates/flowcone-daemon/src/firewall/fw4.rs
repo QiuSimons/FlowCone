@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 
+use super::netlink::NetlinkLivenessClient;
 use super::nft::{
     SET_FWD4, SET_FWD6, SET_V4, SET_V6, generate_forward_rule_v4, generate_forward_rule_v6,
     generate_srcnat_rule_v4, generate_srcnat_rule_v6, nft_apply, nft_output, nft_table_exists,
@@ -484,13 +485,14 @@ pub(crate) fn update_chain_pre_files(
 
 /// Refreshes element timeouts in `inet fw4` liveness sets.
 pub(crate) fn refresh_fw4_liveness(
+    nl: &mut NetlinkLivenessClient,
     enable_v4: bool,
     enable_v6: bool,
     is_v6_masq: bool,
     verbose: bool,
 ) -> bool {
     refresh_table_liveness(
-        "inet", "fw4", enable_v4, enable_v4, enable_v6, enable_v6, is_v6_masq, verbose,
+        nl, "inet", "fw4", enable_v4, enable_v4, enable_v6, enable_v6, is_v6_masq, verbose,
     )
 }
 

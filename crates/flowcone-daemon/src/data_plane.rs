@@ -196,10 +196,8 @@ impl DataPlane {
         iface: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         for name in [
-            "flowcone_tcx_ingress",
             "flowcone_ingress_v4",
             "flowcone_ingress_v6",
-            "flowcone_tcx_egress",
             "flowcone_egress_v4",
             "flowcone_egress_v6",
             "flowcone_egress_alloc_v4",
@@ -224,20 +222,12 @@ impl DataPlane {
         let ingress_target = load_target_slots(
             &mut bpf,
             "INGRESS_TARGET",
-            &[
-                (0, "flowcone_tcx_ingress"),
-                (1, "flowcone_ingress_v4"),
-                (2, "flowcone_ingress_v6"),
-            ],
+            &[(0, "flowcone_ingress_v4"), (1, "flowcone_ingress_v6")],
         )?;
         let egress_target = load_target_slots(
             &mut bpf,
             "EGRESS_TARGET",
-            &[
-                (0, "flowcone_tcx_egress"),
-                (1, "flowcone_egress_v4"),
-                (2, "flowcone_egress_v6"),
-            ],
+            &[(0, "flowcone_egress_v4"), (1, "flowcone_egress_v6")],
         )?;
         let egress_alloc_target = load_target_slots(
             &mut bpf,
