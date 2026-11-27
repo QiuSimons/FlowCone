@@ -1,3 +1,4 @@
+use crate::netlink::{AF_INET, AF_INET6, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR};
 use aya::maps::{Array, HashMap, IterableMap, MapData, RingBuf};
 use flowcone_common::{
     BindingValue4, BindingValue6, EndpointKey4, EndpointKey6, FragKey4, FragKey6, FragValue4,
@@ -119,15 +120,10 @@ type Expiry6 = Reverse<(u32, EndpointKey6, u16)>;
 const GC_QUEUE_DRAIN_MAX: usize = 32768;
 const GC_EXPIRY_MAX_PER_TICK: usize = 1024;
 
-const AF_INET: u8 = 2;
-const AF_INET6: u8 = 10;
 const NETLINK_INET_DIAG: u32 = 4;
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
-const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
 const NLMSG_HDRLEN: usize = 16;
-const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
 
 /// Reusable `NETLINK_INET_DIAG` scanner with per-family fallback to
 /// `/proc/net/udp*`.
@@ -543,11 +539,15 @@ fn sweep_family<V: ConeBinding>(
 ) -> usize {
     expired_buf.clear();
     for (key, val) in ob_map.iter().flatten() {
+        let port_host = u16::from_be(val.port_be());
+        // `port == 0` marks an in-flight stale replacement in eBPF.
+        if port_host == 0 {
+            continue;
+        }
         let item_timeout = item_timeout_for(&val, timeout);
         if now.saturating_sub(val.last_seen()) <= item_timeout {
             continue;
         }
-        let port_host = u16::from_be(val.port_be());
         let ib_last = match ib_map.get(&port_host, 0) {
             Ok(iv) if iv.matches_key(&key) => iv.last_seen(),
             _ => 0,
@@ -561,6 +561,9 @@ fn sweep_family<V: ConeBinding>(
     for &(key, port_host) in expired_buf.iter() {
         // Revalidate against datapath refresh.
         if let Ok(cur_val) = ob_map.get(&key, 0) {
+            if cur_val.port_be() == 0 {
+                continue;
+            }
             if u16::from_be(cur_val.port_be()) != port_host {
                 if let Ok(iv) = ib_map.get(&port_host, 0)
                     && iv.matches_key(&key)
@@ -626,7 +629,6 @@ fn sweep_family<V: ConeBinding>(
     swept
 }
 
-/// Collection of eBPF maps used by SessionManager.
 pub struct SessionMaps {
     pub config_map: Array<MapData, GlobalConfig>,
     pub active_map: Array<MapData, u32>,
@@ -1092,7 +1094,7 @@ impl SessionManager {
         }
     }
 
-    fn rebuild_port_queues(&mut self) {
+    fn reconcile_port_bitmaps(&mut self) {
         if self.port_flags.get(&0, 0).unwrap_or(0) != 0 {
             let _ = self.port_flags.set(0, &0, 0);
             if self.pool_enable_v4 {
@@ -1219,7 +1221,7 @@ impl SessionManager {
             while self.events6.next().is_some() {}
         }
         if need_rebuild {
-            self.rebuild_port_queues();
+            self.reconcile_port_bitmaps();
         }
         drained
     }
@@ -1456,7 +1458,6 @@ impl SessionManager {
         }
     }
 
-    /// Performs periodic session expiry and event ring buffer draining.
     pub fn gc_tick(&mut self, now: u32, timeout: u32) -> (usize, usize, bool) {
         self.drain_events(now, timeout);
         let (mut swept4, mut swept6, has_backlog) = self.expiry_tick(now, timeout);
@@ -1468,42 +1469,44 @@ impl SessionManager {
             self.heap4.clear();
             self.heap6.clear();
             if self.pool_enable_v4 {
-                self.freed_ports.clear();
+                let mut freed = std::mem::take(&mut self.freed_ports);
+                freed.clear();
                 swept4 += sweep_family(
                     &mut self.ob_map4,
                     &mut self.ib_map4,
                     &mut self.expired_v4,
                     &mut self.orphan_ports,
-                    &mut self.freed_ports,
+                    &mut freed,
                     now,
                     timeout,
                 );
-                self.freed_ports.sort_unstable();
-                self.freed_ports.dedup();
-                for i in 0..self.freed_ports.len() {
-                    let p = self.freed_ports[i];
+                freed.sort_unstable();
+                freed.dedup();
+                for &p in &freed {
                     self.release_port4(p);
                 }
-                self.freed_ports.clear();
+                freed.clear();
+                self.freed_ports = freed;
             }
             if self.pool_enable_v6 {
-                self.freed_ports.clear();
+                let mut freed = std::mem::take(&mut self.freed_ports);
+                freed.clear();
                 swept6 += sweep_family(
                     &mut self.ob_map6,
                     &mut self.ib_map6,
                     &mut self.expired_v6,
                     &mut self.orphan_ports,
-                    &mut self.freed_ports,
+                    &mut freed,
                     now,
                     timeout,
                 );
-                self.freed_ports.sort_unstable();
-                self.freed_ports.dedup();
-                for i in 0..self.freed_ports.len() {
-                    let p = self.freed_ports[i];
+                freed.sort_unstable();
+                freed.dedup();
+                for &p in &freed {
                     self.release_port6(p);
                 }
-                self.freed_ports.clear();
+                freed.clear();
+                self.freed_ports = freed;
             }
             self.rebuild_heaps(timeout);
             // Catch events emitted concurrently while scanning tables during
@@ -1517,7 +1520,7 @@ impl SessionManager {
             }
         }
 
-        self.rebuild_port_queues();
+        self.reconcile_port_bitmaps();
         (swept4, swept6, has_backlog)
     }
 
@@ -1551,7 +1554,7 @@ mod port_parser_tests {
     use super::{ExpiryStep, LocalUdpScanner, expiry_step, parse_proc_udp_ports, reserved_delta};
 
     #[test]
-    fn reserved_delta_tracks_started_and_stopped_services() {
+    fn test_reserved_delta_tracks_started_and_stopped_services() {
         let previous = [53, 5353, 51820];
         let current = [53, 51820, 60000];
         let (added, removed) = reserved_delta(&previous, &current);
@@ -1560,7 +1563,7 @@ mod port_parser_tests {
     }
 
     #[test]
-    fn expiry_step_treats_zero_as_a_valid_timestamp() {
+    fn test_expiry_step_treats_zero_as_a_valid_timestamp() {
         let cases = [
             (10, 120, Some(0), ExpiryStep::Keep { deadline: 120 }),
             (0, 120, Some(0), ExpiryStep::Keep { deadline: 120 }),
@@ -1575,7 +1578,7 @@ mod port_parser_tests {
     }
 
     #[test]
-    fn parses_listening_and_connected() {
+    fn test_parses_listening_and_connected() {
         let text = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n 0: 00000000:1450 00000000:0000 07 00000000:00000000 00:00000000 00000000  0 0 1 1\n 1: 0100007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000  0 0 1 1\n 2: 0100007F:C000 0100007F:0035 01 00000000:00000000 00:00000000 00000000  0 0 1 1\n";
         let ports = parse_proc_udp_ports(text);
         assert!(ports.contains(&0x1450));

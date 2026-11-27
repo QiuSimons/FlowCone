@@ -6,19 +6,19 @@ use rustix::net::{
 };
 use std::fmt;
 
-const AF_INET: u8 = 2;
-const AF_INET6: u8 = 10;
+pub(crate) const AF_INET: u8 = 2;
+pub(crate) const AF_INET6: u8 = 10;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 
-const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
+pub(crate) const NLMSG_ERROR: u16 = 2;
+pub(crate) const NLMSG_DONE: u16 = 3;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
 
-const NLM_F_REQUEST: u16 = 0x0001;
+pub(crate) const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_ROOT: u16 = 0x0100;
 const NLM_F_MATCH: u16 = 0x0200;
 
@@ -338,7 +338,6 @@ fn pick_gua_v6(addrs: &[IfaceAddr], current: Option<[u8; 16]>) -> Option<[u8; 16
     best_perm.or(best_dyn).or(best_temp)
 }
 
-/// Global addresses of one interface.
 pub(crate) struct IfaceAddrs {
     pub(crate) v4: Option<[u8; 4]>,
     pub(crate) v6: Option<[u8; 16]>,
@@ -487,7 +486,6 @@ impl AsFd for EventMonitor {
     }
 }
 
-/// Read the kernel ifindex of an interface (`None` if it does not exist).
 pub(crate) fn get_ifindex(ifname: &str) -> Option<u32> {
     std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", ifname))
         .ok()?

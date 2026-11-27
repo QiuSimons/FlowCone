@@ -311,26 +311,26 @@ pub(crate) fn refresh_liveness_netlink(spec: &LivenessRefreshSpec<'_>) -> Result
         return Ok(());
     }
 
-    let timeout_ms = super::fw4::LIVENESS_TIMEOUT_SEC * 1000;
+    let timeout_ms = super::nft::LIVENESS_TIMEOUT_SEC * 1000;
     let mut batch = NetlinkBatch::new();
     let proto = spec.family_proto;
 
     if spec.src_v4 {
-        batch.flush_set(proto, spec.table, super::fw4::SET_V4);
+        batch.flush_set(proto, spec.table, super::nft::SET_V4);
         batch.add_set_elements(
             proto,
             spec.table,
-            super::fw4::SET_V4,
+            super::nft::SET_V4,
             &STATIC_V4_RANGES,
             timeout_ms,
         );
     }
     if spec.fwd_v4 {
-        batch.flush_set(proto, spec.table, super::fw4::SET_FWD4);
+        batch.flush_set(proto, spec.table, super::nft::SET_FWD4);
         batch.add_set_elements(
             proto,
             spec.table,
-            super::fw4::SET_FWD4,
+            super::nft::SET_FWD4,
             &*STATIC_FWD4_RANGE,
             timeout_ms,
         );
@@ -341,15 +341,15 @@ pub(crate) fn refresh_liveness_netlink(spec: &LivenessRefreshSpec<'_>) -> Result
         } else {
             &*STATIC_V6_ULA_RANGES
         };
-        batch.flush_set(proto, spec.table, super::fw4::SET_V6);
-        batch.add_set_elements(proto, spec.table, super::fw4::SET_V6, v6_ranges, timeout_ms);
+        batch.flush_set(proto, spec.table, super::nft::SET_V6);
+        batch.add_set_elements(proto, spec.table, super::nft::SET_V6, v6_ranges, timeout_ms);
     }
     if spec.fwd_v6 {
-        batch.flush_set(proto, spec.table, super::fw4::SET_FWD6);
+        batch.flush_set(proto, spec.table, super::nft::SET_FWD6);
         batch.add_set_elements(
             proto,
             spec.table,
-            super::fw4::SET_FWD6,
+            super::nft::SET_FWD6,
             &*STATIC_FWD6_RANGE,
             timeout_ms,
         );

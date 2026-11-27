@@ -414,7 +414,6 @@ impl DataPlane {
         self.rotate(verbose)
     }
 
-    /// Explicitly detaches active ingress and egress classifiers.
     pub(crate) fn detach(&mut self) {
         let (in_name, out_name) = self.disp_names();
         if let Some(id) = self.ingress.take() {

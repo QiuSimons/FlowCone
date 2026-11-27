@@ -60,7 +60,6 @@ static EBPF_BYTES: &[u8] =
 static RUNNING: AtomicBool = AtomicBool::new(true);
 static RESYNC_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Installs async-signal-safe signal handlers.
 fn setup_signals(sig_write: OwnedFd, wake_write: OwnedFd) {
     let sig_write = Arc::new(sig_write);
     let wake_write = Arc::new(wake_write);
@@ -167,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliAction::Run(c)) => c,
         Ok(CliAction::ExitOk) => return Ok(()),
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("flowcone: error: {}", e);
             std::process::exit(1);
         }
     };
@@ -178,15 +177,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.enable_v4, config.enable_v6, config.min_port, config.max_port, config.timeout_sec
     );
 
-    // Shutdown notification self-pipe.
     let (sig_read_end, sig_write_end) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
-
-    // Worker wake self-pipe.
     let (wake_read_end, wake_write_end) = rustix::pipe::pipe_with(
         rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
     )?;
 
-    // React to netlink link/address events instead of polling.
     let monitor = match netlink::EventMonitor::new() {
         Ok(monitor) => Some(monitor),
         Err(e) => {
@@ -391,7 +386,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut retry_deadline: Option<Instant> = None;
 
     while RUNNING.load(Ordering::SeqCst) {
-        // Calculate poll timeout based on nearest timer.
         let now_instant = Instant::now();
         let time_to_gc = gc_interval.saturating_sub(last_gc_run.elapsed());
         let time_to_reserve = RESERVE_SCAN_INTERVAL.saturating_sub(last_reserve_scan.elapsed());
@@ -716,6 +710,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            if force_new_attach {
+                rotated_on_probe = true;
+                match data_plane.attach(true, false) {
+                    Ok(()) => {
+                        applied.ifindex = cur_ifindex;
+                        if notable {
+                            println!(
+                                "flowcone: TCX programs re-attached to {} (ifindex {})",
+                                config.iface, cur_ifindex
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "flowcone: warning: re-attach on {} failed: {}; will retry",
+                            config.iface, e
+                        );
+                        session_mgr.disable_fail_open();
+                        if config.manage_nft {
+                            firewall_mgr.remove_rules(config.verbose);
+                        }
+                        applied.v4_enabled = false;
+                        applied.effective_v6 = 0;
+                        applied.liveness = false;
+                        retry_deadline = Some(Instant::now() + RETRY_INTERVAL);
+                        config_dirty = false;
+                    }
+                }
+            }
+
             if config_dirty {
                 let is_v6_masq =
                     if config.enable_v6 && resolved_ip6 != [0u8; 16] && applied.l2_known {
@@ -785,7 +809,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         timeout_sec: config.timeout_sec as u32,
                     };
                     let clear_frag = frag_epoch == 0;
-                    let had_flush = flush_v4 || flush_v6;
+                    let had_v4_flush = flush_v4;
+                    let had_v6_flush = flush_v6;
+                    let had_flush = had_v4_flush || had_v6_flush;
                     let set_ok = if had_flush {
                         let ok = session_mgr.set_config(g_cfg);
                         if ok {
@@ -829,7 +855,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 last_liveness_refresh = Instant::now();
                             }
                         } else {
-                            eprintln!("flowcone: firewall sync failed; will retry");
+                            eprintln!(
+                                "flowcone: firewall sync failed; rolling back un-synced families"
+                            );
+                            let keep_v4 = applied.v4_enabled && !had_v4_flush;
+                            let keep_v6 = if !had_v6_flush {
+                                applied.effective_v6
+                            } else {
+                                0
+                            };
+                            let mut rollback_cfg = g_cfg;
+                            rollback_cfg.enabled_v4 = if keep_v4 { 1 } else { 0 };
+                            rollback_cfg.enabled_v6 = keep_v6;
+                            let _ = session_mgr.set_config(rollback_cfg);
+                            applied.v4_enabled = keep_v4;
+                            applied.effective_v6 = keep_v6;
                             retry_deadline = Some(Instant::now() + RETRY_INTERVAL);
                         }
                     } else {
@@ -841,47 +881,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if reattach {
+            if reattach && !force_new_attach {
                 rotated_on_probe = true;
-                let attached = if force_new_attach {
-                    match data_plane.attach(true, false) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            eprintln!(
-                                "flowcone: warning: re-attach on {} failed: {}; will retry",
-                                config.iface, e
-                            );
-                            session_mgr.disable_fail_open();
-                            if config.manage_nft {
-                                firewall_mgr.remove_rules(config.verbose);
-                            }
-                            applied.v4_enabled = false;
-                            applied.effective_v6 = 0;
-                            applied.liveness = false;
-                            retry_deadline = Some(Instant::now() + RETRY_INTERVAL);
-                            false
-                        }
-                    }
-                } else {
-                    match data_plane.ensure_last(config.verbose) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            eprintln!(
-                                "flowcone: TCX tail rotation failed: {}; old links retained",
-                                e
-                            );
-                            false
-                        }
+                let attached = match data_plane.ensure_last(config.verbose) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!(
+                            "flowcone: TCX tail rotation failed: {}; old links retained",
+                            e
+                        );
+                        false
                     }
                 };
                 if attached {
                     applied.ifindex = cur_ifindex;
-                    if notable {
-                        println!(
-                            "flowcone: TCX programs re-attached to {} (ifindex {})",
-                            config.iface, cur_ifindex
-                        );
-                    } else if config.verbose {
+                    if config.verbose {
                         println!(
                             "flowcone: TCX tail verified on {} (ifindex {})",
                             config.iface, cur_ifindex

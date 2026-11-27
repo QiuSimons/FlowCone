@@ -70,20 +70,14 @@ impl FirewallManager {
                 eprintln!("flowcone: error: could not create fw4 liveness sets");
                 return false;
             }
-            let body = build_fw4_insert_script_live(
-                iface,
-                enable_v4,
-                enable_v6,
-                mark,
-                bypass_mask,
-                bypass_val,
-            );
+            let body =
+                build_fw4_insert_script(iface, enable_v4, enable_v6, mark, bypass_mask, bypass_val);
             let ok = nft_apply_with_fallback(&deletes, &body, "inet fw4 rule sync");
             if ok {
                 let native_includes = use_chain_pre();
                 let set_file_ok = native_includes && write_fw4_set_definitions();
                 let chain_pre_ok = set_file_ok
-                    && update_chain_pre_files_live(
+                    && update_chain_pre_files(
                         iface,
                         enable_v4,
                         enable_v6,
@@ -117,11 +111,19 @@ impl FirewallManager {
         let base_chains = get_existing_base_chains();
         let postrouting_nat_chains: Vec<&NftBaseChain> = base_chains
             .iter()
-            .filter(|c| c.hook == "postrouting" && c.chain_type == "nat")
+            .filter(|c| {
+                !(c.family == "inet" && c.table == "flowcone")
+                    && c.hook == "postrouting"
+                    && c.chain_type == "nat"
+            })
             .collect();
         let forward_filter_chains: Vec<&NftBaseChain> = base_chains
             .iter()
-            .filter(|c| c.hook == "forward" && c.chain_type == "filter")
+            .filter(|c| {
+                !(c.family == "inet" && c.table == "flowcone")
+                    && c.hook == "forward"
+                    && c.chain_type == "filter"
+            })
             .collect();
 
         let mut body = String::new();
@@ -132,7 +134,7 @@ impl FirewallManager {
         let standalone = postrouting_nat_chains.is_empty() && forward_filter_chains.is_empty();
         let mut generic_tables = Vec::new();
         if standalone {
-            body.push_str(&generate_standalone_script_live(cfg));
+            body.push_str(&generate_standalone_script(cfg));
         } else {
             generic_tables = collect_generic_tables(
                 &postrouting_nat_chains,
@@ -194,7 +196,6 @@ impl FirewallManager {
         ok
     }
 
-    /// Refresh liveness set timeouts.
     pub(crate) fn refresh_liveness(
         &self,
         enable_v4: bool,

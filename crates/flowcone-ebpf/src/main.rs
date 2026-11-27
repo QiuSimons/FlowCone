@@ -185,7 +185,6 @@ pub static OUTBOUND_BINDINGS_V6: HashMap<EndpointKey6, BindingValue6> =
 pub static INBOUND_BINDINGS_V6: HashMap<u16, BindingValue6> =
     HashMap::with_max_entries(MAX_BINDINGS, 0);
 
-/// Session creation ring buffers consumed by daemon.
 #[map]
 pub static SESSION_EVENTS_V4: RingBuf = RingBuf::with_byte_size(SESSION_EVENT_RINGBUF_BYTES, 0);
 
@@ -500,7 +499,8 @@ fn ingress_v6(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize) -> i32 {
     }
 
     if let Some(target) = lookup_inbound_v6(ext_port) {
-        let new_dst_ip = unsafe { (*target).ip };
+        let mut new_dst_ip = [0u8; 16];
+        copy_ipv6(&mut new_dst_ip, unsafe { &(*target).ip });
         let new_dst_port = unsafe { (*target).port };
         let now = now_sec();
         unsafe {
@@ -1143,7 +1143,7 @@ fn frag_v6_egress_first(
         return FRAG_FIRST_UNSPEC;
     };
     if payload_len < (udp_rel - ip_rel - 40) + 8 {
-        return FRAG_FIRST_UNSPEC;
+        return FRAG_FIRST_SHOT;
     }
     if !ensure_linear(ctx, &mut data, &mut data_end, udp_rel + 8) {
         return FRAG_FIRST_SHOT;
@@ -1202,11 +1202,11 @@ pub fn flowcone_frag_v6_egress_alloc(ctx: TcContext) -> i32 {
 
 #[inline(never)]
 fn frag_v6_egress_cont(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize, frag_rel: usize) -> i32 {
-    if !ensure_linear(ctx, &mut ctx.data(), &mut ctx.data_end(), frag_rel + 8) {
+    let mut data = ctx.data();
+    let mut data_end = ctx.data_end();
+    if !ensure_linear(ctx, &mut data, &mut data_end, frag_rel + 8) {
         return TC_ACT_SHOT;
     }
-    let data = ctx.data();
-    let data_end = ctx.data_end();
     let Some(iph) = (unsafe { parse_header_ref_mut::<Ipv6Hdr>(data + ip_rel, data_end) }) else {
         return TC_ACT_SHOT;
     };
@@ -1232,7 +1232,7 @@ fn frag_v6_egress_cont(ctx: &TcContext, cfg: &GlobalConfig, ip_rel: usize, frag_
     unsafe {
         (*v_ptr).last_seen = now;
     }
-    if ipv6_eq(&v.ip, &[0; 16]) {
+    if ipv6_eq(&v.ip, &ZERO_IP6) {
         return TC_ACT_UNSPEC;
     }
     let wan_id_be = u32::to_be(v.wan_id);
@@ -1320,7 +1320,6 @@ pub fn flowcone_frag_v6_egress(ctx: TcContext) -> i32 {
     frag_v6_egress_cont(&ctx, cfg, ip_rel, frag_rel)
 }
 
-/// Inbound IPv4 fragment NAT handler.
 #[classifier]
 pub fn flowcone_frag_v4_ingress(ctx: TcContext) -> i32 {
     let Some((cfg, l2)) = prepare_packet(&ctx) else {
@@ -1435,7 +1434,6 @@ pub fn flowcone_frag_v4_ingress(ctx: TcContext) -> i32 {
     TC_ACT_UNSPEC
 }
 
-/// Outbound IPv4 fragment NAT handler.
 #[classifier]
 pub fn flowcone_frag_v4_egress(ctx: TcContext) -> i32 {
     let Some((cfg, l2)) = prepare_packet(&ctx) else {
@@ -1498,7 +1496,7 @@ pub fn flowcone_frag_v4_egress(ctx: TcContext) -> i32 {
         return TC_ACT_UNSPEC;
     }
     if !more || (tot_len as usize) < ihl + 8 {
-        return TC_ACT_UNSPEC;
+        return TC_ACT_SHOT;
     }
     let udp_rel = ip_rel + ihl;
     if !ensure_linear(&ctx, &mut data, &mut data_end, udp_rel + 8) {
@@ -1921,7 +1919,7 @@ pub fn flowcone_icmp_egress_target(ctx: TcContext) -> i32 {
     TC_ACT_UNSPEC
 }
 
-/// Fallback ingress dispatcher.
+/// Primary A/B TCX ingress dispatcher.
 #[classifier]
 pub fn flowcone_tcx_ingress_a(ctx: TcContext) -> i32 {
     unsafe {
@@ -1938,7 +1936,7 @@ pub fn flowcone_tcx_ingress_b(ctx: TcContext) -> i32 {
     TC_ACT_UNSPEC
 }
 
-/// Fallback egress dispatcher.
+/// Primary A/B TCX egress dispatcher.
 #[classifier]
 pub fn flowcone_tcx_egress_a(ctx: TcContext) -> i32 {
     unsafe {
